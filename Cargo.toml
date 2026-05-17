@@ -15,6 +15,7 @@ xos-auth = { path = "src/crates/xos-auth" }
 xos-mesh = { path = "src/crates/xos-mesh" }
 xos-tensor = { path = "src/crates/xos-tensor" }
 xos-audio = { path = "src/crates/xos-audio" }
+serde_json = "1"
 darling = "0.21.3"
 variadics_please = "1"
 

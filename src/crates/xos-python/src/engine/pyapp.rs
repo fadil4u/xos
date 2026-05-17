@@ -1153,6 +1153,9 @@ impl PyApp {
         };
 
         if applied {
+            if state.compute_device == xos_core::compute_device::ComputeDevice::Gpu {
+                state.frame.ensure_gpu_from_cpu();
+            }
             self.init_blit_applied = true;
         }
         applied

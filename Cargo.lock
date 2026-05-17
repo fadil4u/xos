@@ -11059,6 +11059,7 @@ dependencies = [
  "darling 0.21.3",
  "getrandom 0.3.4",
  "getrandom 0.4.2",
+ "serde_json",
  "uuid",
  "variadics_please",
  "wasm-bindgen",

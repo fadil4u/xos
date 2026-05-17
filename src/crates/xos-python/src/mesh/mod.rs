@@ -13,9 +13,9 @@ use crate::json_codec::{
 };
 use crate::json_codec::py_to_json_value;
 use crate::runtime::format_python_exception;
+use rustpython_vm::builtins::PyModule;
 #[cfg(not(target_arch = "wasm32"))]
 use rustpython_vm::builtins::PyDict;
-use rustpython_vm::builtins::PyModule;
 use rustpython_vm::function::FuncArgs;
 use rustpython_vm::AsObject;
 use rustpython_vm::{PyRef, PyResult, VirtualMachine};

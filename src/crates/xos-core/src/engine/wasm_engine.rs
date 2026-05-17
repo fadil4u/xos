@@ -851,7 +851,8 @@ pub fn run_web(app: Box<dyn Application>) -> Result<(), JsValue> {
 
                 // Render to canvas. During live browser resizes, the browser can briefly reject a
                 // transient backing store; keep RAF alive and try again next frame.
-                let buffer = state.engine_state.frame_buffer_mut();
+                state.engine_state.frame.publish_gpu_to_staging();
+                let buffer = state.engine_state.frame.staging_slice();
                 let data = wasm_bindgen::Clamped(&buffer[..]);
                 match ImageData::new_with_u8_clamped_array_and_sh(data, width, height) {
                     Ok(image_data) => {

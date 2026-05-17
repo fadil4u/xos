@@ -70,18 +70,10 @@ pub(crate) fn blit_rgba_init_to_buffer(
 }
 
 pub(crate) fn standalone_frame_buffer_copy(viewport_id: u64) -> Option<Vec<u8>> {
-    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
-    {
-        let _ = viewport_id;
-        None
-    }
-    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
-    {
-        STANDALONE_FRAME_BUFFERS
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&viewport_id).cloned())
-    }
+    STANDALONE_FRAME_BUFFERS
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&viewport_id).cloned())
 }
 
 /// Stretch-blit a standalone init framebuffer into the engine framebuffer (e.g. after `__init__`).

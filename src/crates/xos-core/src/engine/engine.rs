@@ -2,6 +2,7 @@ use super::f3_menu::F3Menu;
 
 use crate::burn_raster;
 use crate::compute_device::ComputeDevice;
+use burn::tensor::TensorPrimitive;
 use xos_tensor::{BurnTensor, WgpuDevice};
 use crate::time::Instant;
 use std::ptr::NonNull;
@@ -107,6 +108,21 @@ pub struct FrameState {
     gpu_present_enabled: bool,
     /// Safe region bounding rectangle for UI elements
     pub safe_region_boundaries: SafeRegionBoundingRectangle,
+}
+
+/// On wasm, Burn readback needs an explicit GPU flush/sync before `try_into_data`.
+#[cfg(target_arch = "wasm32")]
+fn flush_wgpu_before_host_read(tensor: &BurnTensor<3>) {
+    let TensorPrimitive::Float(fusion) = tensor.clone().into_primitive() else {
+        return;
+    };
+    let client = fusion.client.clone();
+    if client.flush().is_err() {
+        crate::print("xos wasm: wgpu flush before frame readback failed");
+    }
+    if cubecl_common::future::block_on(client.sync()).is_err() {
+        crate::print("xos wasm: wgpu sync before frame readback failed");
+    }
 }
 
 impl FrameState {
@@ -260,7 +276,29 @@ impl FrameState {
     fn sync_tensor_to_cpu(&mut self) {
         let h = self.height as usize;
         let w = self.width as usize;
+        #[cfg(target_arch = "wasm32")]
+        {
+            flush_wgpu_before_host_read(&self.tensor);
+            let data = match self.tensor.clone().try_into_data() {
+                Ok(d) => d,
+                Err(e) => {
+                    crate::print(&format!("xos wasm: frame GPU readback failed: {e:?}"));
+                    return;
+                }
+            };
+            return Self::write_f32_rgba_to_staging(self, &data, h, w);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         let data = self.tensor.clone().into_data();
+        Self::write_f32_rgba_to_staging(self, &data, h, w);
+    }
+
+    fn write_f32_rgba_to_staging(
+        &mut self,
+        data: &burn::tensor::TensorData,
+        h: usize,
+        w: usize,
+    ) {
         let s = data.as_slice::<f32>().expect("frame f32");
         let buf = self.staging_slice_mut();
         for i in 0..(h * w) {
