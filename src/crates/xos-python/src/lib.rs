@@ -41,7 +41,8 @@ use rustpython_vm::{builtins::PyModule, PyRef, VirtualMachine};
 
 pub use json_codec::decode_mesh_jpeg_bytes_best_effort;
 pub use runtime::{
-    parse_script_cli_flags, run_python_app, run_python_file, run_python_interactive,
+    parse_script_cli_flags, python_app_wants_headless, run_python_app, run_python_file,
+    run_python_interactive,
 };
 
 pub fn make_tensors_module(vm: &VirtualMachine) -> PyRef<PyModule> {

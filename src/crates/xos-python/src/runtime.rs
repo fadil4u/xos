@@ -375,6 +375,20 @@ pub fn run_python_interactive() {
     }
 }
 
+/// Whether the registered `xos.Application` instance requests headless mode.
+pub fn python_app_wants_headless(
+    interpreter: &Interpreter,
+    app_instance: &rustpython_vm::PyObjectRef,
+) -> bool {
+    interpreter.enter(|vm| {
+        vm.get_attribute_opt(app_instance.clone(), "headless")
+            .ok()
+            .flatten()
+            .and_then(|obj| obj.try_into_value::<bool>(vm).ok())
+            .unwrap_or(false)
+    })
+}
+
 /// Run a Python application with the xos engine
 pub fn run_python_app(file_path: &PathBuf, script_flags: &[String]) {
     #[cfg(not(target_arch = "wasm32"))]
@@ -431,13 +445,7 @@ pub fn run_python_app(file_path: &PathBuf, script_flags: &[String]) {
         }
 
         if let Some(app_instance) = app_instance {
-            let headless = interpreter.enter(|vm| {
-                vm.get_attribute_opt(app_instance.clone(), "headless")
-                    .ok()
-                    .flatten()
-                    .and_then(|obj| obj.try_into_value::<bool>(vm).ok())
-                    .unwrap_or(false)
-            });
+            let headless = python_app_wants_headless(&interpreter, &app_instance);
 
             if headless {
                 interpreter.enter(|vm| {
