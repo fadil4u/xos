@@ -82,6 +82,129 @@ pub fn fill_rect(
     frame.set_burn_tensor(t);
 }
 
+/// Axis-aligned rectangle with source-over alpha compositing (keeps frame on GPU).
+pub fn blend_rect(
+    frame: &mut FrameState,
+    frame_width: usize,
+    frame_height: usize,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    rgba: (u8, u8, u8, u8),
+) {
+    if rgba.3 == 0 || frame_width == 0 || frame_height == 0 {
+        return;
+    }
+    let fw = frame_width as i32;
+    let fh = frame_height as i32;
+    let x0 = x0.max(0).min(fw);
+    let x1 = x1.max(0).min(fw);
+    let y0 = y0.max(0).min(fh);
+    let y1 = y1.max(0).min(fh);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+
+    let h = frame_height;
+    let w = frame_width;
+    let a = rgba.3 as f32 / 255.0;
+    let device = frame.device().clone();
+    frame.ensure_gpu_from_cpu();
+    let dst = frame.burn_tensor().clone();
+
+    let y = BurnTensorAny::<XosBackend, 1, Int>::arange(0..h as i64, &device).float();
+    let x = BurnTensorAny::<XosBackend, 1, Int>::arange(0..w as i64, &device).float();
+    let [yy, xx] = meshgrid(&[y, x], GridOptions::default());
+
+    let mask_x0 = xx.clone().greater_equal_elem(x0 as f32);
+    let mask_x1 = xx.lower_elem(x1 as f32);
+    let mask_y0 = yy.clone().greater_equal_elem(y0 as f32);
+    let mask_y1 = yy.lower_elem(y1 as f32);
+    let mask = mask_x0
+        .bool_and(mask_x1)
+        .bool_and(mask_y0)
+        .bool_and(mask_y1);
+
+    let src = rgba_tensor(
+        &device,
+        h,
+        w,
+        [
+            rgba.0 as f32,
+            rgba.1 as f32,
+            rgba.2 as f32,
+            255.0,
+        ],
+    );
+    let mask4 = mask.clone().unsqueeze_dim::<3>(2).expand([h, w, 4]);
+    let weight = mask
+        .float()
+        .unsqueeze_dim::<3>(2)
+        .mul_scalar(a)
+        .expand([h, w, 4]);
+    let inv = BurnTensor::<3>::full([h, w, 4], 1.0, &device).sub(weight.clone());
+    let blended = dst.clone().mul(inv).add(src.mul(weight));
+    let t = dst.mask_where(mask4, blended);
+    frame.set_burn_tensor(t);
+}
+
+/// Upload a small RGBA patch and alpha-composite it onto the frame (no full-frame CPU readback).
+pub fn blend_rgba_patch(
+    frame: &mut FrameState,
+    x0: i32,
+    y0: i32,
+    patch_w: usize,
+    patch_h: usize,
+    patch_rgba: &[u8],
+) {
+    if patch_w == 0 || patch_h == 0 || patch_rgba.len() != patch_w * patch_h * 4 {
+        return;
+    }
+    let [fh, fw, _] = frame.tensor_dims();
+    let x0 = x0.max(0).min(fw as i32);
+    let y0 = y0.max(0).min(fh as i32);
+    let x1 = (x0 + patch_w as i32).min(fw as i32);
+    let y1 = (y0 + patch_h as i32).min(fh as i32);
+    let pw = (x1 - x0) as usize;
+    let ph = (y1 - y0) as usize;
+    if pw == 0 || ph == 0 {
+        return;
+    }
+
+    let row_stride = patch_w * 4;
+    let mut clipped = Vec::with_capacity(pw * ph * 4);
+    for row in 0..ph {
+        let src_off = row * row_stride;
+        clipped.extend_from_slice(&patch_rgba[src_off..src_off + pw * 4]);
+    }
+
+    let device = frame.device().clone();
+    frame.ensure_gpu_from_cpu();
+    let dst = frame.burn_tensor().clone();
+    let patch = tensor_from_rgba_u8(&device, pw, ph, &clipped);
+
+    let region = dst
+        .clone()
+        .slice([y0 as usize..y0 as usize + ph, x0 as usize..x0 as usize + pw, 0..4]);
+    let alpha = patch
+        .clone()
+        .slice([0..ph, 0..pw, 3..4])
+        .div_scalar(255.0);
+    let alpha3 = alpha.expand([ph, pw, 3]);
+    let inv3 = BurnTensor::<3>::full([ph, pw, 3], 1.0, &device).sub(alpha3.clone());
+    let src_rgb = patch.slice([0..ph, 0..pw, 0..3]);
+    let dst_rgb = region.slice([0..ph, 0..pw, 0..3]);
+    let out_rgb = dst_rgb.mul(inv3).add(src_rgb.mul(alpha3));
+    let out_a = BurnTensor::<3>::full([ph, pw, 1], 255.0, &device);
+    let blended = BurnTensor::<3>::cat(vec![out_rgb, out_a], 2);
+    let t = dst.slice_assign(
+        [y0 as usize..y0 as usize + ph, x0 as usize..x0 as usize + pw, 0..4],
+        blended,
+    );
+    frame.set_burn_tensor(t);
+}
+
 /// One filled triangle; vertices in pixel space (same winding / degenerate checks as CPU path).
 pub fn fill_triangle(
     frame: &mut FrameState,
@@ -148,6 +271,82 @@ pub fn fill_triangle(
     let color_plane = rgba_tensor(&device, h, w, c);
     let mask4 = mask.unsqueeze_dim::<3>(2).expand([h, w, 4]);
     t = t.mask_where(mask4, color_plane);
+    frame.set_burn_tensor(t);
+}
+
+/// Filled triangle with source-over alpha compositing.
+pub fn blend_triangle(
+    frame: &mut FrameState,
+    frame_width: usize,
+    frame_height: usize,
+    v0: (f32, f32),
+    v1: (f32, f32),
+    v2: (f32, f32),
+    color: [u8; 4],
+) {
+    if frame_width == 0 || frame_height == 0 || color[3] == 0 {
+        return;
+    }
+    let h = frame_height;
+    let w = frame_width;
+    let ax = v0.0 as f64;
+    let ay = v0.1 as f64;
+    let mut bx = v1.0 as f64;
+    let mut by = v1.1 as f64;
+    let mut cx = v2.0 as f64;
+    let mut cy = v2.1 as f64;
+
+    let area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    if area < 0.0 {
+        std::mem::swap(&mut bx, &mut cx);
+        std::mem::swap(&mut by, &mut cy);
+    }
+    if ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax)).abs() < 1e-20 {
+        return;
+    }
+
+    let a = color[3] as f32 / 255.0;
+    let device = frame.device().clone();
+    frame.ensure_gpu_from_cpu();
+    let dst = frame.burn_tensor().clone();
+
+    let y = BurnTensorAny::<XosBackend, 1, Int>::arange(0..h as i64, &device).float();
+    let x = BurnTensorAny::<XosBackend, 1, Int>::arange(0..w as i64, &device).float();
+    let [yy, xx] = meshgrid(&[y, x], GridOptions::default());
+    let px = xx + 0.5;
+    let py = yy + 0.5;
+
+    let bx_ = bx as f32;
+    let by_ = by as f32;
+    let cx_ = cx as f32;
+    let cy_ = cy as f32;
+    let ax_ = ax as f32;
+    let ay_ = ay as f32;
+
+    let w0 = (cx_ - bx_) * (py.clone() - by_) - (cy_ - by_) * (px.clone() - bx_);
+    let w1 = (ax_ - cx_) * (py.clone() - cy_) - (ay_ - cy_) * (px.clone() - cx_);
+    let w2 = (bx_ - ax_) * (py.clone() - ay_) - (by_ - ay_) * (px.clone() - ax_);
+
+    let mask = w0
+        .greater_equal_elem(0.0f32)
+        .bool_and(w1.greater_equal_elem(0.0f32))
+        .bool_and(w2.greater_equal_elem(0.0f32));
+
+    let src = rgba_tensor(
+        &device,
+        h,
+        w,
+        [color[0] as f32, color[1] as f32, color[2] as f32, 255.0],
+    );
+    let mask4 = mask.clone().unsqueeze_dim::<3>(2).expand([h, w, 4]);
+    let weight = mask
+        .float()
+        .unsqueeze_dim::<3>(2)
+        .mul_scalar(a)
+        .expand([h, w, 4]);
+    let inv = BurnTensor::<3>::full([h, w, 4], 1.0, &device).sub(weight.clone());
+    let blended = dst.clone().mul(inv).add(src.mul(weight));
+    let t = dst.mask_where(mask4, blended);
     frame.set_burn_tensor(t);
 }
 

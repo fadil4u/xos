@@ -278,21 +278,20 @@ impl AppState {
             );
 
             if self.engine_state.keyboard.onscreen.needs_framebuffer_access() {
-                self.engine_state.keyboard.onscreen.tick_draw_gpu(
+                #[cfg(not(target_arch = "wasm32"))]
+                self.engine_state.keyboard.onscreen.draw_overlay_gpu(
                     &mut self.engine_state.frame,
                     width,
                     height,
                     &safe_region,
                 );
-                if self.engine_state.keyboard.onscreen.is_shown() {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let buffer = self.engine_state.frame.buffer_mut();
                     self.engine_state
                         .keyboard
                         .onscreen
-                        .draw_key_labels(
-                            self.engine_state.frame.buffer_mut(),
-                            width,
-                            height,
-                        );
+                        .tick_draw_cpu(buffer, width, height, &safe_region);
                 }
             }
         }

@@ -87,6 +87,8 @@ pub struct OnScreenKeyboard {
     pub trackpad_spoof_nx: f32,
     pub trackpad_spoof_ny: f32,
     trackpad_spoof_last_px: Option<(f32, f32)>,
+    /// CPU scratch for the keyboard region (one GPU patch upload per frame).
+    overlay_scratch: Vec<u8>,
 }
 
 impl std::fmt::Debug for OnScreenKeyboard {
@@ -126,6 +128,7 @@ impl OnScreenKeyboard {
             trackpad_spoof_nx: 0.5,
             trackpad_spoof_ny: 0.5,
             trackpad_spoof_last_px: None,
+            overlay_scratch: Vec::new(),
         };
 
         keyboard.layout_keys();
@@ -294,6 +297,141 @@ impl OnScreenKeyboard {
         for key in &self.keys {
             let label = self.key_label(key);
             self.draw_key_label_only(buffer, width, height, key, &label);
+        }
+    }
+
+    /// Draw keyboard chrome + labels into a local scratch buffer, then one GPU patch (no full-frame readback).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn draw_overlay_gpu(
+        &mut self,
+        frame: &mut crate::engine::FrameState,
+        width: u32,
+        height: u32,
+        safe_region: &crate::engine::SafeRegionBoundingRectangle,
+    ) {
+        if self.minimized {
+            if self.is_trackpad_mode() {
+                use crate::burn_raster::fill_circle;
+                let wf = width as usize;
+                let hf = height as usize;
+                let hf_f = height as f32;
+                let (_, top_norm, _, _) = self.top_edge_coordinates();
+                let keyboard_top_px = top_norm * hf_f;
+                let lx = self.trackpad_spoof_nx * width as f32;
+                let ly = self.trackpad_spoof_ny * hf_f;
+                if ly < keyboard_top_px - 1.0 {
+                    fill_circle(frame, wf, hf, lx, ly, 6.0, (255, 0, 0, 255));
+                }
+            }
+            return;
+        }
+
+        let w = width as f32;
+        let h = height as f32;
+        let x0 = (self.data.left * w).round().clamp(0.0, w) as i32;
+        let x1 = (self.data.right * w).round().clamp(0.0, w) as i32;
+        let y0 = (self.data.top * h).round().clamp(0.0, h) as i32;
+        let y1 = (self.data.bottom * h).round().clamp(0.0, h) as i32;
+        let kw = ((x1 - x0).max(1)) as u32;
+        let kh = ((y1 - y0).max(1)) as u32;
+
+        let mut scratch = std::mem::take(&mut self.overlay_scratch);
+        scratch.resize((kw * kh * 4) as usize, 0);
+        scratch.fill(0);
+        Self::render_into_scratch(self, &mut scratch, kw, kh, width, height, x0, y0);
+
+        // Green line + fill below keyboard (still in frame space; small CPU patch extension).
+        let mut extend_h = 0u32;
+        let keyboard_bottom_px = safe_region.y2 * h;
+        if keyboard_bottom_px < h {
+            extend_h = (h - keyboard_bottom_px).ceil() as u32;
+        }
+        if extend_h > 0 {
+            let ext_w = width;
+            let ext_size = (ext_w * extend_h * 4) as usize;
+            let mut ext_scratch = vec![0u8; ext_size];
+            let border_y = keyboard_bottom_px.round() as i32;
+            for x in 0..ext_w as i32 {
+                let ly = 0i32;
+                if let Some(idx) = Self::local_idx(ext_w, extend_h, x, ly, 0, 0) {
+                    ext_scratch[idx] = 0;
+                    ext_scratch[idx + 1] = 255;
+                    ext_scratch[idx + 2] = 0;
+                    ext_scratch[idx + 3] = 255;
+                }
+            }
+            for y in 1..extend_h as i32 {
+                for x in 0..ext_w as i32 {
+                    if let Some(idx) = Self::local_idx(ext_w, extend_h, x, y, 0, 0) {
+                        ext_scratch[idx..idx + 4].copy_from_slice(&[0, 0, 0, 255]);
+                    }
+                }
+            }
+            crate::burn_raster::blend_rgba_patch(
+                frame,
+                0,
+                border_y,
+                ext_w as usize,
+                extend_h as usize,
+                &ext_scratch,
+            );
+        }
+
+        crate::burn_raster::blend_rgba_patch(
+            frame,
+            x0,
+            y0,
+            kw as usize,
+            kh as usize,
+            &scratch,
+        );
+        self.overlay_scratch = scratch;
+    }
+
+    #[inline]
+    fn local_idx(
+        buf_w: u32,
+        buf_h: u32,
+        px: i32,
+        py: i32,
+        origin_x: i32,
+        origin_y: i32,
+    ) -> Option<usize> {
+        let lx = px - origin_x;
+        let ly = py - origin_y;
+        if lx >= 0 && ly >= 0 && (lx as u32) < buf_w && (ly as u32) < buf_h {
+            Some(((ly as u32 * buf_w + lx as u32) * 4) as usize)
+        } else {
+            None
+        }
+    }
+
+    fn render_into_scratch(
+        keyboard: &Self,
+        buffer: &mut [u8],
+        buf_w: u32,
+        buf_h: u32,
+        screen_w: u32,
+        screen_h: u32,
+        origin_x: i32,
+        origin_y: i32,
+    ) {
+        let mut full = vec![0u8; (screen_w * screen_h * 4) as usize];
+        keyboard.draw(&mut full, screen_w, screen_h);
+        for key in &keyboard.keys {
+            let label = keyboard.key_label(key);
+            keyboard.draw_key_label_only(&mut full, screen_w, screen_h, key, &label);
+        }
+        for dy in 0..buf_h {
+            for dx in 0..buf_w {
+                let px = origin_x + dx as i32;
+                let py = origin_y + dy as i32;
+                let src = ((py as u32 * screen_w + px as u32) * 4) as usize;
+                let dst = ((dy * buf_w + dx) * 4) as usize;
+                if src + 3 < full.len() && dst + 3 < buffer.len() {
+                    buffer[dst..dst + 4].copy_from_slice(&full[src..src + 4]);
+                }
+            }
         }
     }
 
