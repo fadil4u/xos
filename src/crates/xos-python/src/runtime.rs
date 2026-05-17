@@ -56,6 +56,81 @@ pub fn parse_script_cli_flags(rest: &[String]) -> Vec<String> {
 /// Callback type for capturing print output
 pub type PrintCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
+#[cfg(target_arch = "wasm32")]
+static WASM_PRINT_SINK: Mutex<Option<PrintCallback>> = Mutex::new(None);
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_emit_print(s: &str) {
+    if let Ok(guard) = WASM_PRINT_SINK.lock() {
+        if let Some(cb) = guard.as_ref() {
+            cb(s);
+            return;
+        }
+    }
+    xos_core::print(s);
+}
+
+/// Route Python `print` / `sys.stdout` to the browser console (or an optional sink).
+#[cfg(target_arch = "wasm32")]
+pub fn set_wasm_print_sink(callback: Option<PrintCallback>) {
+    if let Ok(mut guard) = WASM_PRINT_SINK.lock() {
+        *guard = callback;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+const WASM_STDIO_SETUP: &str = r#"
+import sys
+import builtins
+
+class _XosWasmIO:
+    def write(self, s):
+        if s:
+            __xos_write__(s)
+        return len(s) if s else 0
+    def flush(self):
+        pass
+
+_io = _XosWasmIO()
+sys.stdout = _io
+sys.stderr = _io
+
+def __xos_print__(*args, sep=' ', end='\n', **kwargs):
+    __xos_write__(sep.join(str(arg) for arg in args) + end)
+
+builtins.print = __xos_print__
+"#;
+
+/// Install `sys.stdout` / `builtins.print` on the VM (RustPython leaves them unset on wasm32).
+#[cfg(target_arch = "wasm32")]
+pub fn install_wasm_python_stdio(vm: &VirtualMachine) {
+    if vm.builtins.get_attr("__xos_write__", vm).is_err() {
+        let write_fn = vm.new_function(
+            "__xos_write__",
+            |args: rustpython_vm::function::FuncArgs, vm: &VirtualMachine| -> rustpython_vm::PyResult {
+                if let Some(text_obj) = args.args.first() {
+                    if let Ok(text) = text_obj.str(vm) {
+                        wasm_emit_print(&text.to_string());
+                    }
+                }
+                Ok(vm.ctx.none())
+            },
+        );
+        let _ = vm.builtins.set_attr("__xos_write__", write_fn, vm);
+    }
+
+    let scope = vm.new_scope_with_builtins();
+    if let Err(e) = vm.run_code_string(scope, WASM_STDIO_SETUP, "<wasm-stdio>".to_string()) {
+        xos_core::print(&format!("xos wasm: failed to install Python stdio: {e:?}"));
+    }
+}
+
+/// Call from `Interpreter::with_init` on wasm before running app scripts.
+#[cfg(target_arch = "wasm32")]
+pub fn wasm_interpreter_init(vm: &VirtualMachine) {
+    install_wasm_python_stdio(vm);
+}
+
 /// How Python source is compiled before execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PythonRunMode {
@@ -127,6 +202,12 @@ pub fn execute_python_code_with_mode(
     let output_buffer_clone = Arc::clone(&output_buffer);
 
     let (result, app_instance, new_scope) = interpreter.enter(|vm| {
+        #[cfg(target_arch = "wasm32")]
+        {
+            set_wasm_print_sink(print_callback.clone());
+            install_wasm_python_stdio(vm);
+        }
+
         // Clear previous app instance from builtins
         let _ = vm
             .builtins
@@ -163,6 +244,7 @@ pub fn execute_python_code_with_mode(
 
         // Set up print capture
         let buffer_for_capture = Arc::clone(&output_buffer_clone);
+        #[cfg(not(target_arch = "wasm32"))]
         let callback_clone = print_callback.clone();
         let write_output_fn = vm.new_function(
             "__write_output__",
@@ -178,7 +260,9 @@ pub fn execute_python_code_with_mode(
                             buffer.push_str(&text_str);
                         }
 
-                        // Call callback if provided
+                        #[cfg(target_arch = "wasm32")]
+                        wasm_emit_print(&text_str);
+                        #[cfg(not(target_arch = "wasm32"))]
                         if let Some(ref callback) = callback_clone {
                             callback(&text_str);
                         }
@@ -192,28 +276,11 @@ pub fn execute_python_code_with_mode(
             .set_item("__write_output__", write_output_fn.into(), vm)
             .ok();
 
-        // Override print to capture output
-        #[cfg(target_arch = "wasm32")]
-        let wasm_stdio = r#"
-import io
-class _XosWasmTextIO(io.TextIOBase):
-    def write(self, s):
-        if s:
-            __write_output__(s)
-        return len(s) if s else 0
-    def flush(self):
-        pass
-sys.stdout = _XosWasmTextIO()
-sys.stderr = _XosWasmTextIO()
-"#;
-        #[cfg(not(target_arch = "wasm32"))]
-        let wasm_stdio = "";
         let setup_code = format!(
             r#"
 import builtins
 import sys
 import xos
-{wasm_stdio}
 # Ensure `xos` is always present without an explicit user import
 # (for `xpy` and `xos py/python` execution paths).
 globals()["xos"] = xos
@@ -221,7 +288,6 @@ globals()["xos"] = xos
 __original_print__ = builtins.print
 "#,
             xos_flags_setup_python(script_flags),
-            wasm_stdio = wasm_stdio,
         );
         let setup_code = format!(
             "{}{}",

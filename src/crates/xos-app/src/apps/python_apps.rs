@@ -293,6 +293,8 @@ fn make_app_interpreter() -> Interpreter {
             "xos".to_owned(),
             Box::new(xos_python::xos_module::make_module),
         );
+        #[cfg(target_arch = "wasm32")]
+        xos_python::runtime::wasm_interpreter_init(vm);
     })
 }
 

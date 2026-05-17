@@ -1298,6 +1298,9 @@ impl Application for PyApp {
             let mut tick_failed = false;
 
             self.interpreter.enter(|vm| {
+                #[cfg(target_arch = "wasm32")]
+                crate::runtime::install_wasm_python_stdio(vm);
+
                 // Require subclasses to call super().__init__() so base fields exist.
                 let initialized_ok = match vm.get_attribute_opt(app_instance.clone(), "_xos_initialized") {
                     Ok(Some(flag_obj)) => flag_obj.clone().try_into_value::<bool>(vm).unwrap_or(false),
@@ -1523,6 +1526,9 @@ Call super().__init__() in your app __init__ before using tick().",
 
             let _tls_guard = TickEngineStateGuard::install(state);
             self.interpreter.enter(|vm| {
+                #[cfg(target_arch = "wasm32")]
+                crate::runtime::install_wasm_python_stdio(vm);
+
                 // Update frame data before calling the handler
                 if let Ok(Some(frame_obj)) = vm.get_attribute_opt(app_instance.clone(), "frame") {
                     let _ = crate::engine::py_bindings::update_py_frame_state(
