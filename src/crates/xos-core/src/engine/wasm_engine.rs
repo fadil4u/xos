@@ -67,15 +67,19 @@ fn schedule_wasm_frame_readback(frame: &mut FrameState) {
     if !frame.is_gpu_dirty() || frame.wasm_readback_pending() {
         return;
     }
-    frame.begin_wasm_readback();
+    let generation = frame.begin_wasm_readback();
     let tensor = frame.burn_tensor().clone();
-    let device = frame.device().clone();
     let frame_ptr = frame as *mut FrameState;
     wasm_bindgen_futures::spawn_local(async move {
-        super::engine::flush_gpu_for_readback(&device, &tensor);
+        super::engine::drain_gpu_for_readback(&tensor);
         match tensor.into_data_async().await {
             Ok(data) => unsafe {
-                (*frame_ptr).complete_wasm_readback(data);
+                let frame = &mut *frame_ptr;
+                if frame.wasm_readback_generation_matches(generation) {
+                    frame.complete_wasm_readback(data);
+                } else {
+                    frame.clear_wasm_readback_pending();
+                }
             },
             Err(e) => {
                 crate::print(&format!("xos wasm: frame GPU readback failed: {e:?}"));
@@ -85,6 +89,49 @@ fn schedule_wasm_frame_readback(frame: &mut FrameState) {
             }
         }
     });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn blit_frame_to_canvas(
+    context: &web_sys::CanvasRenderingContext2d,
+    present_rgba: &mut Vec<u8>,
+    image_data: &mut Option<web_sys::ImageData>,
+    buffer: &[u8],
+    width: u32,
+    height: u32,
+) {
+    let len = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    if len == 0 {
+        return;
+    }
+    let copy_len = len.min(buffer.len());
+    if present_rgba.len() != len {
+        present_rgba.resize(len, 0);
+    }
+    present_rgba[..copy_len].copy_from_slice(&buffer[..copy_len]);
+    if copy_len < len {
+        present_rgba[copy_len..].fill(0);
+    }
+    let needs_new = image_data
+        .as_ref()
+        .map(|img| img.width() != width || img.height() != height)
+        .unwrap_or(true);
+    if needs_new {
+        *image_data = web_sys::ImageData::new_with_u8_clamped_array_and_sh(
+            wasm_bindgen::Clamped(&present_rgba[..len]),
+            width,
+            height,
+        )
+        .ok();
+    } else if let Some(img) = image_data.as_ref() {
+        let dst = js_sys::Uint8Array::new(&img.data().into());
+        dst.copy_from(&present_rgba[..len]);
+    }
+    if let Some(img) = image_data.as_ref() {
+        let _ = context.put_image_data(img, 0.0, 0.0);
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -738,6 +785,8 @@ pub fn run_web(app: Box<dyn Application>) -> Result<(), JsValue> {
             canvas: HtmlCanvasElement,
             context: CanvasRenderingContext2d,
             last_tick_instant: Option<crate::time::Instant>,
+            present_rgba: Vec<u8>,
+            image_data: Option<ImageData>,
         }
 
         let anim_state_ptr = Box::into_raw(Box::new(AnimationState {
@@ -746,6 +795,8 @@ pub fn run_web(app: Box<dyn Application>) -> Result<(), JsValue> {
             canvas: canvas.clone(),
             context: context.clone(),
             last_tick_instant: None,
+            present_rgba: Vec::new(),
+            image_data: None,
         }));
 
         // Create the animation frame callback
@@ -779,6 +830,8 @@ pub fn run_web(app: Box<dyn Application>) -> Result<(), JsValue> {
                 let shape = state.engine_state.frame.shape();
                 if shape[1] as u32 != width || shape[0] as u32 != height {
                     state.engine_state.resize_frame(width, height);
+                    anim_state.present_rgba.clear();
+                    anim_state.image_data = None;
                     anim_state.last_tick_instant = Some(crate::time::Instant::now());
                     // Notify app of screen size change
                     state
@@ -853,7 +906,8 @@ pub fn run_web(app: Box<dyn Application>) -> Result<(), JsValue> {
                     let safe_region = state.engine_state.frame.safe_region_boundaries.clone();
                     // Split borrows: get buffer and keyboard separately
                     let (buffer, keyboard) = {
-                        let buffer_ptr = state.engine_state.frame.buffer_mut() as *mut [u8];
+                        let buffer_ptr =
+                            state.engine_state.frame.staging_slice_mut_for_tick() as *mut [u8];
                         let keyboard_ptr: *mut crate::ui::onscreen_keyboard::OnScreenKeyboard =
                             &mut state.engine_state.keyboard.onscreen;
                         (&mut *buffer_ptr, &mut *keyboard_ptr)
@@ -878,17 +932,14 @@ pub fn run_web(app: Box<dyn Application>) -> Result<(), JsValue> {
                 // transient backing store; keep RAF alive and try again next frame.
                 schedule_wasm_frame_readback(&mut state.engine_state.frame);
                 let buffer = state.engine_state.frame.data();
-                let data = wasm_bindgen::Clamped(&buffer[..]);
-                match ImageData::new_with_u8_clamped_array_and_sh(data, width, height) {
-                    Ok(image_data) => {
-                        if let Err(err) = anim_state.context.put_image_data(&image_data, 0.0, 0.0) {
-                            crate::print(&format!("xos wasm: put_image_data failed: {:?}", err));
-                        }
-                    }
-                    Err(err) => {
-                        crate::print(&format!("xos wasm: ImageData failed: {:?}", err));
-                    }
-                }
+                blit_frame_to_canvas(
+                    &anim_state.context,
+                    &mut anim_state.present_rgba,
+                    &mut anim_state.image_data,
+                    buffer,
+                    width,
+                    height,
+                );
 
                 // Request next animation frame
                 web_sys::window()

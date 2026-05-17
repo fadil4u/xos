@@ -4,11 +4,7 @@ use crate::burn_raster;
 use crate::compute_device::ComputeDevice;
 #[cfg(target_arch = "wasm32")]
 use burn::tensor::TensorPrimitive;
-#[cfg(target_arch = "wasm32")]
-use burn::tensor::backend::Backend;
 use xos_tensor::{BurnTensor, WgpuDevice};
-#[cfg(target_arch = "wasm32")]
-use xos_tensor::XosBackend;
 use crate::time::Instant;
 use std::ptr::NonNull;
 
@@ -116,18 +112,18 @@ pub struct FrameState {
     /// Async GPU→CPU readback in flight (wasm canvas path).
     #[cfg(target_arch = "wasm32")]
     wasm_readback_pending: bool,
+    /// Bumped when a new readback is scheduled; stale async results are dropped.
+    #[cfg(target_arch = "wasm32")]
+    wasm_readback_generation: u64,
 }
 
-/// Drain fusion ops and sync the WGPU device before async host readback.
+/// Drain pending fusion ops before async host readback (must not block-sync on wasm).
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn flush_gpu_for_readback(device: &WgpuDevice, tensor: &BurnTensor<3>) {
+pub(crate) fn drain_gpu_for_readback(tensor: &BurnTensor<3>) {
     let TensorPrimitive::Float(fusion) = tensor.clone().into_primitive() else {
         return;
     };
     fusion.client.drain();
-    if XosBackend::sync(device).is_err() {
-        crate::print("xos wasm: wgpu sync before frame readback failed");
-    }
 }
 
 impl FrameState {
@@ -165,6 +161,8 @@ impl FrameState {
             safe_region_boundaries: safe_region,
             #[cfg(target_arch = "wasm32")]
             wasm_readback_pending: false,
+            #[cfg(target_arch = "wasm32")]
+            wasm_readback_generation: 0,
         }
     }
 
@@ -175,13 +173,21 @@ impl FrameState {
     }
 
     #[cfg(target_arch = "wasm32")]
-    pub(crate) fn begin_wasm_readback(&mut self) {
+    pub(crate) fn begin_wasm_readback(&mut self) -> u64 {
         self.wasm_readback_pending = true;
+        self.wasm_readback_generation = self.wasm_readback_generation.wrapping_add(1);
+        self.wasm_readback_generation
     }
 
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn clear_wasm_readback_pending(&mut self) {
         self.wasm_readback_pending = false;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[inline]
+    pub(crate) fn wasm_readback_generation_matches(&self, generation: u64) -> bool {
+        self.wasm_readback_generation == generation
     }
 
     /// Apply async readback result into CPU staging (wasm only).

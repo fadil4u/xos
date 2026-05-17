@@ -193,18 +193,35 @@ pub fn execute_python_code_with_mode(
             .ok();
 
         // Override print to capture output
+        #[cfg(target_arch = "wasm32")]
+        let wasm_stdio = r#"
+import io
+class _XosWasmTextIO(io.TextIOBase):
+    def write(self, s):
+        if s:
+            __write_output__(s)
+        return len(s) if s else 0
+    def flush(self):
+        pass
+sys.stdout = _XosWasmTextIO()
+sys.stderr = _XosWasmTextIO()
+"#;
+        #[cfg(not(target_arch = "wasm32"))]
+        let wasm_stdio = "";
         let setup_code = format!(
             r#"
 import builtins
 import sys
 import xos
+{wasm_stdio}
 # Ensure `xos` is always present without an explicit user import
 # (for `xpy` and `xos py/python` execution paths).
 globals()["xos"] = xos
 {}
 __original_print__ = builtins.print
 "#,
-            xos_flags_setup_python(script_flags)
+            xos_flags_setup_python(script_flags),
+            wasm_stdio = wasm_stdio,
         );
         let setup_code = format!(
             "{}{}",
@@ -274,14 +291,25 @@ builtins.__import__ = __xos_import__
             Err(err) => Err(vm.new_syntax_error(&err, Some(code))),
         };
 
-        // Restore original print
-        let restore_code = r#"
+        // Restore original print (wasm keeps custom print + sys.stdout for tick()).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let restore_code = r#"
 builtins.print = __original_print__
 xos.print = __original_print__
 builtins.__import__ = __original_import__
 "#;
-        vm.run_code_string(scope.clone(), restore_code, "<restore>".to_string())
-            .ok();
+            vm.run_code_string(scope.clone(), restore_code, "<restore>".to_string())
+                .ok();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let restore_code = r#"
+builtins.__import__ = __original_import__
+"#;
+            vm.run_code_string(scope.clone(), restore_code, "<restore>".to_string())
+                .ok();
+        }
 
         // Handle errors
         let result = if let Err(py_exc) = exec_result {
