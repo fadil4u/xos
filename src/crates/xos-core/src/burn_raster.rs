@@ -7,9 +7,7 @@ use xos_tensor::{BurnTensor, TensorData, WgpuDevice, XosBackend};
 use burn::tensor::grid::{meshgrid, GridOptions};
 use burn::tensor::Int;
 use burn::tensor::Tensor as BurnTensorAny;
-#[cfg(not(target_arch = "wasm32"))]
 use burn::tensor::module::conv2d;
-#[cfg(not(target_arch = "wasm32"))]
 use burn_backend::ops::ConvOptions;
 
 fn rgba_tensor(device: &WgpuDevice, h: usize, w: usize, c: [f32; 4]) -> BurnTensor<3> {
@@ -28,7 +26,6 @@ pub fn fill_solid(frame: &mut FrameState, color: (u8, u8, u8, u8)) {
 }
 
 /// Opaque/solid fill directly on the GPU tensor (no CPU staging touch).
-#[cfg(not(target_arch = "wasm32"))]
 pub fn fill_solid_gpu(frame: &mut FrameState, color: (u8, u8, u8, u8)) {
     let device = frame.device().clone();
     let [h, w, _] = frame.tensor_dims();
@@ -414,7 +411,6 @@ pub fn triangles(
 /// Same-size RGB convolution on the frame's GPU tensor (Burn `conv2d` on WGPU).
 ///
 /// `kernel_nchw` is `[out_c=3, in_c=3, kh, kw]`. After the op, staging is updated for display.
-#[cfg(not(target_arch = "wasm32"))]
 pub fn convolve_rgb_same(
     frame: &mut FrameState,
     kernel_nchw: Vec<f32>,
@@ -457,7 +453,6 @@ pub fn convolve_rgb_same(
 }
 
 /// Depthwise same-size convolution on the frame GPU tensor.
-#[cfg(not(target_arch = "wasm32"))]
 pub fn convolve_depthwise_rgb_same(
     frame: &mut FrameState,
     kernel: Vec<f32>,
@@ -510,7 +505,6 @@ pub fn convolve_depthwise_rgb_same(
 }
 
 /// Filled disk in pixel space (GPU).
-#[cfg(not(target_arch = "wasm32"))]
 pub fn fill_circle(
     frame: &mut FrameState,
     frame_width: usize,
@@ -556,7 +550,6 @@ pub fn fill_circle(
 }
 
 /// Fill the frame RGBA tensor on GPU (stays on GPU; no CPU staging touch).
-#[cfg(not(target_arch = "wasm32"))]
 pub fn uniform_fill_rgba(frame: &mut FrameState, low: f32, high: f32) {
     use burn::tensor::Distribution;
     let device = frame.device().clone();

@@ -973,7 +973,6 @@ fn frame_clear(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         )
     })?;
 
-    #[cfg(not(target_arch = "wasm32"))]
     if let Some(engine) = crate::engine::py_engine_tls::engine_compute_device() {
         if engine == xos_core::compute_device::ComputeDevice::Gpu {
             if crate::engine::py_engine_tls::with_engine_state_mut(|state| {

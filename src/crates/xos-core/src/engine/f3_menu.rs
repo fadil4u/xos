@@ -2,6 +2,7 @@
 //! Desktop: toggle with **F3** (or host binding). iOS: **three-finger long-press** on the
 //! main viewport (same idea as Expo’s dev gesture); implemented in `XosViewportView.swift`.
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::compute_device::ComputeDevice;
 use crate::engine::{
     frame_view_rect_norm, EngineState, F3_UI_SCALE_MAX_PERCENT, F3_UI_SCALE_MIN_PERCENT,

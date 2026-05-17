@@ -9,6 +9,17 @@ burn = { version = "=0.21.0-pre.3", default-features = false, features = ["std",
 burn-backend = { version = "=0.21.0-pre.3" }
 burn-ndarray = { version = "=0.21.0-pre.3", default-features = false }
 
+# Desktop (macOS / Windows / Linux): WGPU + Metal on Apple Silicon.
 [target.'cfg(all(not(target_os = "ios"), not(target_arch = "wasm32")))'.dependencies]
 burn = { version = "=0.21.0-pre.3", default-features = false, features = ["wgpu"] }
 burn-wgpu = { version = "=0.21.0-pre.3", default-features = false, features = ["std", "fusion", "metal"] }
+
+# iOS: WGPU + Metal.
+[target.'cfg(target_os = "ios")'.dependencies]
+burn = { version = "=0.21.0-pre.3", default-features = false, features = ["wgpu"] }
+burn-wgpu = { version = "=0.21.0-pre.3", default-features = false, features = ["std", "fusion", "metal"] }
+
+# WASM: WGPU + WebGPU (browser).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+burn = { version = "=0.21.0-pre.3", default-features = false, features = ["wgpu"] }
+burn-wgpu = { version = "=0.21.0-pre.3", default-features = false, features = ["std", "fusion", "webgpu"] }

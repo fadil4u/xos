@@ -5,6 +5,7 @@
 //! **`input` / `kernel` take `Vec<f32>`** so callers move owned buffers into [`TensorData`] without an
 //! extra `slice::to_vec()` copy. If you only have `&[f32]`, call `.to_vec()` once at the call site.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::OnceLock;
 
 use burn::tensor::TensorData;

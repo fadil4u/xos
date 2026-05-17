@@ -27,20 +27,11 @@ impl ComputeDevice {
         }
     }
 
-    /// Auto: GPU on native hosts, CPU on wasm.
+    /// Auto: GPU (WGPU / Metal / WebGPU) on all hosts; use `Some(Cpu)` to force CPU staging paths.
     pub fn resolve_auto(pref: Option<Self>) -> Self {
         match pref {
             Some(d) => d,
-            None => {
-                #[cfg(target_arch = "wasm32")]
-                {
-                    ComputeDevice::Cpu
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    ComputeDevice::Gpu
-                }
-            }
+            None => ComputeDevice::Gpu,
         }
     }
 

@@ -62,6 +62,9 @@ metal = "0.32.0"
 objc = "0.2"
 
 [target.'cfg(target_os = "ios")'.dependencies]
+burn = { version = "=0.21.0-pre.3", default-features = false, features = ["wgpu"] }
+burn-backend = { version = "=0.21.0-pre.3" }
+burn-wgpu = { version = "=0.21.0-pre.3", default-features = false, features = ["std", "fusion", "metal"] }
 ringbuf = "0.3"
 ct2rs = { version = "0.9.18", optional = true, default-features = false, features = ["whisper", "ruy"] }
 ureq = { version = "2.12", optional = true }
@@ -74,6 +77,9 @@ log = { version = "0.4", optional = true }
 mt19937 = { version = "3.3.0", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+burn = { version = "=0.21.0-pre.3", default-features = false, features = ["wgpu"] }
+burn-backend = { version = "=0.21.0-pre.3" }
+burn-wgpu = { version = "=0.21.0-pre.3", default-features = false, features = ["std", "fusion", "webgpu"] }
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

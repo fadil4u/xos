@@ -365,7 +365,6 @@ fn uniform_fill(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let frame_dev = device_policy::tensor_device_label(tensor_hint, vm)?;
     let engine_dev = device_policy::require_engine_device(vm, "uniform_fill", &frame_dev)?;
 
-    #[cfg(not(target_arch = "wasm32"))]
     if engine_dev == ComputeDevice::Gpu {
         if crate::engine::py_engine_tls::with_engine_state_mut(|state| {
             xos_core::burn_raster::uniform_fill_rgba(&mut state.frame, low as f32, high as f32);
@@ -385,7 +384,6 @@ fn uniform_fill(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
     crate::xos_module::with_frame_write_buffer(vm, Some(tensor_hint), |buffer| {
         fill_buffer_uniform_random(buffer, low, high, vm)?;
-        #[cfg(not(target_arch = "wasm32"))]
         let _ = crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
             state.frame.mark_cpu_staging_dirty();
         });

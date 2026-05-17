@@ -28,7 +28,6 @@ fn kernel_hwc_to_nchw(kernel: &[f32], kernel_size: usize) -> Vec<f32> {
 }
 
 /// When `Application.tick()` is active, convolve on [`FrameState`]'s GPU tensor (no per-frame CPU↔GPU vec path).
-#[cfg(not(target_arch = "wasm32"))]
 fn try_convolve_on_frame_gpu(
     kernel_nchw: &[f32],
     kernel_size: usize,
@@ -47,7 +46,6 @@ fn try_convolve_on_frame_gpu(
     .unwrap_or(false)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn try_convolve_depthwise_on_frame_gpu(
     kernel: Vec<f32>,
     kernel_size: usize,
@@ -203,7 +201,6 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let kernel_nchw = kernel_hwc_to_nchw(&kernel, kernel_size);
     let stride_pair = [stride, stride];
 
-    #[cfg(not(target_arch = "wasm32"))]
     if engine_dev == ComputeDevice::Gpu
         && try_convolve_on_frame_gpu(&kernel_nchw, kernel_size, stride_pair)
     {
@@ -232,7 +229,6 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     if engine_dev == ComputeDevice::Gpu {
         return Err(vm.new_runtime_error(
             "convolve(): GPU frame path unavailable (engine state not bound during tick)"
@@ -466,7 +462,6 @@ pub fn convolve_depthwise(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
     let stride_pair = [stride, stride];
 
-    #[cfg(not(target_arch = "wasm32"))]
     if engine_dev == ComputeDevice::Gpu
         && try_convolve_depthwise_on_frame_gpu(kernel.clone(), kernel_size, stride_pair)
     {
@@ -495,7 +490,6 @@ pub fn convolve_depthwise(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     if engine_dev == ComputeDevice::Gpu {
         return Err(vm.new_runtime_error(
             "convolve_depthwise(): GPU frame path unavailable (engine state not bound during tick)"

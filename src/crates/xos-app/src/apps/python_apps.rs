@@ -4,11 +4,17 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rustpython_vm::{AsObject, Interpreter};
-use xos_core::engine::{start_headless_native, start_native, start_overlay_native, Application};
+use rustpython_vm::Interpreter;
+#[cfg(all(not(target_os = "ios"), not(target_arch = "wasm32")))]
+use rustpython_vm::AsObject;
+use xos_core::engine::Application;
+#[cfg(all(not(target_os = "ios"), not(target_arch = "wasm32")))]
+use xos_core::engine::{start_headless_native, start_native, start_overlay_native};
 use xos_core::find_xos_project_root;
 use xos_python::engine::pyapp::PyApp;
-use xos_python::runtime::{execute_python_code, python_app_wants_headless};
+#[cfg(all(not(target_os = "ios"), not(target_arch = "wasm32")))]
+use xos_python::runtime::python_app_wants_headless;
+use xos_python::runtime::execute_python_code;
 
 /// One app folder under `src/apps/`.
 #[derive(Debug, Clone)]
