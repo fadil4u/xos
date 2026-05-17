@@ -6,6 +6,7 @@ pub mod coordinates;
 pub mod colors;
 pub mod csv_api;
 pub mod data;
+pub mod device_policy;
 pub mod dialoguer;
 pub mod dtypes;
 pub mod engine;

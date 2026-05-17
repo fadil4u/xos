@@ -27,6 +27,25 @@ pub fn fill_solid(frame: &mut FrameState, color: (u8, u8, u8, u8)) {
     frame.fill_solid_fast(color);
 }
 
+/// Opaque/solid fill directly on the GPU tensor (no CPU staging touch).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fill_solid_gpu(frame: &mut FrameState, color: (u8, u8, u8, u8)) {
+    let device = frame.device().clone();
+    let [h, w, _] = frame.tensor_dims();
+    let t = rgba_tensor(
+        &device,
+        h,
+        w,
+        [
+            color.0 as f32,
+            color.1 as f32,
+            color.2 as f32,
+            color.3 as f32,
+        ],
+    );
+    frame.set_burn_tensor(t);
+}
+
 /// Axis-aligned rectangle `[x0, x1) × [y0, y1)` in pixel coordinates, clipped to the frame.
 pub fn fill_rect(
     frame: &mut FrameState,

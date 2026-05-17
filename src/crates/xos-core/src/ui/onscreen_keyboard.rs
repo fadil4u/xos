@@ -416,22 +416,109 @@ impl OnScreenKeyboard {
         origin_x: i32,
         origin_y: i32,
     ) {
-        let mut full = vec![0u8; (screen_w * screen_h * 4) as usize];
-        keyboard.draw(&mut full, screen_w, screen_h);
+        let bg_color = if keyboard.trackpad_mode {
+            TRACKPAD_COLOR
+        } else {
+            KEYBOARD_BG_COLOR
+        };
+        for chunk in buffer.chunks_exact_mut(4) {
+            chunk.copy_from_slice(&[bg_color.0, bg_color.1, bg_color.2, 255]);
+        }
+        for dx in 0..buf_w {
+            if let Some(idx) = Self::local_idx(buf_w, buf_h, dx as i32, 0, 0, 0) {
+                buffer[idx] = TOP_LINE_COLOR.0;
+                buffer[idx + 1] = TOP_LINE_COLOR.1;
+                buffer[idx + 2] = TOP_LINE_COLOR.2;
+                buffer[idx + 3] = 255;
+            }
+        }
         for key in &keyboard.keys {
             let label = keyboard.key_label(key);
-            keyboard.draw_key_label_only(&mut full, screen_w, screen_h, key, &label);
+            let (x0, y0, x1, y1) = keyboard.key_pixel_rect(screen_w, screen_h, key);
+            let lx0 = x0 - origin_x;
+            let ly0 = y0 - origin_y;
+            let key_w = (x1 - x0).max(0) as u32;
+            let key_h = (y1 - y0).max(0) as u32;
+            if key_w == 0 || key_h == 0 {
+                continue;
+            }
+            let color = if key.pressed {
+                KEY_PRESSED_COLOR
+            } else {
+                KEY_COLOR
+            };
+            keyboard.draw_rounded_rect(buffer, buf_w, buf_h, lx0, ly0, key_w, key_h, color, 8.0);
+            keyboard.draw_key_label_local(
+                buffer,
+                buf_w,
+                buf_h,
+                origin_x,
+                origin_y,
+                screen_w,
+                screen_h,
+                key,
+                &label,
+            );
         }
-        for dy in 0..buf_h {
-            for dx in 0..buf_w {
-                let px = origin_x + dx as i32;
-                let py = origin_y + dy as i32;
-                let src = ((py as u32 * screen_w + px as u32) * 4) as usize;
-                let dst = ((dy * buf_w + dx) * 4) as usize;
-                if src + 3 < full.len() && dst + 3 < buffer.len() {
-                    buffer[dst..dst + 4].copy_from_slice(&full[src..src + 4]);
+    }
+
+    fn draw_key_label_local(
+        &self,
+        buffer: &mut [u8],
+        buf_w: u32,
+        buf_h: u32,
+        origin_x: i32,
+        origin_y: i32,
+        screen_w: u32,
+        screen_h: u32,
+        key: &Key,
+        label: &str,
+    ) {
+        let (x0, y0, x1, y1) = self.key_pixel_rect(screen_w, screen_h, key);
+        let key_w = (x1 - x0).max(0) as u32;
+        let key_h = (y1 - y0).max(0) as u32;
+        if key_w == 0 || key_h == 0 {
+            return;
+        }
+
+        let key_size = (key_w as f32).min(key_h as f32);
+        let font_size = (key_size * 0.36).clamp(9.0, 43.2);
+        let line_metrics = self
+            .font
+            .horizontal_line_metrics(font_size)
+            .expect("Font missing horizontal metrics");
+        let baseline_y =
+            (y0 - origin_y) as f32 + (key_h as f32 / 2.0) + (line_metrics.ascent - line_metrics.descent) / 2.0;
+
+        let label_chars: Vec<char> = label.chars().collect();
+        let mut total_width = 0.0;
+        let mut character_data = Vec::new();
+        for &ch in &label_chars {
+            let (metrics, bitmap) = self.font.rasterize(ch, font_size);
+            total_width += metrics.advance_width;
+            character_data.push((metrics, bitmap));
+        }
+
+        let mut current_x = (x0 - origin_x) as f32 + ((key_w as f32 - total_width) / 2.0);
+        for (metrics, bitmap) in character_data {
+            let char_y = baseline_y - metrics.height as f32 - metrics.ymin as f32;
+            for y in 0..metrics.height {
+                for x in 0..metrics.width {
+                    let val = bitmap[y * metrics.width + x];
+                    if val == 0 {
+                        continue;
+                    }
+                    let sx = (current_x + x as f32) as i32;
+                    let sy = (char_y + y as f32) as i32;
+                    if let Some(idx) = Self::local_idx(buf_w, buf_h, sx, sy, 0, 0) {
+                        buffer[idx] = KEY_TEXT_COLOR.0;
+                        buffer[idx + 1] = KEY_TEXT_COLOR.1;
+                        buffer[idx + 2] = KEY_TEXT_COLOR.2;
+                        buffer[idx + 3] = val;
+                    }
                 }
             }
+            current_x += metrics.advance_width;
         }
     }
 

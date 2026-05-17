@@ -173,6 +173,7 @@ pub extern "C" fn xos_engine_init(app_name: *const c_char, width: u32, height: u
     let safe_region = SafeRegionBoundingRectangle::ios_iphone_16_pro();
     let mut engine_state = EngineState {
         frame: FrameState::new(width, height, safe_region),
+        compute_device: xos_core::compute_device::ComputeDevice::resolve_auto(None),
         mouse: MouseState {
             x: 0.0,
             y: 0.0,

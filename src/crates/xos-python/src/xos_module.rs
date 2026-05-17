@@ -329,6 +329,7 @@ impl StandalonePreviewApp {
                         size.height.max(1),
                         safe_region,
                     ),
+                    compute_device: xos_core::compute_device::ComputeDevice::Cpu,
                     mouse: xos_core::engine::MouseState {
                         x: 0.0,
                         y: 0.0,
@@ -972,6 +973,30 @@ fn frame_clear(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         )
     })?;
 
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(engine) = crate::engine::py_engine_tls::engine_compute_device() {
+        if engine == xos_core::compute_device::ComputeDevice::Gpu {
+            if crate::engine::py_engine_tls::with_engine_state_mut(|state| {
+                xos_core::burn_raster::fill_solid_gpu(
+                    &mut state.frame,
+                    (
+                        r.clamp(0, 255) as u8,
+                        g.clamp(0, 255) as u8,
+                        b.clamp(0, 255) as u8,
+                        a.clamp(0, 255) as u8,
+                    ),
+                );
+                true
+            })
+            .is_some()
+            {
+                return Ok(vm.ctx.none());
+            }
+        } else {
+            // CPU app: fall through to staging fill below.
+        }
+    }
+
     let buffer_len = width * height * 4;
     let buffer = unsafe { std::slice::from_raw_parts_mut(buffer_ptr, buffer_len) };
     crate::rasterizer::fill_buffer_solid_rgba(
@@ -1036,7 +1061,10 @@ fn frame_begin_standalone(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             .into(),
         vm,
     )?;
-    tensor_dict.set_item("device", vm.ctx.new_str("cpu").into(), vm)?;
+    let device_label = crate::device_policy::app_compute_device(vm)
+        .map(|d| d.as_str().to_string())
+        .unwrap_or_else(|_| "cpu".to_string());
+    tensor_dict.set_item("device", vm.ctx.new_str(device_label).into(), vm)?;
     tensor_dict.set_item("dtype", vm.ctx.new_str("uint8").into(), vm)?;
     tensor_dict.set_item("size", vm.ctx.new_int(width * height * 4).into(), vm)?;
     tensor_dict.set_item(

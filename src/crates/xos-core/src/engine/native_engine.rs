@@ -2,6 +2,7 @@ use super::engine::{
     tick_frame_delta, Application, CursorStyle, CursorStyleSetter, EngineState, FrameState,
     KeyboardModifiers, KeyboardState, MouseState, SafeRegionBoundingRectangle,
 };
+use crate::compute_device::ComputeDevice;
 use super::{
     apply_frame_view_zoom, f3_menu_boost_interaction_fade, f3_menu_handle_frame_zoom_scroll,
     f3_menu_handle_mouse_down, f3_menu_handle_mouse_move, f3_menu_handle_mouse_up,
@@ -278,20 +279,29 @@ impl AppState {
             );
 
             if self.engine_state.keyboard.onscreen.needs_framebuffer_access() {
-                #[cfg(not(target_arch = "wasm32"))]
-                self.engine_state.keyboard.onscreen.draw_overlay_gpu(
-                    &mut self.engine_state.frame,
-                    width,
-                    height,
-                    &safe_region,
-                );
-                #[cfg(target_arch = "wasm32")]
-                {
-                    let buffer = self.engine_state.frame.buffer_mut();
+                if self.engine_state.compute_device == ComputeDevice::Cpu {
+                    let buffer = self.engine_state.frame.staging_slice_mut_for_tick();
                     self.engine_state
                         .keyboard
                         .onscreen
                         .tick_draw_cpu(buffer, width, height, &safe_region);
+                    self.engine_state.frame.mark_cpu_staging_dirty();
+                } else {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    self.engine_state.keyboard.onscreen.draw_overlay_gpu(
+                        &mut self.engine_state.frame,
+                        width,
+                        height,
+                        &safe_region,
+                    );
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let buffer = self.engine_state.frame.buffer_mut();
+                        self.engine_state
+                            .keyboard
+                            .onscreen
+                            .tick_draw_cpu(buffer, width, height, &safe_region);
+                    }
                 }
             }
         }
@@ -798,6 +808,7 @@ impl ApplicationHandler for AppStateWrapper {
                     burn_device,
                     true,
                 ),
+                compute_device: ComputeDevice::resolve_auto(None),
                 mouse: MouseState {
                     x: 0.0,
                     y: 0.0,
@@ -946,6 +957,7 @@ pub fn start_headless_native(
     let safe_region = SafeRegionBoundingRectangle::full_screen();
     let mut engine_state = EngineState {
         frame: FrameState::new(width.max(1), height.max(1), safe_region),
+        compute_device: ComputeDevice::resolve_auto(None),
         mouse: MouseState {
             x: 0.0,
             y: 0.0,

@@ -2,6 +2,7 @@
 //! Desktop: toggle with **F3** (or host binding). iOS: **three-finger long-press** on the
 //! main viewport (same idea as Expo’s dev gesture); implemented in `XosViewportView.swift`.
 
+use crate::compute_device::ComputeDevice;
 use crate::engine::{
     frame_view_rect_norm, EngineState, F3_UI_SCALE_MAX_PERCENT, F3_UI_SCALE_MIN_PERCENT,
     FRAME_VIEW_ZOOM_MAX, FRAME_VIEW_ZOOM_MIN,
@@ -25,8 +26,7 @@ const FONT_HEADER_BASE_SIZE: f32 = 17.0;
 #[cfg(target_os = "ios")]
 const IOS_MESH_TOGGLE_LABEL_BASE_SIZE: f32 = 16.0;
 
-/// Panel-local rectangle for wasm full-frame CPU compositing.
-#[cfg(target_arch = "wasm32")]
+/// Full-frame CPU rectangle (wasm + native CPU compute device).
 macro_rules! f3_blend_rect {
     ($buffer:expr, $fw:expr, $fh:expr, $($rest:tt)*) => {
         blend_rect_cpu($buffer, $fw, $fh, $($rest)*);
@@ -700,19 +700,18 @@ pub fn tick_f3_menu(state: &mut EngineState) {
     let height = shape[0] as f32;
 
     #[cfg(not(target_arch = "wasm32"))]
-    {
+    if state.compute_device == ComputeDevice::Gpu {
         draw_f3_panel_native(state, &geom, knob_w, overlay_alpha, view_rect, width, height);
         return;
     }
 
-    #[cfg(target_arch = "wasm32")]
     let fw = width as usize;
-    #[cfg(target_arch = "wasm32")]
     let fh = height as usize;
     #[cfg(target_arch = "wasm32")]
     let buffer = state.frame.buffer_mut();
+    #[cfg(not(target_arch = "wasm32"))]
+    let buffer = state.frame.staging_slice_mut_for_tick();
 
-    #[cfg(target_arch = "wasm32")]
     {
     // Opaque black panel behind text and slider.
     let panel_x1 = (geom.panel_left + geom.panel_w).ceil() as i32;
@@ -1050,8 +1049,11 @@ pub fn tick_f3_menu(state: &mut EngineState) {
     let line_h = 32.0 * ui_scale;
     let label_origin_y = fps_origin_y + line_h + line_gap;
 
-    draw_f3_text_layer(
-        state,
+    draw_f3_text_layer_cpu(
+        &state.f3_menu,
+        buffer,
+        fw,
+        fh,
         &geom,
         width,
         height,
@@ -1061,6 +1063,8 @@ pub fn tick_f3_menu(state: &mut EngineState) {
         label_origin_x,
         label_origin_y,
     );
+    #[cfg(not(target_arch = "wasm32"))]
+    state.frame.mark_cpu_staging_dirty();
     }
 }
 
@@ -1509,61 +1513,64 @@ fn draw_f3_panel_native(
     crate::burn_raster::blend_rgba_patch(&mut state.frame, pl, pt, pw, ph, scratch);
 }
 
-#[cfg(target_arch = "wasm32")]
-fn draw_f3_text_layer(
-    state: &mut EngineState,
+fn draw_f3_text_layer_cpu(
+    menu: &F3Menu,
+    buffer: &mut [u8],
+    width: usize,
+    height: usize,
     geom: &PanelGeom,
-    width: f32,
-    height: f32,
+    _frame_w: f32,
+    _frame_h: f32,
     overlay_alpha: f32,
     fps_origin_x: f32,
     fps_origin_y: f32,
     label_origin_x: f32,
     label_origin_y: f32,
 ) {
-    let buffer = state.frame.buffer_mut();
-        #[cfg(target_os = "ios")]
-        blend_text_cpu(
-            buffer,
-            width,
-            height,
-            &state.f3_menu.ios_mesh_toggle_rasterizer,
+    let wf = width as f32;
+    let hf = height as f32;
+    #[cfg(target_os = "ios")]
+    blend_text_cpu(
+        buffer,
+        wf,
+        hf,
+        &menu.ios_mesh_toggle_rasterizer,
             geom.toggle_left + (8.0 * geom.ui_scale),
             geom.toggle_top + ((geom.toggle_bottom - geom.toggle_top) * 0.23),
             (245, 245, 245),
             overlay_alpha,
         );
-        blend_text_cpu(
-            buffer,
-            width,
-            height,
-            &state.f3_menu.fps_rasterizer,
+    blend_text_cpu(
+        buffer,
+        wf,
+        hf,
+        &menu.fps_rasterizer,
             fps_origin_x,
             fps_origin_y,
             (0, 255, 0),
             overlay_alpha,
         );
-        blend_text_cpu(
-            buffer,
-            width,
-            height,
-            &state.f3_menu.scale_rasterizer,
+    blend_text_cpu(
+        buffer,
+        wf,
+        hf,
+        &menu.scale_rasterizer,
             label_origin_x,
             label_origin_y,
             (255, 255, 255),
             overlay_alpha,
         );
-        blend_text_cpu(
-            buffer,
-            width,
-            height,
-            &state.f3_menu.font_header_rasterizer,
+    blend_text_cpu(
+        buffer,
+        wf,
+        hf,
+        &menu.font_header_rasterizer,
             geom.slider_left,
             geom.font_header_top,
             (210, 210, 210),
             overlay_alpha,
         );
-        for (idx, text_rasterizer) in state.f3_menu.font_option_rasterizers.iter().enumerate() {
+        for (idx, text_rasterizer) in menu.font_option_rasterizers.iter().enumerate() {
             let Some((x0, _x1, y0, y1)) = font_option_rect(&geom, idx) else {
                 continue;
             };
@@ -1575,17 +1582,17 @@ fn draw_f3_text_layer(
             let tx =
                 x0 + ((geom.slider_right - geom.slider_left - text_w) * 0.5).max(8.0 * geom.ui_scale);
             let ty = y0 + ((y1 - y0 - FONT_OPTION_BASE_SIZE * geom.ui_scale) * 0.35).max(2.0);
-            blend_text_cpu(
-                buffer,
-                width,
-                height,
-                text_rasterizer,
-                tx,
-                ty,
-                (245, 245, 245),
-                overlay_alpha,
-            );
-        }
+        blend_text_cpu(
+            buffer,
+            wf,
+            hf,
+            text_rasterizer,
+            tx,
+            ty,
+            (245, 245, 245),
+            overlay_alpha,
+        );
+    }
 }
 
 fn blend_text_into_scratch(

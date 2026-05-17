@@ -1,6 +1,7 @@
 use super::f3_menu::F3Menu;
 
 use crate::burn_raster;
+use crate::compute_device::ComputeDevice;
 use xos_tensor::{BurnTensor, WgpuDevice};
 use crate::time::Instant;
 use std::ptr::NonNull;
@@ -425,6 +426,8 @@ pub struct KeyboardState {
 pub struct EngineState {
     /// Frame state containing pixel array and safe region boundaries
     pub frame: FrameState,
+    /// Resolved app compute backend (`cpu` = staging/rasterizer only; `gpu` = Burn tensor + present).
+    pub compute_device: ComputeDevice,
     pub mouse: MouseState,
     pub keyboard: KeyboardState,
     /// Global F3 menu (FPS + UI scale; drawn by the engine after each app tick).
@@ -475,6 +478,20 @@ pub fn f3_ui_scale_multiplier(percent: u16) -> f32 {
 }
 
 impl EngineState {
+    /// Apply a Python `device` preference (`None` / missing → auto).
+    pub fn apply_compute_device_pref(&mut self, pref: Option<&str>) -> Result<(), String> {
+        let parsed = ComputeDevice::parse_pref(pref)?;
+        self.compute_device = ComputeDevice::resolve_auto(parsed);
+        self.frame
+            .set_gpu_present_enabled(self.compute_device.gpu_present_enabled());
+        Ok(())
+    }
+
+    #[inline]
+    pub fn compute_device_label(&self) -> &'static str {
+        self.compute_device.as_str()
+    }
+
     /// Same as [`f3_ui_scale_multiplier`]: `ui_scale_percent / 100` (25–500% → 0.25–5.0).
     #[inline]
     pub fn ui_scale_coefficient(&self) -> f32 {

@@ -251,6 +251,8 @@ unsafe impl Sync for FrameBufferPtr {}
 pub static CURRENT_FRAME_BUFFER: Mutex<Option<FrameBufferPtr>> = Mutex::new(None);
 pub static CURRENT_FRAME_WIDTH: Mutex<usize> = Mutex::new(0);
 pub static CURRENT_FRAME_HEIGHT: Mutex<usize> = Mutex::new(0);
+/// Set when any rasterizer / `frame.clear` path writes the active CPU framebuffer this tick.
+pub static FRAME_CPU_WRITTEN: Mutex<bool> = Mutex::new(false);
 
 // Global font for text rasterization (lazy loaded)
 static GLOBAL_FONT: Mutex<Option<Font>> = Mutex::new(None);
@@ -263,6 +265,7 @@ pub(crate) fn fill_buffer_solid_rgba(buffer: &mut [u8], r: u8, g: u8, b: u8, a: 
     for chunk in buffer.chunks_exact_mut(4) {
         chunk.copy_from_slice(&px);
     }
+    note_frame_cpu_write();
 }
 
 /// Called by PyApp before tick to set the frame buffer pointer
@@ -270,11 +273,20 @@ pub fn set_frame_buffer_context(buffer: &mut [u8], width: usize, height: usize) 
     *CURRENT_FRAME_BUFFER.lock().unwrap() = Some(FrameBufferPtr(buffer.as_mut_ptr()));
     *CURRENT_FRAME_WIDTH.lock().unwrap() = width;
     *CURRENT_FRAME_HEIGHT.lock().unwrap() = height;
+    *FRAME_CPU_WRITTEN.lock().unwrap() = false;
 }
 
 /// Called by PyApp after tick to clear the frame buffer pointer
 pub fn clear_frame_buffer_context() {
     *CURRENT_FRAME_BUFFER.lock().unwrap() = None;
+    *FRAME_CPU_WRITTEN.lock().unwrap() = false;
+}
+
+#[inline]
+pub fn note_frame_cpu_write() {
+    if let Ok(mut w) = FRAME_CPU_WRITTEN.lock() {
+        *w = true;
+    }
 }
 
 /// Copy active RGBA framebuffer when `width` / `height` match the bound context (used by `xos.json` / mesh).
@@ -1232,6 +1244,7 @@ fn rects_filled(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         )));
     }
 
+    note_frame_cpu_write();
     Ok(vm.ctx.none())
 }
 

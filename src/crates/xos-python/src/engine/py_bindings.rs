@@ -1,4 +1,5 @@
 use xos_core::engine::{EngineState, FrameState};
+use xos_core::compute_device::ComputeDevice;
 use rustpython_vm::{PyObjectRef, PyResult, VirtualMachine};
 
 /// Python wrapper for Array<u8>
@@ -77,9 +78,13 @@ pub fn create_py_array(vm: &VirtualMachine, frame: &mut FrameState) -> PyResult 
     Ok(dict.into())
 }
 
-pub fn create_py_frame_state(vm: &VirtualMachine, frame: &mut FrameState) -> PyResult {
+pub fn create_py_frame_state(
+    vm: &VirtualMachine,
+    frame: &mut FrameState,
+    compute_device: ComputeDevice,
+) -> PyResult {
     let shape = frame.shape();
-    let buffer = frame.buffer_mut();
+    let buffer = frame.staging_slice_mut_for_tick();
 
     // Tensor metadata dict (CPU RGBA; rasterizer writes the real buffer directly)
     let tensor_dict = vm.ctx.new_dict();
@@ -92,7 +97,7 @@ pub fn create_py_frame_state(vm: &VirtualMachine, frame: &mut FrameState) -> PyR
     )?;
     tensor_dict.set_item(
         "device",
-        vm.ctx.new_str(xos_tensor::compute_device_label()).into(),
+        vm.ctx.new_str(compute_device.as_str()).into(),
         vm,
     )?;
 
@@ -118,6 +123,7 @@ pub fn update_py_frame_state(
     vm: &VirtualMachine,
     frame_obj: PyObjectRef,
     frame: &mut FrameState,
+    compute_device: ComputeDevice,
 ) -> PyResult<()> {
     // frame_obj might be a _FrameWrapper, get the underlying dict
     let actual_dict = if let Ok(data_attr) = vm.get_attribute_opt(frame_obj.clone(), "_data") {
@@ -162,7 +168,7 @@ pub fn update_py_frame_state(
     frame_dict.set_item("height", vm.ctx.new_int(height).into(), vm)?;
     tensor_dict.set_item(
         "device",
-        vm.ctx.new_str(xos_tensor::compute_device_label()).into(),
+        vm.ctx.new_str(compute_device.as_str()).into(),
         vm,
     )?;
 

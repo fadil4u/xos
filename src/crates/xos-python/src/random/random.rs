@@ -1,6 +1,9 @@
 use rustpython_vm::{
     builtins::PyModule, function::FuncArgs, PyObjectRef, PyRef, PyResult, VirtualMachine,
 };
+use xos_core::compute_device::ComputeDevice;
+
+use crate::device_policy;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use std::sync::OnceLock;
@@ -282,6 +285,11 @@ fn uniform(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
         let py_tensor = Tensor::new(random_data, shape.clone());
         let dict = py_tensor.to_py_dict(vm, DType::Float32)?;
+        if let Ok(d) = dict.clone().downcast::<rustpython_vm::builtins::PyDict>() {
+            if let Ok(dev) = device_policy::effective_compute_device(vm) {
+                device_policy::tag_tensor_device(&d, dev.as_str(), vm);
+            }
+        }
 
         // Wrap in _TensorWrapper for nice display and compatibility
         if let Ok(wrapper_class) = vm.builtins.get_attr("Tensor", vm) {
@@ -354,17 +362,25 @@ fn uniform_fill(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let low: f64 = parse_f64(&args_vec[1], vm)?;
     let high: f64 = parse_f64(&args_vec[2], vm)?;
 
+    let frame_dev = device_policy::tensor_device_label(tensor_hint, vm)?;
+    let engine_dev = device_policy::require_engine_device(vm, "uniform_fill", &frame_dev)?;
+
     #[cfg(not(target_arch = "wasm32"))]
-    {
-        if crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
+    if engine_dev == ComputeDevice::Gpu {
+        if crate::engine::py_engine_tls::with_engine_state_mut(|state| {
             xos_core::burn_raster::uniform_fill_rgba(&mut state.frame, low as f32, high as f32);
             true
-        }).is_some()
+        })
+        .is_some()
         {
             let sentinel = vm.ctx.new_dict();
             sentinel.set_item("_direct_fill", vm.ctx.new_bool(true).into(), vm)?;
             return Ok(sentinel.into());
         }
+        return Err(vm.new_runtime_error(
+            "uniform_fill(): GPU path unavailable (engine state not bound during tick)"
+                .to_string(),
+        ));
     }
 
     crate::xos_module::with_frame_write_buffer(vm, Some(tensor_hint), |buffer| {

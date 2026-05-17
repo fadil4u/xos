@@ -919,7 +919,7 @@ class Application:
     pointer, ``key_char``, and shortcuts alike — no special cases per event type are required.
     """
     
-    def __init__(self, headless=None):
+    def __init__(self, headless=None, device=None):
         import builtins
         next_id = int(getattr(builtins, "__xos_next_viewport_id__", 0))
         builtins.__xos_next_viewport_id__ = next_id + 1
@@ -941,6 +941,8 @@ class Application:
         self.safe_region = SafeRegion(0.0, 0.0, 1.0, 1.0)
         if headless is not None:
             self.headless = bool(headless)
+        if device is not None:
+            self.device = device
 
         # Standalone framebuffer for __init__ drawing (uniform_fill, rasterizer, etc.).
         self._xos_init_standalone_frame()
@@ -1157,14 +1159,36 @@ impl PyApp {
     }
 }
 
+fn read_python_device_pref(
+    vm: &rustpython_vm::VirtualMachine,
+    app_instance: &rustpython_vm::PyObjectRef,
+) -> Option<String> {
+    vm.get_attribute_opt(app_instance.clone(), "device")
+        .ok()
+        .flatten()
+        .and_then(|obj| {
+            if obj.is(&vm.ctx.none()) {
+                None
+            } else {
+                obj.try_into_value::<String>(vm).ok()
+            }
+        })
+}
+
 impl Application for PyApp {
     fn setup(&mut self, state: &mut EngineState) -> Result<(), String> {
         if let Some(ref app_instance) = self.app_instance {
             let viewport_id = self.interpreter.enter(|vm| -> Result<Option<u64>, String> {
+                let pref = read_python_device_pref(vm, app_instance);
+                state
+                    .apply_compute_device_pref(pref.as_deref())
+                    .map_err(|e| e.to_string())?;
+
                 // Create Python frame object from engine state
                 let frame_dict = crate::engine::py_bindings::create_py_frame_state(
                     vm,
                     &mut state.frame,
+                    state.compute_device,
                 )
                 .map_err(|e| format!("Failed to create frame object: {:?}", e))?;
 
@@ -1287,7 +1311,12 @@ Call super().__init__() in your app __init__ before using tick().",
 
                 // Update frame data before calling tick
                 if let Ok(Some(frame_obj)) = vm.get_attribute_opt(app_instance.clone(), "frame") {
-                    let _ = crate::engine::py_bindings::update_py_frame_state(vm, frame_obj.clone(), &mut state.frame);
+                    let _ = crate::engine::py_bindings::update_py_frame_state(
+                        vm,
+                        frame_obj.clone(),
+                        &mut state.frame,
+                        state.compute_device,
+                    );
 
                     // Update mouse data
                     let mouse_dict = vm.ctx.new_dict();
@@ -1328,6 +1357,14 @@ Call super().__init__() in your app __init__ before using tick().",
                 }
             } else {
                 self.ticks_completed = self.ticks_completed.saturating_add(1);
+            }
+
+            if crate::rasterizer::FRAME_CPU_WRITTEN
+                .lock()
+                .map(|w| *w)
+                .unwrap_or(false)
+            {
+                state.frame.mark_cpu_staging_dirty();
             }
 
             // Clear the frame buffer context after tick
@@ -1474,13 +1511,14 @@ Call super().__init__() in your app __init__ before using tick().",
             let shape = state.frame.shape();
             let frame_width = shape[1];
             let frame_height = shape[0];
-            let buffer = state.frame.buffer_mut();
+            let buffer = state.frame.staging_slice_mut_for_tick();
             crate::rasterizer::set_frame_buffer_context(
                 buffer,
                 frame_width,
                 frame_height,
             );
 
+            let _tls_guard = TickEngineStateGuard::install(state);
             self.interpreter.enter(|vm| {
                 // Update frame data before calling the handler
                 if let Ok(Some(frame_obj)) = vm.get_attribute_opt(app_instance.clone(), "frame") {
@@ -1488,6 +1526,7 @@ Call super().__init__() in your app __init__ before using tick().",
                         vm,
                         frame_obj,
                         &mut state.frame,
+                        state.compute_device,
                     );
                 }
                 // Call the Python handler
@@ -1500,6 +1539,14 @@ Call super().__init__() in your app __init__ before using tick().",
                     ));
                 }
             });
+
+            if crate::rasterizer::FRAME_CPU_WRITTEN
+                .lock()
+                .map(|w| *w)
+                .unwrap_or(false)
+            {
+                state.frame.mark_cpu_staging_dirty();
+            }
 
             // Clear the frame buffer context after handler completes
             crate::rasterizer::clear_frame_buffer_context();

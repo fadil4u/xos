@@ -124,6 +124,7 @@ pub fn run_web(app: Box<dyn Application>) -> Result<(), JsValue> {
                 let safe_region = SafeRegionBoundingRectangle::full_screen();
                 FrameState::new(width, height, safe_region)
             },
+            compute_device: crate::compute_device::ComputeDevice::resolve_auto(None),
             mouse: MouseState {
                 x: 0.0,
                 y: 0.0,

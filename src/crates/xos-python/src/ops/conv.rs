@@ -1,5 +1,8 @@
+use xos_core::compute_device::ComputeDevice;
 use xos_tensor::conv::{conv2d, depthwise_conv2d};
 use rustpython_vm::{function::FuncArgs, PyObjectRef, PyResult, VirtualMachine};
+
+use crate::device_policy;
 
 fn direct_fill_sentinel(vm: &VirtualMachine) -> PyResult {
     let sentinel = vm.ctx.new_dict();
@@ -144,8 +147,20 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         ));
     }
 
-    let _image_dict = &args_vec[0]; // Image dict (we access frame buffer directly)
+    let image_arg = &args_vec[0];
     let kernel_arg = &args_vec[1];
+
+    let frame_dev = device_policy::tensor_device_label(image_arg, vm)?;
+    let kernel_dev = device_policy::tensor_device_label(kernel_arg, vm)?;
+    device_policy::require_same_devices(
+        vm,
+        "convolve",
+        &[
+            ("frame", frame_dev.clone()),
+            ("kernel", kernel_dev.clone()),
+        ],
+    )?;
+    let engine_dev = device_policy::require_engine_device(vm, "convolve", &frame_dev)?;
 
     let kernel_list = get_array_data_list(kernel_arg, vm)?
         .and_then(|o| o.downcast::<rustpython_vm::builtins::PyList>().ok())
@@ -189,7 +204,9 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let stride_pair = [stride, stride];
 
     #[cfg(not(target_arch = "wasm32"))]
-    if try_convolve_on_frame_gpu(&kernel_nchw, kernel_size, stride_pair) {
+    if engine_dev == ComputeDevice::Gpu
+        && try_convolve_on_frame_gpu(&kernel_nchw, kernel_size, stride_pair)
+    {
         if inplace {
             return direct_fill_sentinel(vm);
         }
@@ -211,8 +228,16 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
                 output_rgb[dst + 1] = buffer[src + 1] as f32;
                 output_rgb[dst + 2] = buffer[src + 2] as f32;
             }
-            return wrap_output_tensor(vm, width, height, &output_rgb);
+            return wrap_output_tensor(vm, width, height, &output_rgb, engine_dev);
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if engine_dev == ComputeDevice::Gpu {
+        return Err(vm.new_runtime_error(
+            "convolve(): GPU frame path unavailable (engine state not bound during tick)"
+                .to_string(),
+        ));
     }
 
     // Get the frame buffer from global context
@@ -311,10 +336,13 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             }
         }
 
+        crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
+            state.frame.mark_cpu_staging_dirty();
+        });
         return direct_fill_sentinel(vm);
     }
 
-    wrap_output_tensor(vm, width, height, &output_rgb)
+    wrap_output_tensor(vm, width, height, &output_rgb, engine_dev)
 }
 
 fn wrap_output_tensor(
@@ -322,6 +350,7 @@ fn wrap_output_tensor(
     width: usize,
     height: usize,
     output_rgb: &[f32],
+    device: ComputeDevice,
 ) -> PyResult {
     let py_list: Vec<rustpython_vm::PyObjectRef> = output_rgb
         .iter()
@@ -343,7 +372,7 @@ fn wrap_output_tensor(
     tensor_dict.set_item("dtype", vm.ctx.new_str("float32").into(), vm)?;
     tensor_dict.set_item(
         "device",
-        vm.ctx.new_str(xos_tensor::compute_device_label()).into(),
+        vm.ctx.new_str(device.as_str()).into(),
         vm,
     )?;
     tensor_dict.set_item("_data", vm.ctx.new_list(py_list).into(), vm)?;
@@ -392,8 +421,20 @@ pub fn convolve_depthwise(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         ));
     }
 
-    let _image_dict = &args_vec[0]; // Image dict (we access frame buffer directly)
+    let image_arg = &args_vec[0];
     let kernel_arg = &args_vec[1];
+
+    let frame_dev = device_policy::tensor_device_label(image_arg, vm)?;
+    let kernel_dev = device_policy::tensor_device_label(kernel_arg, vm)?;
+    device_policy::require_same_devices(
+        vm,
+        "convolve_depthwise",
+        &[
+            ("frame", frame_dev.clone()),
+            ("kernel", kernel_dev.clone()),
+        ],
+    )?;
+    let engine_dev = device_policy::require_engine_device(vm, "convolve_depthwise", &frame_dev)?;
 
     let kernel_list = get_array_data_list(kernel_arg, vm)?
         .and_then(|o| o.downcast::<rustpython_vm::builtins::PyList>().ok())
@@ -426,7 +467,9 @@ pub fn convolve_depthwise(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let stride_pair = [stride, stride];
 
     #[cfg(not(target_arch = "wasm32"))]
-    if try_convolve_depthwise_on_frame_gpu(kernel.clone(), kernel_size, stride_pair) {
+    if engine_dev == ComputeDevice::Gpu
+        && try_convolve_depthwise_on_frame_gpu(kernel.clone(), kernel_size, stride_pair)
+    {
         if inplace {
             return direct_fill_sentinel(vm);
         }
@@ -448,8 +491,16 @@ pub fn convolve_depthwise(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
                 output_rgb[dst + 1] = buffer[src + 1] as f32;
                 output_rgb[dst + 2] = buffer[src + 2] as f32;
             }
-            return wrap_output_tensor(vm, width, height, &output_rgb);
+            return wrap_output_tensor(vm, width, height, &output_rgb, engine_dev);
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if engine_dev == ComputeDevice::Gpu {
+        return Err(vm.new_runtime_error(
+            "convolve_depthwise(): GPU frame path unavailable (engine state not bound during tick)"
+                .to_string(),
+        ));
     }
 
     // Get the frame buffer from global context
@@ -561,5 +612,5 @@ pub fn convolve_depthwise(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         return direct_fill_sentinel(vm);
     }
 
-    wrap_output_tensor(vm, width, height, &output_rgb)
+    wrap_output_tensor(vm, width, height, &output_rgb, engine_dev)
 }
