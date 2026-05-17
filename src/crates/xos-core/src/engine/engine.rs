@@ -4,7 +4,11 @@ use crate::burn_raster;
 use crate::compute_device::ComputeDevice;
 #[cfg(target_arch = "wasm32")]
 use burn::tensor::TensorPrimitive;
+#[cfg(target_arch = "wasm32")]
+use burn::tensor::backend::Backend;
 use xos_tensor::{BurnTensor, WgpuDevice};
+#[cfg(target_arch = "wasm32")]
+use xos_tensor::XosBackend;
 use crate::time::Instant;
 use std::ptr::NonNull;
 
@@ -109,19 +113,19 @@ pub struct FrameState {
     gpu_present_enabled: bool,
     /// Safe region bounding rectangle for UI elements
     pub safe_region_boundaries: SafeRegionBoundingRectangle,
+    /// Async GPU→CPU readback in flight (wasm canvas path).
+    #[cfg(target_arch = "wasm32")]
+    wasm_readback_pending: bool,
 }
 
-/// On wasm, Burn readback needs an explicit GPU flush/sync before `try_into_data`.
+/// Drain fusion ops and sync the WGPU device before async host readback.
 #[cfg(target_arch = "wasm32")]
-fn flush_wgpu_before_host_read(tensor: &BurnTensor<3>) {
+pub(crate) fn flush_gpu_for_readback(device: &WgpuDevice, tensor: &BurnTensor<3>) {
     let TensorPrimitive::Float(fusion) = tensor.clone().into_primitive() else {
         return;
     };
-    let client = fusion.client.clone();
-    if client.flush().is_err() {
-        crate::print("xos wasm: wgpu flush before frame readback failed");
-    }
-    if cubecl_common::future::block_on(client.sync()).is_err() {
+    fusion.client.drain();
+    if XosBackend::sync(device).is_err() {
         crate::print("xos wasm: wgpu sync before frame readback failed");
     }
 }
@@ -159,7 +163,35 @@ impl FrameState {
             cpu_dirty: false,
             gpu_present_enabled,
             safe_region_boundaries: safe_region,
+            #[cfg(target_arch = "wasm32")]
+            wasm_readback_pending: false,
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[inline]
+    pub(crate) fn wasm_readback_pending(&self) -> bool {
+        self.wasm_readback_pending
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn begin_wasm_readback(&mut self) {
+        self.wasm_readback_pending = true;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn clear_wasm_readback_pending(&mut self) {
+        self.wasm_readback_pending = false;
+    }
+
+    /// Apply async readback result into CPU staging (wasm only).
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn complete_wasm_readback(&mut self, data: burn::tensor::TensorData) {
+        let h = self.height as usize;
+        let w = self.width as usize;
+        self.write_f32_rgba_to_staging(&data, h, w);
+        self.gpu_dirty = false;
+        self.wasm_readback_pending = false;
     }
 
     #[inline]
@@ -269,30 +301,19 @@ impl FrameState {
 
     /// Copy the GPU frame tensor into CPU staging / the pixels mirror (for display after GPU ops).
     pub fn publish_gpu_to_staging(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
         if self.gpu_dirty {
             self.sync_tensor_to_cpu();
             self.gpu_dirty = false;
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn sync_tensor_to_cpu(&mut self) {
         let h = self.height as usize;
         let w = self.width as usize;
-        #[cfg(target_arch = "wasm32")]
-        {
-            flush_wgpu_before_host_read(&self.tensor);
-            let data = match self.tensor.clone().try_into_data() {
-                Ok(d) => d,
-                Err(e) => {
-                    crate::print(&format!("xos wasm: frame GPU readback failed: {e:?}"));
-                    return;
-                }
-            };
-            return Self::write_f32_rgba_to_staging(self, &data, h, w);
-        }
-        #[cfg(not(target_arch = "wasm32"))]
         let data = self.tensor.clone().into_data();
-        Self::write_f32_rgba_to_staging(self, &data, h, w);
+        self.write_f32_rgba_to_staging(&data, h, w);
     }
 
     fn write_f32_rgba_to_staging(
@@ -314,6 +335,7 @@ impl FrameState {
 
     /// Immutable RGBA bytes; syncs from GPU if needed.
     pub fn data(&mut self) -> &[u8] {
+        #[cfg(not(target_arch = "wasm32"))]
         if self.gpu_dirty {
             self.sync_tensor_to_cpu();
             self.gpu_dirty = false;
@@ -323,11 +345,19 @@ impl FrameState {
 
     /// Get mutable access to the frame buffer (zero-copy for rasterizer)
     pub fn buffer_mut(&mut self) -> &mut [u8] {
+        #[cfg(not(target_arch = "wasm32"))]
         if self.gpu_dirty {
             self.sync_tensor_to_cpu();
             self.gpu_dirty = false;
         }
-        self.cpu_dirty = true;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.cpu_dirty = true;
+        }
+        #[cfg(target_arch = "wasm32")]
+        if !self.gpu_dirty {
+            self.cpu_dirty = true;
+        }
         self.staging_slice_mut()
     }
 

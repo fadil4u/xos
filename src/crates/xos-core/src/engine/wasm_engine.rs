@@ -63,6 +63,31 @@ fn set_canvas_viewport(
 }
 
 #[cfg(target_arch = "wasm32")]
+fn schedule_wasm_frame_readback(frame: &mut FrameState) {
+    if !frame.is_gpu_dirty() || frame.wasm_readback_pending() {
+        return;
+    }
+    frame.begin_wasm_readback();
+    let tensor = frame.burn_tensor().clone();
+    let device = frame.device().clone();
+    let frame_ptr = frame as *mut FrameState;
+    wasm_bindgen_futures::spawn_local(async move {
+        super::engine::flush_gpu_for_readback(&device, &tensor);
+        match tensor.into_data_async().await {
+            Ok(data) => unsafe {
+                (*frame_ptr).complete_wasm_readback(data);
+            },
+            Err(e) => {
+                crate::print(&format!("xos wasm: frame GPU readback failed: {e:?}"));
+                unsafe {
+                    (*frame_ptr).clear_wasm_readback_pending();
+                }
+            }
+        }
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
 fn canvas_backing_scale(canvas: &web_sys::HtmlCanvasElement) -> f32 {
     let rect = canvas_as_element(canvas).get_bounding_client_rect();
     let css_width = rect.width().max(1.0) as f32;
@@ -851,8 +876,8 @@ pub fn run_web(app: Box<dyn Application>) -> Result<(), JsValue> {
 
                 // Render to canvas. During live browser resizes, the browser can briefly reject a
                 // transient backing store; keep RAF alive and try again next frame.
-                state.engine_state.frame.publish_gpu_to_staging();
-                let buffer = state.engine_state.frame.staging_slice();
+                schedule_wasm_frame_readback(&mut state.engine_state.frame);
+                let buffer = state.engine_state.frame.data();
                 let data = wasm_bindgen::Clamped(&buffer[..]);
                 match ImageData::new_with_u8_clamped_array_and_sh(data, width, height) {
                     Ok(image_data) => {
