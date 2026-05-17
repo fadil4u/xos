@@ -404,26 +404,8 @@ pub fn run_python_app(file_path: &PathBuf, script_flags: &[String]) {
     });
 
     #[cfg(not(target_arch = "wasm32"))]
-    if !source_declares_headless_window_app(&code) {
-        match xos_core::engine::start_native(Box::new(StagedNativePythonApp::new(
-            resolved_file_path.clone(),
-            code.clone(),
-            script_flags.to_vec(),
-            print_cb.clone(),
-        ))) {
-            Ok(()) => return,
-            Err(e) => {
-                eprintln!("❌ Engine error: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    // Headless heuristic match, or WASM: interpreter before engine (prior behavior).
-
-    #[cfg(not(target_arch = "wasm32"))]
     {
-        // Create interpreter with xos module
+        // Run the script first so `headless` / `device` on the Application instance are known.
         let interpreter = Interpreter::with_init(Default::default(), |vm| {
             vm.add_native_module(
                 "xos".to_owned(),
@@ -474,6 +456,22 @@ pub fn run_python_app(file_path: &PathBuf, script_flags: &[String]) {
                 std::process::exit(1);
             }
             return;
+        }
+
+        // Scripts that defer app construction: window-first staged bootstrap (not headless).
+        if !source_declares_headless_window_app(&code) {
+            match xos_core::engine::start_native(Box::new(StagedNativePythonApp::new(
+                resolved_file_path.clone(),
+                code.clone(),
+                script_flags.to_vec(),
+                print_cb.clone(),
+            ))) {
+                Ok(()) => return,
+                Err(e) => {
+                    eprintln!("❌ Engine error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 

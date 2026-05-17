@@ -944,11 +944,11 @@ class Application:
         if device is not None:
             self.device = device
 
-        # Standalone framebuffer for __init__ drawing (uniform_fill, rasterizer, etc.).
-        self._xos_init_standalone_frame()
-        # So xos.random.uniform_fill and friends can resolve the init buffer from __init__.
+        # Register before standalone frame so device/headless class attrs are visible to native ops.
         import builtins
         builtins.__xos_app_instance__ = self
+        # Standalone framebuffer for __init__ drawing (uniform_fill, rasterizer, etc.).
+        self._xos_init_standalone_frame()
 
     def _xos_init_standalone_frame(self):
         """Build a CPU frame + rasterizer context for standalone use (before tick/run)."""

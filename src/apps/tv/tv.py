@@ -4,7 +4,7 @@ import xos
 class TVApp(xos.Application):
     headless: bool = False
     # device: None = auto (GPU on native, CPU on wasm), "cpu" / "gpu" to force
-    device = None
+    device: None | str = None # "gpu"
 
     def __init__(self):
         super().__init__()

@@ -98,13 +98,6 @@ pub fn require_engine_device(
 
     // `Application.__init__` uses a CPU standalone framebuffer even for GPU apps.
     if py_engine_tls::engine_compute_device().is_none() {
-        if tensor_dev != "cpu" && tensor_dev != app_dev.as_str() {
-            return Err(vm.new_runtime_error(format!(
-                "{op}(): tensor device is '{tensor_dev}' during Application.__init__() \
-                 (expected 'cpu' or '{}')",
-                app_dev.as_str()
-            )));
-        }
         return Ok(ComputeDevice::Cpu);
     }
 
