@@ -9,6 +9,7 @@ use rustpython_vm::{
     builtins::PyBaseExceptionRef, PyObjectRef, PyResult, VirtualMachine,
 };
 use serde_json::{json, Map, Number, Value};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
@@ -99,11 +100,13 @@ pub(crate) fn frame_rgba_to_mesh_wire_value(w: usize, h: usize, rgba: &[u8]) -> 
 }
 
 /// Wire body `{"frame": …}` built from RGBA slice (caller runs off the interpreter thread).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn mesh_broadcast_body_from_rgba(w: u32, h: u32, rgba: &[u8]) -> Value {
     xos_mesh::wire_frame::mesh_broadcast_body_from_rgba(w, h, rgba)
 }
 
 /// Fast path for coalesced `broadcast(id=\"frame\", frame=…)`: tensor must be contiguous `tensor._data` PyBytes RGBA matching `width×height×4`.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn try_mesh_frame_rgba_arc_for_broadcast(
     vm: &VirtualMachine,
     id: &str,

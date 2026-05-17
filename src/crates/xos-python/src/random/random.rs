@@ -414,11 +414,8 @@ fn fill_buffer_uniform_random(
 
     // Metal GPU path for iOS/macOS - 10x+ faster than CPU
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        if try_fill_random_metal(buffer, low, high) {
-            return Ok(());
-        }
-        // If Metal fails, fall through to CPU path
+    if try_fill_random_metal(buffer, low, high) {
+        return Ok(());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -459,9 +456,8 @@ fn fill_buffer_uniform_random(
                 }
             }
         });
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// xos.random.randint(a, b) -> int in the inclusive range [a, b]

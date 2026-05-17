@@ -15,7 +15,7 @@ pub mod ai;
 pub mod blank_app;
 pub mod burn_raster;
 pub mod compute_device;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
 pub mod gpu_present;
 pub mod coder_log;
 pub mod engine;

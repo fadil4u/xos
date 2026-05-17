@@ -452,8 +452,9 @@ fn write_wasm_index_html(output_dir: &Path) -> io::Result<()> {
       }
     }
     try {
-      const init = (await import("./pkg/xos_wasm.js")).default;
-      await init();
+      const wasm = await import("./pkg/xos_wasm.js");
+      await wasm.default();
+      await wasm.xos_launch();
       console.log("xos wasm: initialized");
     } catch (error) {
       console.error("xos wasm: failed to initialize", error);

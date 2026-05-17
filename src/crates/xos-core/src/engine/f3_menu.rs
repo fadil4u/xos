@@ -35,6 +35,7 @@ macro_rules! f3_blend_rect {
 }
 
 #[inline]
+#[cfg(not(target_arch = "wasm32"))]
 fn rect_rel(
     scratch: &mut [u8],
     pw: usize,
@@ -76,6 +77,7 @@ pub struct F3Menu {
     /// True when the last mouse down was consumed by the F3 panel (skip matching mouse up for the app).
     pub(crate) pointer_captured: bool,
     /// CPU scratch for F3 labels (uploaded as one GPU patch; avoids full-frame readback).
+    #[cfg(not(target_arch = "wasm32"))]
     text_scratch: Vec<u8>,
 }
 
@@ -130,6 +132,7 @@ impl F3Menu {
             scale_zoom_velocity: 0.0,
             interaction_fade: 0.0,
             pointer_captured: false,
+            #[cfg(not(target_arch = "wasm32"))]
             text_scratch: Vec::new(),
         }
     }
@@ -1596,6 +1599,7 @@ fn draw_f3_text_layer_cpu(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn blend_text_into_scratch(
     buffer: &mut [u8],
     buf_w: usize,

@@ -28,6 +28,7 @@ pub mod regex;
 pub mod runtime;
 #[cfg(not(target_arch = "wasm32"))]
 mod repl;
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod staged_native_python_app;
 pub mod sensors;
 pub mod system;

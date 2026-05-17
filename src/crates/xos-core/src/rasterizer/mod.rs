@@ -24,7 +24,7 @@ pub fn fill(frame: &mut FrameState, color: (u8, u8, u8, u8)) {
 }
 
 /// Blit the Burn frame tensor into the pixels backing texture (same wgpu device as Burn).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
 pub fn render_pending_gpu_passes(
     cache: &mut RasterCache,
     frame: &mut crate::engine::FrameState,

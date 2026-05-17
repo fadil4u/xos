@@ -20,6 +20,7 @@ pub(super) fn check_join_interrupt() -> Result<(), String> {
 }
 
 /// UDP port for LAN mesh encrypted payloads (**not** discovery). Below discovery range (35000..).
+#[allow(dead_code)]
 pub(super) fn udp_hub_port_for_mesh(mesh_id: &str) -> u16 {
     let mut h: u32 = 0xCAFE_F00D;
     for b in mesh_id.bytes() {

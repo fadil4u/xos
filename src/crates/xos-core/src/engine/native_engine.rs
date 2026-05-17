@@ -113,6 +113,7 @@ struct AppState {
     engine_state: EngineState,
     app: Box<dyn Application>,
     size: winit::dpi::PhysicalSize<u32>,
+    #[cfg_attr(target_os = "ios", allow(dead_code))]
     raster_cache: RasterCache,
     last_tick_instant: Option<Instant>,
     // Modifier key tracking for shortcuts
@@ -190,41 +191,49 @@ impl AppState {
     }
 
     fn render_pixels(&mut self) -> Result<(), pixels::Error> {
-        let skip_cpu = crate::gpu_present::should_skip_cpu_upload(&self.engine_state.frame);
-        self.pixels.set_skip_cpu_texture_upload(skip_cpu);
-        if !skip_cpu {
-            self.engine_state.frame.publish_gpu_to_staging();
-        }
-
-        let mut gpu_blit = false;
-        self.pixels.render_with(|encoder, render_target, context| {
-            if self.engine_state.frame.gpu_present_enabled() {
-                gpu_blit = crate::rasterizer::render_pending_gpu_passes(
-                    &mut self.raster_cache,
-                    &mut self.engine_state.frame,
-                    encoder,
-                    &context.device,
-                    &context.queue,
-                    &context.texture,
-                    context.texture_extent,
-                    context.texture_format,
-                );
-            }
-            if skip_cpu && !gpu_blit {
+        #[cfg(not(target_os = "ios"))]
+        {
+            let skip_cpu = crate::gpu_present::should_skip_cpu_upload(&self.engine_state.frame);
+            self.pixels.set_skip_cpu_texture_upload(skip_cpu);
+            if !skip_cpu {
                 self.engine_state.frame.publish_gpu_to_staging();
-                crate::gpu_present::upload_staging_to_pixels_texture(
-                    context,
-                    self.engine_state.frame.data(),
-                );
             }
-            context.scaling_renderer.render(encoder, render_target);
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        })?;
 
-        if gpu_blit {
-            self.engine_state.frame.mark_gpu_presented();
+            let mut gpu_blit = false;
+            self.pixels.render_with(|encoder, render_target, context| {
+                if self.engine_state.frame.gpu_present_enabled() {
+                    gpu_blit = crate::rasterizer::render_pending_gpu_passes(
+                        &mut self.raster_cache,
+                        &mut self.engine_state.frame,
+                        encoder,
+                        &context.device,
+                        &context.queue,
+                        &context.texture,
+                        context.texture_extent,
+                        context.texture_format,
+                    );
+                }
+                if skip_cpu && !gpu_blit {
+                    self.engine_state.frame.publish_gpu_to_staging();
+                    crate::gpu_present::upload_staging_to_pixels_texture(
+                        context,
+                        self.engine_state.frame.data(),
+                    );
+                }
+                context.scaling_renderer.render(encoder, render_target);
+                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+            })?;
+
+            if gpu_blit {
+                self.engine_state.frame.mark_gpu_presented();
+            }
+            return Ok(());
         }
-        Ok(())
+        #[cfg(target_os = "ios")]
+        {
+            self.engine_state.frame.publish_gpu_to_staging();
+            self.pixels.render()
+        }
     }
 
     fn tick_and_render_frame(&mut self) {
@@ -786,11 +795,21 @@ impl ApplicationHandler for AppStateWrapper {
 
             let size = window.inner_size();
             let surface_texture = SurfaceTexture::new(size.width, size.height, &window);
-            let pixels = match PixelsBuilder::new(size.width, size.height, surface_texture)
-                .enable_vsync(false)
-                .device_descriptor_from_adapter(crate::gpu_present::shared_wgpu_device_descriptor)
-                .build()
-            {
+            let pixels = match {
+                #[cfg(not(target_os = "ios"))]
+                {
+                    PixelsBuilder::new(size.width, size.height, surface_texture)
+                        .enable_vsync(false)
+                        .device_descriptor_from_adapter(crate::gpu_present::shared_wgpu_device_descriptor)
+                        .build()
+                }
+                #[cfg(target_os = "ios")]
+                {
+                    PixelsBuilder::new(size.width, size.height, surface_texture)
+                        .enable_vsync(false)
+                        .build()
+                }
+            } {
                 Ok(p) => unsafe { std::mem::transmute(p) }, // SAFETY: window outlives pixels
                 Err(e) => {
                     eprintln!("Failed to create pixels: {}", e);
@@ -798,7 +817,10 @@ impl ApplicationHandler for AppStateWrapper {
                 }
             };
 
+            #[cfg(not(target_os = "ios"))]
             let burn_device = crate::gpu_present::burn_device_from_pixels(&pixels);
+            #[cfg(target_os = "ios")]
+            let burn_device = xos_tensor::XosDevice::default();
             let safe_region = SafeRegionBoundingRectangle::full_screen();
             let mut engine_state = EngineState {
                 frame: FrameState::new_with_device(

@@ -5,6 +5,7 @@
 //! - Python-facing CPU [`Tensor`] lives in `xos-python` (`tensor_buf`); frame RGBA uses [`xos_core::engine::FrameState`].
 
 pub mod conv;
+pub mod wgpu_init;
 
 pub use burn::tensor::backend::Backend;
 pub use burn::tensor::{ElementConversion, Int, Shape, TensorData};

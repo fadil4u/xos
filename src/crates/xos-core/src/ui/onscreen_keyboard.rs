@@ -88,6 +88,7 @@ pub struct OnScreenKeyboard {
     pub trackpad_spoof_ny: f32,
     trackpad_spoof_last_px: Option<(f32, f32)>,
     /// CPU scratch for the keyboard region (one GPU patch upload per frame).
+    #[cfg(not(target_arch = "wasm32"))]
     overlay_scratch: Vec<u8>,
 }
 
@@ -128,6 +129,7 @@ impl OnScreenKeyboard {
             trackpad_spoof_nx: 0.5,
             trackpad_spoof_ny: 0.5,
             trackpad_spoof_last_px: None,
+            #[cfg(not(target_arch = "wasm32"))]
             overlay_scratch: Vec::new(),
         };
 
@@ -388,6 +390,7 @@ impl OnScreenKeyboard {
         self.overlay_scratch = scratch;
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[inline]
     fn local_idx(
         buf_w: u32,
@@ -406,6 +409,7 @@ impl OnScreenKeyboard {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn render_into_scratch(
         keyboard: &Self,
         buffer: &mut [u8],
@@ -462,6 +466,7 @@ impl OnScreenKeyboard {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn draw_key_label_local(
         &self,
         buffer: &mut [u8],

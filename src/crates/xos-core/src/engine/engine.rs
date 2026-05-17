@@ -155,12 +155,14 @@ impl FrameState {
         self.gpu_dirty
     }
 
+    /// After a successful GPU blit to the display texture (CPU staging may be stale).
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
     #[inline]
     pub(crate) fn is_cpu_dirty(&self) -> bool {
         self.cpu_dirty
     }
 
-    /// After a successful GPU blit to the display texture (CPU staging may be stale).
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
     pub(crate) fn mark_gpu_presented(&mut self) {
         self.gpu_dirty = false;
     }

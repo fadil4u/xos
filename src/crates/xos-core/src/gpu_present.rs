@@ -47,7 +47,6 @@ struct BlitParams {
 
 struct GpuPresentPipeline {
     bind_group_layout: BindGroupLayout,
-    pipeline_layout: PipelineLayout,
     pipeline: ComputePipeline,
 }
 
@@ -185,7 +184,6 @@ fn blit_pipeline(device: &Device) -> GpuPresentPipeline {
     });
     GpuPresentPipeline {
         bind_group_layout,
-        pipeline_layout,
         pipeline,
     }
 }

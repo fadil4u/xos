@@ -716,7 +716,7 @@ impl<'win> Pixels<'win> {
     }
 
     /// Provides access to the internal [`PixelsContext`].
-    pub fn context(&self) -> &PixelsContext {
+    pub fn context(&self) -> &PixelsContext<'_> {
         &self.context
     }
 

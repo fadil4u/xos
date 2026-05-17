@@ -6,6 +6,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
+#[cfg(target_arch = "wasm32")]
 const WASM_DATA_ROOT: &str = ".xos";
 
 pub fn data_dir_string() -> Result<String, String> {

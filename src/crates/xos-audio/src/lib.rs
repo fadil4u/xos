@@ -210,6 +210,7 @@ impl AudioDevice {
 // ================================================================================================
 
 /// Platform-appropriate debug log (used by iOS FFI teardown paths in `speakers`).
+#[allow(dead_code)]
 pub(crate) fn print(message: &str) {
     #[cfg(target_arch = "wasm32")]
     {

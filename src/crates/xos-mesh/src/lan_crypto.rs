@@ -357,12 +357,16 @@ pub fn decrypt_mesh_line(cipher: &Aes256Gcm, line: &str) -> Result<String, Strin
 }
 
 /// Max plaintext bytes per UDP mesh datagram before AES-GCM (fits in one IPv4 UDP payload).
+#[allow(dead_code)]
 pub const MESH_UDP_PAYLOAD_CHUNK: usize = 48 * 1024;
 
+#[allow(dead_code)]
 const MUDP_MAGIC: [u8; 4] = *b"XMU1";
+#[allow(dead_code)]
 const MUDP_HDR: usize = 4 + 8 + 4 + 4;
 
 /// One AES-GCM datagram: `magic | msg_id | idx | total | nonce | ciphertext`.
+#[allow(dead_code)]
 pub fn mesh_udp_encrypt_chunk(
     cipher: &Aes256Gcm,
     msg_id: u64,
@@ -393,6 +397,7 @@ pub fn mesh_udp_encrypt_chunk(
 }
 
 /// Returns `(msg_id, idx, total, plaintext_chunk)` or error if not a valid mesh UDP frame.
+#[allow(dead_code)]
 pub fn mesh_udp_try_decrypt_chunk(
     cipher: &Aes256Gcm,
     buf: &[u8],
@@ -425,6 +430,7 @@ pub fn mesh_udp_try_decrypt_chunk(
 }
 
 /// Split a full wire JSON line into AES-GCM UDP datagrams sharing `msg_id`.
+#[allow(dead_code)]
 pub fn mesh_udp_encrypt_inner(cipher: &Aes256Gcm, inner: &str) -> Result<Vec<Vec<u8>>, String> {
     let b = inner.as_bytes();
     let n = b.len();

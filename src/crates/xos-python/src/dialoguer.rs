@@ -1,4 +1,4 @@
-#[cfg(not(target_os = "ios"))]
+#[cfg(all(not(target_os = "ios"), not(target_arch = "wasm32")))]
 use rustpython_vm::PyObjectRef;
 use rustpython_vm::{builtins::PyModule, function::FuncArgs, PyRef, PyResult, VirtualMachine};
 

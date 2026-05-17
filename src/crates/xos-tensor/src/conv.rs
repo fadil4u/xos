@@ -21,11 +21,18 @@ fn conv_device() -> WgpuDevice {
     #[cfg(not(target_arch = "wasm32"))]
     {
         return WGPU_DEVICE
-            .get_or_init(WgpuDevice::default)
+            .get_or_init(|| {
+                crate::wgpu_init::ensure_initialized();
+                WgpuDevice::default()
+            })
             .clone();
     }
     #[cfg(target_arch = "wasm32")]
     {
+        debug_assert!(
+            crate::wgpu_init::is_initialized(),
+            "call xos_tensor::wgpu_init::ensure_initialized().await before GPU tensor ops on wasm"
+        );
         WgpuDevice::default()
     }
 }
