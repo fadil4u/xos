@@ -167,6 +167,7 @@ fn system_monitor_get_frame(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         any(target_os = "macos", target_os = "windows")
     )))]
     {
+        let _ = args;
         return Err(vm.new_runtime_error(
             "xos.system.Monitor.get_frame is only available on native macOS and Windows builds"
                 .into(),

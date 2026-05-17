@@ -2,6 +2,7 @@ use super::f3_menu::F3Menu;
 
 use crate::burn_raster;
 use crate::compute_device::ComputeDevice;
+#[cfg(target_arch = "wasm32")]
 use burn::tensor::TensorPrimitive;
 use xos_tensor::{BurnTensor, WgpuDevice};
 use crate::time::Instant;
@@ -242,7 +243,8 @@ impl FrameState {
         self.cpu_dirty = true;
     }
 
-    pub(crate) fn ensure_gpu_from_cpu(&mut self) {
+    /// Upload CPU staging (or pixels mirror) into the Burn GPU tensor when `cpu_dirty`.
+    pub fn ensure_gpu_from_cpu(&mut self) {
         if self.cpu_dirty {
             let w = self.width as usize;
             let h = self.height as usize;
