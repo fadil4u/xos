@@ -1126,6 +1126,12 @@ impl Application for PyApp {
 
                 sync_app_safe_region(vm, app_instance, &state.frame.safe_region_boundaries)
                     .map_err(|e| format!("Failed to sync safe_region: {:?}", e))?;
+                if app_instance.has_attr("setup", vm).unwrap_or(false) {
+                if let Err(e) = vm.call_method(app_instance, "setup", ()) {
+                    let error_msg = format_python_exception(vm, &e);
+                    return Err(format!("Python setup error: {}", error_msg));
+                }
+            }
 
                 Ok(())
             })
