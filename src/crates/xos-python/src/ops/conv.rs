@@ -110,21 +110,12 @@ fn try_convolve_depthwise_on_frame_gpu_out(
     .unwrap_or(false)
 }
 
-fn frame_dims_from_tick() -> Option<(usize, usize)> {
-    crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
-        let shape = state.frame.shape();
-        Some((shape[1], shape[0]))
-    })
-    .flatten()
-}
-
 /// Opaque GPU conv result: no `_data` until [`materialize_conv_output`] (one readback).
-fn wrap_gpu_conv_output_tensor(
-    vm: &VirtualMachine,
-    width: usize,
-    height: usize,
-    device: ComputeDevice,
-) -> PyResult {
+fn wrap_gpu_conv_output_tensor(vm: &VirtualMachine, device: ComputeDevice) -> PyResult {
+    let (height, width, channels) =
+        crate::engine::py_engine_tls::conv_gpu_output_shape().ok_or_else(|| {
+            vm.new_runtime_error("no GPU conv output shape (internal error)".to_string())
+        })?;
     let tensor_dict = vm.ctx.new_dict();
     tensor_dict.set_item(
         "shape",
@@ -132,7 +123,7 @@ fn wrap_gpu_conv_output_tensor(
             .new_tuple(vec![
                 vm.ctx.new_int(height).into(),
                 vm.ctx.new_int(width).into(),
-                vm.ctx.new_int(3).into(),
+                vm.ctx.new_int(channels).into(),
             ])
             .into(),
         vm,
@@ -176,7 +167,7 @@ pub fn materialize_conv_output(args: FuncArgs, vm: &VirtualMachine) -> PyResult 
         return Ok(vm.ctx.none());
     }
 
-    let bytes = crate::engine::py_engine_tls::materialize_conv_gpu_output_rgb_u8()
+    let bytes = crate::engine::py_engine_tls::materialize_conv_gpu_output_rgba_u8()
         .ok_or_else(|| vm.new_runtime_error("no GPU conv output to materialize".to_string()))?;
     dict.set_item(
         "_data",
@@ -244,7 +235,7 @@ fn get_array_data_list(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<Optio
 /// - kernel: 3D array [height, width, channels] - e.g., KxKx3 for RGB
 /// - padding: "same" (default) maintains image dimensions
 ///
-/// Returns raw float output as shape [height, width, 3] (RGB, no alpha).
+/// Returns float output as shape [height, width, 4] (RGBA; alpha copied from the frame).
 /// Caller is responsible for any display-space mapping/clamping.
 /// Note: Automatically detects kernel size from array length
 pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
@@ -344,10 +335,8 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             if try_convolve_on_frame_gpu(&kernel_nchw, kernel_size, stride_pair) {
                 return direct_fill_sentinel(vm);
             }
-        } else if let Some((width, height)) = frame_dims_from_tick() {
-            if try_convolve_on_frame_gpu_out(kernel_nchw, kernel_size, stride_pair) {
-                return wrap_gpu_conv_output_tensor(vm, width, height, engine_dev);
-            }
+        } else if try_convolve_on_frame_gpu_out(kernel_nchw, kernel_size, stride_pair) {
+            return wrap_gpu_conv_output_tensor(vm, engine_dev);
         }
         return Err(vm.new_runtime_error(
             "convolve(): GPU frame path unavailable (engine state not bound during tick)"
@@ -447,7 +436,7 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
                     let iv = output_rgb[src_idx + c] as i32;
                     buffer[dst_idx + c] = iv.clamp(0, 255) as u8;
                 }
-                buffer[dst_idx + 3] = 255;
+                // Preserve existing alpha (do not overwrite with 255).
             }
         }
 
@@ -457,17 +446,34 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         return direct_fill_sentinel(vm);
     }
 
-    wrap_output_tensor(vm, width, height, &output_rgb, engine_dev)
+    wrap_output_tensor(vm, width, height, buffer, &output_rgb, engine_dev)
 }
 
 fn wrap_output_tensor(
     vm: &VirtualMachine,
     width: usize,
     height: usize,
+    source_rgba: &[u8],
     output_rgb: &[f32],
     device: ComputeDevice,
 ) -> PyResult {
-    let py_list: Vec<rustpython_vm::PyObjectRef> = output_rgb
+    let pixels = width * height;
+    let mut output_rgba = Vec::with_capacity(pixels * 4);
+    for i in 0..pixels {
+        let src_rgb = i * 3;
+        let src_rgba = i * 4;
+        output_rgba.push(output_rgb[src_rgb]);
+        output_rgba.push(output_rgb[src_rgb + 1]);
+        output_rgba.push(output_rgb[src_rgb + 2]);
+        let alpha = if source_rgba.len() >= pixels * 4 {
+            source_rgba[src_rgba + 3] as f32
+        } else {
+            255.0
+        };
+        output_rgba.push(alpha);
+    }
+
+    let py_list: Vec<rustpython_vm::PyObjectRef> = output_rgba
         .iter()
         .map(|&v| vm.ctx.new_float(v as f64).into())
         .collect();
@@ -479,7 +485,7 @@ fn wrap_output_tensor(
             .new_tuple(vec![
                 vm.ctx.new_int(height).into(),
                 vm.ctx.new_int(width).into(),
-                vm.ctx.new_int(3).into(),
+                vm.ctx.new_int(4).into(),
             ])
             .into(),
         vm,
@@ -508,7 +514,7 @@ fn wrap_output_tensor(
 /// - kernel: 2D array [height, width] = KxK values (applied to each channel separately)
 /// - padding: "same" (default) maintains image dimensions
 ///
-/// Returns raw float output as shape [height, width, 3] (RGB, no alpha).
+/// Returns float output as shape [height, width, 4] (RGBA; alpha copied from the frame).
 /// Caller is responsible for any display-space mapping/clamping.
 /// Note: Automatically detects kernel size from array length
 pub fn convolve_depthwise(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
@@ -586,10 +592,8 @@ pub fn convolve_depthwise(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             if try_convolve_depthwise_on_frame_gpu(kernel.clone(), kernel_size, stride_pair) {
                 return direct_fill_sentinel(vm);
             }
-        } else if let Some((width, height)) = frame_dims_from_tick() {
-            if try_convolve_depthwise_on_frame_gpu_out(kernel, kernel_size, stride_pair) {
-                return wrap_gpu_conv_output_tensor(vm, width, height, engine_dev);
-            }
+        } else if try_convolve_depthwise_on_frame_gpu_out(kernel, kernel_size, stride_pair) {
+            return wrap_gpu_conv_output_tensor(vm, engine_dev);
         }
         return Err(vm.new_runtime_error(
             "convolve_depthwise(): GPU frame path unavailable (engine state not bound during tick)"
@@ -699,12 +703,12 @@ pub fn convolve_depthwise(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
                     let iv = output_rgb[src_idx + c] as i32;
                     buffer[dst_idx + c] = iv.clamp(0, 255) as u8;
                 }
-                buffer[dst_idx + 3] = 255;
+                // Preserve existing alpha (do not overwrite with 255).
             }
         }
 
         return direct_fill_sentinel(vm);
     }
 
-    wrap_output_tensor(vm, width, height, &output_rgb, engine_dev)
+    wrap_output_tensor(vm, width, height, buffer, &output_rgb, engine_dev)
 }

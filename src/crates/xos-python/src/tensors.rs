@@ -300,77 +300,104 @@ pub fn tensor_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     wrap_tensor_dict(py_tensor.to_py_dict_on(vm, dtype, &device)?, vm)
 }
 
+fn parse_shape_arg(shape_obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<Vec<usize>> {
+    if let Some(tup) = shape_obj.downcast_ref::<rustpython_vm::builtins::PyTuple>() {
+        return tup
+            .as_slice()
+            .iter()
+            .map(|s| s.clone().try_into_value::<i32>(vm).map(|i| i as usize))
+            .collect::<Result<Vec<_>, _>>();
+    }
+    if let Some(lst) = shape_obj.downcast_ref::<rustpython_vm::builtins::PyList>() {
+        return lst
+            .borrow_vec()
+            .iter()
+            .map(|s| s.clone().try_into_value::<i32>(vm).map(|i| i as usize))
+            .collect::<Result<Vec<_>, _>>();
+    }
+    Err(vm.new_type_error("shape must be a tuple or list".to_string()))
+}
+
+fn dtype_from_args(args: &FuncArgs, args_vec: &[PyObjectRef], vm: &VirtualMachine) -> PyResult<DType> {
+    if args_vec.len() > 1 && !vm.is_none(&args_vec[1]) {
+        return DType::from_py_object(&args_vec[1], vm);
+    }
+    if let Some(dtype_kwarg) = args.kwargs.get("dtype") {
+        return DType::from_py_object(dtype_kwarg, vm);
+    }
+    Ok(DType::Float32)
+}
+
+fn tensor_dtype_from_ref(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<DType> {
+    let mut cur = obj.clone();
+    for _ in 0..8 {
+        if let Some(dict) = cur.downcast_ref::<rustpython_vm::builtins::PyDict>() {
+            if let Ok(dtype_obj) = dict.get_item("dtype", vm) {
+                return DType::from_py_object(&dtype_obj, vm);
+            }
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "_data") {
+            cur = attr;
+            continue;
+        }
+        break;
+    }
+    Ok(DType::Float32)
+}
+
 pub fn zeros_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-    let args_vec = args.args;
-    if args_vec.is_empty() {
+    if args.args.is_empty() {
         return Err(vm.new_type_error("zeros() requires 1 argument (shape)".to_string()));
     }
-    let shape_arg: Vec<usize> = args_vec[0]
-        .downcast_ref::<rustpython_vm::builtins::PyTuple>()
-        .ok_or_else(|| vm.new_type_error("shape must be a tuple".to_string()))?
-        .as_slice()
-        .iter()
-        .map(|s| s.clone().try_into_value::<i32>(vm).map(|i| i as usize))
-        .collect::<Result<Vec<_>, _>>()?;
-    let dtype = if args_vec.len() > 1 && !vm.is_none(&args_vec[1]) {
-        DType::from_py_object(&args_vec[1], vm).unwrap_or(DType::Float32)
-    } else if let Some(dtype_kwarg) = args.kwargs.get("dtype") {
-        DType::from_py_object(dtype_kwarg, vm).unwrap_or(DType::Float32)
-    } else {
-        DType::Float32
-    };
+    let device = crate::device_policy::tensor_device_for_constructor(&args, vm)?;
+    let dtype = dtype_from_args(&args, &args.args, vm)?;
+    let shape_arg = parse_shape_arg(&args.args[0], vm)?;
     let total: usize = shape_arg.iter().product();
     let py_tensor = create_tensor_from_data(vec![0.0f32; total], shape_arg, dtype);
-    wrap_tensor_dict(py_tensor.to_py_dict(vm, dtype)?, vm)
+    wrap_tensor_dict(py_tensor.to_py_dict_on(vm, dtype, &device)?, vm)
+}
+
+pub fn zeros_like_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let ref_tensor = args.args.first().ok_or_else(|| {
+        vm.new_type_error("zeros_like() requires 1 argument (tensor)".to_string())
+    })?;
+    let shape = tensor_shape_tuple(ref_tensor, vm)?;
+    let dtype = tensor_dtype_from_ref(ref_tensor, vm)?;
+    let device = crate::device_policy::tensor_device_label(ref_tensor, vm)?;
+    let total: usize = shape.iter().product();
+    let py_tensor = create_tensor_from_data(vec![0.0f32; total], shape, dtype);
+    wrap_tensor_dict(py_tensor.to_py_dict_on(vm, dtype, &device)?, vm)
 }
 
 pub fn ones_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-    let args_vec = args.args;
-    if args_vec.is_empty() {
+    if args.args.is_empty() {
         return Err(vm.new_type_error("ones() requires 1 argument (shape)".to_string()));
     }
-    let shape_arg: Vec<usize> = args_vec[0]
-        .downcast_ref::<rustpython_vm::builtins::PyTuple>()
-        .ok_or_else(|| vm.new_type_error("shape must be a tuple".to_string()))?
-        .as_slice()
-        .iter()
-        .map(|s| s.clone().try_into_value::<i32>(vm).map(|i| i as usize))
-        .collect::<Result<Vec<_>, _>>()?;
-    let dtype = if args_vec.len() > 1 && !vm.is_none(&args_vec[1]) {
-        DType::from_py_object(&args_vec[1], vm).unwrap_or(DType::Float32)
-    } else if let Some(dtype_kwarg) = args.kwargs.get("dtype") {
-        DType::from_py_object(dtype_kwarg, vm).unwrap_or(DType::Float32)
-    } else {
-        DType::Float32
-    };
+    let device = crate::device_policy::tensor_device_for_constructor(&args, vm)?;
+    let dtype = dtype_from_args(&args, &args.args, vm)?;
+    let shape_arg = parse_shape_arg(&args.args[0], vm)?;
     let total: usize = shape_arg.iter().product();
     let py_tensor = create_tensor_from_data(vec![1.0f32; total], shape_arg, dtype);
-    wrap_tensor_dict(py_tensor.to_py_dict(vm, dtype)?, vm)
+    wrap_tensor_dict(py_tensor.to_py_dict_on(vm, dtype, &device)?, vm)
 }
 
 pub fn full_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-    let args_vec = args.args;
-    if args_vec.len() < 2 {
+    if args.args.len() < 2 {
         return Err(vm.new_type_error("full() requires shape and fill value".to_string()));
     }
-    let shape_arg: Vec<usize> = args_vec[0]
-        .downcast_ref::<rustpython_vm::builtins::PyTuple>()
-        .ok_or_else(|| vm.new_type_error("shape must be a tuple".to_string()))?
-        .as_slice()
-        .iter()
-        .map(|s| s.clone().try_into_value::<i32>(vm).map(|i| i as usize))
-        .collect::<Result<Vec<_>, _>>()?;
-    let fill_value = py_number_to_f64(&args_vec[1], vm)? as f32;
-    let dtype = if args_vec.len() > 2 && !vm.is_none(&args_vec[2]) {
-        DType::from_py_object(&args_vec[2], vm).unwrap_or(DType::Float32)
+    let device = crate::device_policy::tensor_device_for_constructor(&args, vm)?;
+    let dtype = if args.args.len() > 2 && !vm.is_none(&args.args[2]) {
+        DType::from_py_object(&args.args[2], vm)?
     } else if let Some(dtype_kwarg) = args.kwargs.get("dtype") {
-        DType::from_py_object(dtype_kwarg, vm).unwrap_or(DType::Float32)
+        DType::from_py_object(dtype_kwarg, vm)?
     } else {
         DType::Float32
     };
+    let shape_arg = parse_shape_arg(&args.args[0], vm)?;
+    let fill_value = py_number_to_f64(&args.args[1], vm)? as f32;
     let total: usize = shape_arg.iter().product();
     let py_tensor = create_tensor_from_data(vec![fill_value; total], shape_arg, dtype);
-    wrap_tensor_dict(py_tensor.to_py_dict(vm, dtype)?, vm)
+    wrap_tensor_dict(py_tensor.to_py_dict_on(vm, dtype, &device)?, vm)
 }
 
 pub fn arange_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
@@ -470,6 +497,9 @@ pub fn register_tensors_functions(module: &PyRef<PyModule>, vm: &VirtualMachine)
         .unwrap();
     module
         .set_attr("zeros", vm.new_function("zeros", zeros_fn), vm)
+        .unwrap();
+    module
+        .set_attr("zeros_like", vm.new_function("zeros_like", zeros_like_fn), vm)
         .unwrap();
     module
         .set_attr("ones", vm.new_function("ones", ones_fn), vm)

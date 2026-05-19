@@ -424,7 +424,16 @@ fn rgb_conv_same_rgba(
     let pad_h = (kernel_h.saturating_sub(1)) / 2;
     let pad_w = (kernel_w.saturating_sub(1)) / 2;
 
-    let rgb = input.slice([0..h, 0..w, 0..3]);
+    let c_in = input.dims()[2];
+    let (rgb, alpha) = if c_in >= 4 {
+        let alpha = input.clone().slice([0..h, 0..w, 3..4]);
+        let rgb = input.slice([0..h, 0..w, 0..3]);
+        (rgb, alpha)
+    } else {
+        let rgb = input.slice([0..h, 0..w, 0..3]);
+        let alpha = BurnTensor::<3>::full([h, w, 1], 255.0, device);
+        (rgb, alpha)
+    };
     let x = rgb
         .swap_dims(0, 2)
         .swap_dims(1, 2)
@@ -441,7 +450,6 @@ fn rgb_conv_same_rgba(
         .swap_dims(0, 2)
         .swap_dims(0, 1)
         .clamp(0.0, 255.0);
-    let alpha = BurnTensor::<3>::full([h, w, 1], 255.0, device);
     Ok(BurnTensor::<3>::cat(vec![out_hwc, alpha], 2))
 }
 
@@ -459,6 +467,16 @@ fn depthwise_conv_same_rgba(
         return Err("convolve_depthwise_rgb_same currently requires stride [1, 1]".into());
     }
     let pad = (kernel_h.saturating_sub(1)) / 2;
+    let c_in = input.dims()[2];
+    let (rgb, alpha) = if c_in >= 4 {
+        let alpha = input.clone().slice([0..h, 0..w, 3..4]);
+        let rgb = input.slice([0..h, 0..w, 0..3]);
+        (rgb, alpha)
+    } else {
+        let rgb = input.slice([0..h, 0..w, 0..3]);
+        let alpha = BurnTensor::<3>::full([h, w, 1], 255.0, device);
+        (rgb, alpha)
+    };
 
     let mut kernel_dw = vec![0.0f32; 3 * kernel_h * kernel_w];
     for c in 0..3 {
@@ -471,7 +489,6 @@ fn depthwise_conv_same_rgba(
         }
     }
 
-    let rgb = input.slice([0..h, 0..w, 0..3]);
     let x = rgb
         .swap_dims(0, 2)
         .swap_dims(1, 2)
@@ -488,7 +505,6 @@ fn depthwise_conv_same_rgba(
         .swap_dims(0, 2)
         .swap_dims(0, 1)
         .clamp(0.0, 255.0);
-    let alpha = BurnTensor::<3>::full([h, w, 1], 255.0, device);
     Ok(BurnTensor::<3>::cat(vec![out_hwc, alpha], 2))
 }
 

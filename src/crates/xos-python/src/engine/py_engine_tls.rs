@@ -79,24 +79,34 @@ pub fn clear_conv_gpu_output() {
     CONV_GPU_OUTPUT.with(|c| *c.borrow_mut() = None);
 }
 
-/// One host readback of the stored conv tensor into packed RGB `u8` (HWC).
-pub fn materialize_conv_gpu_output_rgb_u8() -> Option<Vec<u8>> {
+/// Shape `[height, width, channels]` of the stored conv tensor (if any).
+pub fn conv_gpu_output_shape() -> Option<(usize, usize, usize)> {
+    CONV_GPU_OUTPUT.with(|c| {
+        let t = c.borrow();
+        let t = t.as_ref()?;
+        let [h, w, ch] = t.dims();
+        Some((h, w, ch))
+    })
+}
+
+/// One host readback of the stored conv tensor into packed RGBA `u8` (HWC).
+pub fn materialize_conv_gpu_output_rgba_u8() -> Option<Vec<u8>> {
     CONV_GPU_OUTPUT.with(|c| {
         let t = c.borrow();
         let t = t.as_ref()?;
         let [h, w, c_ch] = t.dims();
-        if c_ch < 3 {
+        if c_ch < 1 {
             return None;
         }
         let data = t.clone().into_data();
         let s = data.as_slice::<f32>().ok()?;
         let pixels = h * w;
-        let mut out = Vec::with_capacity(pixels * 3);
+        let mut out = Vec::with_capacity(pixels * c_ch);
         for i in 0..pixels {
-            let o = i * 4;
-            out.push(s[o].clamp(0., 255.) as u8);
-            out.push(s[o + 1].clamp(0., 255.) as u8);
-            out.push(s[o + 2].clamp(0., 255.) as u8);
+            let o = i * c_ch;
+            for c in 0..c_ch {
+                out.push(s[o + c].clamp(0., 255.) as u8);
+            }
         }
         Some(out)
     })

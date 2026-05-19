@@ -1510,6 +1510,13 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
         .set_attr("zeros", tensors_module.get_attr("zeros", vm).unwrap(), vm)
         .unwrap();
     module
+        .set_attr(
+            "zeros_like",
+            tensors_module.get_attr("zeros_like", vm).unwrap(),
+            vm,
+        )
+        .unwrap();
+    module
         .set_attr("ones", tensors_module.get_attr("ones", vm).unwrap(), vm)
         .unwrap();
     module
