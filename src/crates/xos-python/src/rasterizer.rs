@@ -1,3 +1,4 @@
+use crate::tensor_buf::tensor_flat_bytes;
 use crate::tensors::{tensor_flat_data_list, tensor_shape_tuple};
 use xos_core::rasterizer::shapes::lines::draw_line_direct;
 use xos_core::rasterizer::text::fonts::{self, FontFamily};
@@ -899,56 +900,33 @@ fn fill(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     Ok(vm.ctx.none())
 }
 
-/// xos.rasterizer._fill_buffer(array_dict, values) - fill buffer 1:1 with values
-///
-/// Internal function to efficiently fill the frame buffer with a list of values
-/// This is called by _TensorWrapper when doing slice assignment: array[:] = values
-fn fill_buffer(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-    let args_vec = args.args;
-    if args_vec.len() != 2 {
-        return Err(vm.new_type_error(format!(
-            "_fill_buffer() takes exactly 2 arguments ({} given)",
-            args_vec.len()
-        )));
+/// Copy tensor/list values into an RGBA framebuffer (1:1 byte layout).
+fn copy_values_into_rgba_buffer(
+    buffer: &mut [u8],
+    values_list: &PyObjectRef,
+    vm: &VirtualMachine,
+) -> PyResult<()> {
+    if let Ok(bytes) = tensor_flat_bytes(values_list, vm) {
+        let n = buffer.len().min(bytes.len());
+        buffer[..n].copy_from_slice(&bytes[..n]);
+        return Ok(());
     }
 
-    let _array_dict = &args_vec[0]; // For future use if needed
-    let values_list = &args_vec[1];
-
-    // Get the frame buffer from global context
-    let buffer_ptr_opt = CURRENT_FRAME_BUFFER
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|ptr| ptr.as_ptr());
-    let width = *CURRENT_FRAME_WIDTH.lock().unwrap();
-    let height = *CURRENT_FRAME_HEIGHT.lock().unwrap();
-
-    let buffer_ptr = buffer_ptr_opt.ok_or_else(|| {
-        vm.new_runtime_error(
-            "No frame buffer context set. _fill_buffer must be called during tick().".to_string(),
-        )
-    })?;
-
-    let buffer_len = width * height * 4;
-    let buffer = unsafe { std::slice::from_raw_parts_mut(buffer_ptr, buffer_len) };
-
-    // Parse values - supports list, _TensorWrapper, or dict-like tensor data.
     // Walk nested _data/data containers until we reach a flat list.
     let mut cur = values_list.clone();
     let mut depth = 0usize;
     let actual_list = loop {
-        if let Some(list) = cur.downcast_ref::<rustpython_vm::builtins::PyList>() {
+        if let Some(list) = cur.downcast_ref::<PyList>() {
             break list;
         }
 
         if depth >= 8 {
             return Err(
-                vm.new_type_error("values nesting too deep while resolving _data".to_string())
+                vm.new_type_error("values nesting too deep while resolving _data".to_string()),
             );
         }
 
-        if let Some(dict) = cur.downcast_ref::<rustpython_vm::builtins::PyDict>() {
+        if let Some(dict) = cur.downcast_ref::<PyDict>() {
             if let Ok(next) = dict.get_item("_data", vm) {
                 cur = next;
                 depth += 1;
@@ -968,18 +946,43 @@ fn fill_buffer(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         }
 
         return Err(vm.new_type_error(
-            "values must be a list or tensor-like object with _data list".to_string(),
+            "values must be a list or tensor-like object with _data".to_string(),
         ));
     };
 
     let values_vec = actual_list.borrow_vec();
-
-    // Copy values 1:1 into buffer
-    let copy_len = values_vec.len().min(buffer_len);
+    let copy_len = values_vec.len().min(buffer.len());
     for i in 0..copy_len {
         let val: i32 = values_vec[i].clone().try_into_value(vm)?;
         buffer[i] = val.clamp(0, 255) as u8;
     }
+    Ok(())
+}
+
+/// xos.rasterizer._fill_buffer(array_dict, values) - fill buffer 1:1 with values
+///
+/// Internal function to efficiently fill the frame buffer with a list of values
+/// This is called by _TensorWrapper when doing slice assignment: array[:] = values
+fn fill_buffer(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let args_vec = args.args;
+    if args_vec.len() != 2 {
+        return Err(vm.new_type_error(format!(
+            "_fill_buffer() takes exactly 2 arguments ({} given)",
+            args_vec.len()
+        )));
+    }
+
+    let array_dict = &args_vec[0];
+    let values_list = &args_vec[1];
+
+    crate::xos_module::with_frame_write_buffer(vm, Some(array_dict), |buffer| {
+        copy_values_into_rgba_buffer(buffer, values_list, vm)
+    })?;
+
+    let _ = crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
+        state.frame.mark_cpu_staging_dirty();
+        true
+    });
 
     Ok(vm.ctx.none())
 }
