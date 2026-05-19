@@ -107,6 +107,7 @@ pub fn create_py_frame_state(
 
     tensor_dict.set_item("dtype", vm.ctx.new_str("uint8").into(), vm)?;
     tensor_dict.set_item("size", vm.ctx.new_int(buffer.len()).into(), vm)?;
+    tensor_dict.set_item("_xos_frame_backing", vm.ctx.new_bool(true).into(), vm)?;
 
     // Create frame dict
     let frame_dict = vm.ctx.new_dict();

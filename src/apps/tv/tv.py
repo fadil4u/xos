@@ -11,7 +11,7 @@ class TVApp(xos.Application):
 
         # frame is initialized with random static
         self.randomize_frame()
-        self.kernel = xos.tensor([[1, 1, 1], [1, 0, 1], [1, 1, 1]])
+        self.kernel = xos.tensor([[1, 1, 1], [1, 0, 1], [1, 1, 1]], device="gpu")
 
     def randomize_frame(self):
         xos.random.uniform_fill(self.frame.tensor, 0.0, 1.0)

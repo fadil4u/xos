@@ -36,6 +36,15 @@ impl Tensor {
     }
 
     pub fn to_py_dict(&self, vm: &VirtualMachine, dtype: DType) -> PyResult<PyObjectRef> {
+        self.to_py_dict_on(vm, dtype, "cpu")
+    }
+
+    pub fn to_py_dict_on(
+        &self,
+        vm: &VirtualMachine,
+        dtype: DType,
+        device: &str,
+    ) -> PyResult<PyObjectRef> {
         let data_guard = self.data.lock().unwrap();
         let shape = &self.shape;
 
@@ -50,7 +59,7 @@ impl Tensor {
         )?;
 
         dict.set_item("dtype", vm.ctx.new_str(dtype.name()).into(), vm)?;
-        dict.set_item("device", vm.ctx.new_str("cpu").into(), vm)?;
+        dict.set_item("device", vm.ctx.new_str(device).into(), vm)?;
 
         let py_data: Vec<PyObjectRef> = data_guard
             .iter()

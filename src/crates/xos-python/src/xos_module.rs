@@ -76,6 +76,20 @@ pub(crate) fn standalone_frame_buffer_copy(viewport_id: u64) -> Option<Vec<u8>> 
         .and_then(|m| m.get(&viewport_id).cloned())
 }
 
+pub(crate) fn write_standalone_frame_buffer(viewport_id: u64, bytes: &[u8]) -> bool {
+    let mut buffers = match STANDALONE_FRAME_BUFFERS.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let Some(buf) = buffers.get_mut(&viewport_id) else {
+        return false;
+    };
+    let n = buf.len().min(bytes.len());
+    buf[..n].copy_from_slice(&bytes[..n]);
+    mark_standalone_frame_drawn(viewport_id);
+    true
+}
+
 /// Stretch-blit a standalone init framebuffer into the engine framebuffer (e.g. after `__init__`).
 pub(crate) fn apply_standalone_init_to_engine_buffer(
     viewport_id: u64,
@@ -1063,6 +1077,7 @@ fn frame_begin_standalone(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         vm.ctx.new_int(viewport_id as i64).into(),
         vm,
     )?;
+    tensor_dict.set_item("_xos_frame_backing", vm.ctx.new_bool(true).into(), vm)?;
 
     let frame_dict = vm.ctx.new_dict();
     frame_dict.set_item("width", vm.ctx.new_int(width).into(), vm)?;
@@ -1550,6 +1565,23 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
                 "_tensor_min_max_mean",
                 crate::tensors::tensor_min_max_mean,
             ),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr(
+            "_materialize_frame_tensor",
+            vm.new_function(
+                "_materialize_frame_tensor",
+                crate::frame_tensor::materialize_frame_tensor,
+            ),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr(
+            "_flush_frame_tensor",
+            vm.new_function("_flush_frame_tensor", crate::frame_tensor::flush_frame_tensor),
             vm,
         )
         .unwrap();

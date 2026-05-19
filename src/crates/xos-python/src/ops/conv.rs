@@ -121,7 +121,6 @@ fn get_array_data_list(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<Optio
 /// Caller is responsible for any display-space mapping/clamping.
 /// Note: Automatically detects kernel size from array length
 pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-    let args_vec = args.args;
     let inplace = args
         .kwargs
         .get("inplace")
@@ -139,12 +138,25 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         .unwrap_or(1)
         .max(1) as usize;
 
-    if args_vec.len() < 2 {
+    if args.args.len() < 2 {
         return Err(vm.new_type_error(
             "convolve() requires at least 2 arguments (image, kernel)".to_string(),
         ));
     }
 
+    let kernel_arg = &args.args[1];
+    if let Some(kernel_list) = get_array_data_list(kernel_arg, vm)?
+        .and_then(|o| o.downcast::<rustpython_vm::builtins::PyList>().ok())
+    {
+        let kernel_len = kernel_list.borrow_vec().len();
+        let k = (kernel_len as f32).sqrt() as usize;
+        // K×K spatial kernel (e.g. 3×3 Game-of-Life stencil) → depthwise per RGBA channel.
+        if k * k == kernel_len {
+            return convolve_depthwise(args, vm);
+        }
+    }
+
+    let args_vec = args.args;
     let image_arg = &args_vec[0];
     let kernel_arg = &args_vec[1];
 
@@ -166,12 +178,11 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
     let kernel_vec = kernel_list.borrow_vec();
 
-    // Infer kernel size: for RGB conv, length should be K*K*3
-    // where K is the spatial kernel size
+    // Infer kernel size: RGB conv expects K*K*3 (HWC); K*K is handled above via depthwise.
     let kernel_len = kernel_vec.len();
     if kernel_len % 3 != 0 {
         return Err(vm.new_value_error(format!(
-            "kernel length must be divisible by 3 (for RGB), got {}",
+            "kernel length must be a square KxK or KxKx3 (RGB), got {}",
             kernel_len
         )));
     }
@@ -181,7 +192,7 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
     if kernel_size * kernel_size * 3 != kernel_len {
         return Err(vm.new_value_error(format!(
-            "kernel must be square (KxKx3), got {} elements",
+            "kernel must be square KxK (e.g. 3×3 → 9 elements) or KxKx3 RGB (→ 27 elements), got {}",
             kernel_len
         )));
     }

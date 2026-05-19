@@ -1,7 +1,7 @@
 //! Strict device matching for Python tensor / frame ops.
 
 use rustpython_vm::builtins::PyDictRef;
-use rustpython_vm::{AsObject, PyObjectRef, PyResult, VirtualMachine};
+use rustpython_vm::{function::FuncArgs, AsObject, PyObjectRef, PyResult, VirtualMachine};
 use xos_core::compute_device::ComputeDevice;
 
 use crate::engine::py_engine_tls;
@@ -113,4 +113,32 @@ pub fn require_engine_device(
 
 pub fn tag_tensor_device(dict: &PyDictRef, device: &str, vm: &VirtualMachine) {
     let _ = dict.set_item("device", vm.ctx.new_str(device).into(), vm);
+}
+
+/// Normalize a Python device label (`"gpu"`, `"cuda"`, …) to `cpu` / `gpu` / `wasm`.
+pub fn normalize_tensor_device_label(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<String> {
+    let s: String = if let Ok(s) = obj.clone().try_into_value::<String>(vm) {
+        s
+    } else if let Ok(s) = obj.str(vm) {
+        s.to_string()
+    } else {
+        return Err(vm.new_type_error("device must be a string".to_string()));
+    };
+    let d = s.trim().to_lowercase();
+    match d.as_str() {
+        "cpu" => Ok("cpu".to_string()),
+        "gpu" | "cuda" | "mps" | "metal" | "wgpu" => Ok("gpu".to_string()),
+        "wasm" => Ok("wasm".to_string()),
+        _ => Err(vm.new_value_error(format!(
+            "unsupported device '{s}' (use 'cpu', 'gpu', or 'wasm')"
+        ))),
+    }
+}
+
+/// Device metadata for newly constructed tensors (`xos.tensor`, `zeros`, …).
+pub fn tensor_device_for_constructor(args: &FuncArgs, vm: &VirtualMachine) -> PyResult<String> {
+    if let Some(dev) = args.kwargs.get("device") {
+        return normalize_tensor_device_label(dev, vm);
+    }
+    Ok(effective_compute_device(vm)?.as_str().to_string())
 }

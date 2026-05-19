@@ -237,6 +237,7 @@ fn clip_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 }
 
 pub fn tensor_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let device = crate::device_policy::tensor_device_for_constructor(&args, vm)?;
     let args_vec = args.args;
     if args_vec.is_empty() {
         return Err(vm.new_type_error("tensor() requires at least 1 argument".to_string()));
@@ -296,7 +297,7 @@ pub fn tensor_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     };
     let casted_data: Vec<f32> = flat_data.iter().map(|&v| dtype.cast_from_f32(v)).collect();
     let py_tensor = create_tensor_from_data(casted_data, shape, dtype);
-    wrap_tensor_dict(py_tensor.to_py_dict(vm, dtype)?, vm)
+    wrap_tensor_dict(py_tensor.to_py_dict_on(vm, dtype, &device)?, vm)
 }
 
 pub fn zeros_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {

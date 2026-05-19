@@ -10,6 +10,7 @@ pub mod device_policy;
 pub mod dialoguer;
 pub mod dtypes;
 pub mod engine;
+pub mod frame_tensor;
 pub mod geom;
 pub(crate) mod json_codec;
 pub mod json_api;

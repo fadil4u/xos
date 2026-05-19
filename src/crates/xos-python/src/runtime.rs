@@ -398,13 +398,18 @@ builtins.__import__ = __original_import__
     (result, output, app_instance, Some(new_scope))
 }
 
+fn read_python_source(path: &PathBuf) -> Result<String, std::io::Error> {
+    let content = fs::read_to_string(path)?;
+    Ok(crate::frame_tensor::preprocess_tensor_logical_keywords(&content))
+}
+
 /// Run a Python file (CLI mode)
 pub fn run_python_file(file_path: &PathBuf, script_flags: &[String]) {
     let resolved_file_path = file_path
         .canonicalize()
         .unwrap_or_else(|_| file_path.clone());
     // Read the Python file
-    let code = match fs::read_to_string(&resolved_file_path) {
+    let code = match read_python_source(&resolved_file_path) {
         Ok(content) => content,
         Err(e) => {
             eprintln!(
@@ -494,7 +499,7 @@ pub fn run_python_app(file_path: &PathBuf, script_flags: &[String]) {
         .unwrap_or_else(|_| file_path.clone());
 
     // Read the Python file
-    let code = match fs::read_to_string(&resolved_file_path) {
+    let code = match read_python_source(&resolved_file_path) {
         Ok(content) => content,
         Err(e) => {
             eprintln!(

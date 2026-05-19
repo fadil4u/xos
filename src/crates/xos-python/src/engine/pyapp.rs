@@ -341,6 +341,82 @@ class Tensor:
         d = self._data.get("_data")
         return len(d) if isinstance(d, list) else 0
 
+    def _ensure_flat(self):
+        import xos
+        if (
+            self._data.get("_xos_viewport_id") is not None
+            or self._data.get("_xos_frame_backing")
+            or self._data.get("_xos_frame_materialized")
+        ):
+            self._data.pop("_data", None)
+            xos._materialize_frame_tensor(self)
+            return
+        inner = self._data.get("_data")
+        if isinstance(inner, list) and len(inner) > 0:
+            return
+        xos._materialize_frame_tensor(self)
+
+    def _maybe_flush_frame(self):
+        import xos
+        if (
+            self._data.get("_xos_viewport_id") is not None
+            or self._data.get("_xos_frame_backing")
+            or self._data.get("_xos_frame_materialized")
+        ):
+            xos._flush_frame_tensor(self)
+
+    def _broadcast_rhs_flat(self, lshape, rshape, left, right):
+        if len(left) == len(right):
+            return right
+        if (
+            len(lshape) == 3
+            and len(rshape) == 3
+            and lshape[0] == rshape[0]
+            and lshape[1] == rshape[1]
+            and lshape[2] == 4
+            and rshape[2] == 3
+        ):
+            h, w = int(lshape[0]), int(lshape[1])
+            out = []
+            for i in range(h * w):
+                rv = right[i * 3]
+                for _ in range(4):
+                    out.append(rv)
+            return out
+        raise ValueError(
+            "shape mismatch for broadcast: {} vs {} ({} vs {} elements)".format(
+                lshape, rshape, len(left), len(right)
+            )
+        )
+
+    def _masked_assign(self, mask_tensor, value):
+        flat = self._data["_data"]
+        mask = mask_tensor._data.get("_data", [])
+        if not isinstance(mask, list):
+            raise TypeError("boolean mask must be a tensor with flat _data")
+        if len(mask) != len(flat):
+            raise IndexError(
+                "boolean mask length ({}) must equal tensor size ({})".format(
+                    len(mask), len(flat)
+                )
+            )
+        if isinstance(value, Tensor):
+            vlist = value._data.get("_data", [])
+            if isinstance(vlist, list) and len(vlist) == 1:
+                scalar = vlist[0]
+            elif isinstance(vlist, list) and len(vlist) == len(flat):
+                for i, m in enumerate(mask):
+                    if int(m) != 0:
+                        flat[i] = vlist[i]
+                return
+            else:
+                raise TypeError("assigned value must be scalar or same-length tensor")
+        else:
+            scalar = value
+        for i, m in enumerate(mask):
+            if int(m) != 0:
+                flat[i] = scalar
+
     def _getitem_int_index(self, key):
         """Row-major integer indexing: ``t[i]``, ``t[i,j]``, … partial views or a scalar."""
         shape = tuple(self.shape)
@@ -472,11 +548,17 @@ class Tensor:
             # Full slice assignment
             # Check if value is a sentinel dict indicating direct fill already happened
             if isinstance(value, dict) and value.get('_direct_fill', False):
-                # Data already written directly to buffer by Rust - ZERO COPY! Do nothing.
+                # Data already written directly to buffer by Rust - drop stale flat cache.
+                self._data.pop("_data", None)
                 return
             # Call Rust function to fill buffer (handles lists and Tensor)
             import xos
             xos.rasterizer._fill_buffer(self._data, value)
+        elif isinstance(key, Tensor):
+            self._ensure_flat()
+            key._ensure_flat()
+            self._masked_assign(key, value)
+            self._maybe_flush_frame()
         else:
             self._data[key] = value
 
@@ -521,14 +603,16 @@ class Tensor:
         return self._wrap_like_self(out)
 
     def _cmp_broadcast(self, other, cmp_fn):
+        self._ensure_flat()
         left = self._data["_data"]
         lshape = tuple(self.shape)
         if isinstance(other, Tensor):
+            other._ensure_flat()
             right = other._data["_data"]
             rshape = tuple(other.shape)
-            if lshape == rshape:
-                return self._wrap_vals(lshape, [cmp_fn(a, b) for a, b in zip(left, right)])
-            if len(lshape) == 2 and len(rshape) == 2 and lshape[0] == rshape[0] and lshape[1] == 2 and rshape[1] == 1:
+            if len(left) != len(right):
+                right = self._broadcast_rhs_flat(lshape, rshape, left, right)
+            elif len(lshape) == 2 and len(rshape) == 2 and lshape[0] == rshape[0] and lshape[1] == 2 and rshape[1] == 1:
                 n = lshape[0]
                 out = []
                 for i in range(n):
@@ -536,9 +620,22 @@ class Tensor:
                     out.append(cmp_fn(left[2 * i], rv))
                     out.append(cmp_fn(left[2 * i + 1], rv))
                 return self._wrap_vals(lshape, out)
+            return self._wrap_vals(lshape, [cmp_fn(a, b) for a, b in zip(left, right)])
         if isinstance(other, (int, float)):
             return self._wrap_vals(lshape, [cmp_fn(a, other) for a in left])
         raise TypeError("unsupported comparison operand")
+
+    def _logical_binary(self, other, combiner):
+        self._ensure_flat()
+        la = self._data["_data"]
+        lshape = tuple(self.shape)
+        if isinstance(other, Tensor):
+            other._ensure_flat()
+            lb = other._data["_data"]
+            rshape = tuple(other.shape)
+            lb = self._broadcast_rhs_flat(lshape, rshape, la, lb)
+            return self._wrap_vals(lshape, [combiner(a, b) for a, b in zip(la, lb)])
+        raise TypeError("unsupported logical operand")
 
     def __lt__(self, other):
         return self._cmp_broadcast(other, lambda a, b: 1.0 if a < b else 0.0)
@@ -546,14 +643,29 @@ class Tensor:
     def __gt__(self, other):
         return self._cmp_broadcast(other, lambda a, b: 1.0 if a > b else 0.0)
 
+    def __eq__(self, other):
+        return self._cmp_broadcast(other, lambda a, b: 1.0 if a == b else 0.0)
+
+    def __invert__(self):
+        self._ensure_flat()
+        d = self._data["_data"]
+        return self._wrap_vals(self.shape, [0.0 if int(v) != 0 else 1.0 for v in d])
+
+    def __and__(self, other):
+        return self._logical_binary(
+            other, lambda a, b: 1.0 if (int(a) != 0 and int(b) != 0) else 0.0
+        )
+
+    def __rand__(self, other):
+        return self.__and__(other)
+
     def __or__(self, other):
-        if isinstance(other, Tensor):
-            la = self._data["_data"]
-            lb = other._data["_data"]
-            if len(la) != len(lb):
-                raise ValueError("or shape mismatch")
-            return self._wrap_vals(self.shape, [1.0 if (a != 0.0 or b != 0.0) else 0.0 for a, b in zip(la, lb)])
-        raise TypeError("unsupported or operand")
+        return self._logical_binary(
+            other, lambda a, b: 1.0 if (int(a) != 0 or int(b) != 0) else 0.0
+        )
+
+    def __ror__(self, other):
+        return self.__or__(other)
 
     def __neg__(self):
         return self._wrap_vals(self.shape, [-a for a in self._data["_data"]])
