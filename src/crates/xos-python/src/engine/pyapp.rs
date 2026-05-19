@@ -1116,6 +1116,11 @@ class Frame:
             if bound:
                 xos.frame._end_standalone()
 
+class Verbosities:
+  """Debug flags for xos apps (see ``Application.verbosities``)."""
+  function_calls = False
+
+
 class Application:
     """Base class for xos applications. Extend this class and implement __init__() and tick().
 
@@ -1156,6 +1161,11 @@ class Application:
         if device is not None:
             self.device = device
 
+        self.verbosities = Verbosities()
+        class_verb = getattr(type(self), "verbosities", None)
+        if isinstance(class_verb, Verbosities):
+            self.verbosities.function_calls = bool(class_verb.function_calls)
+
         # Register before standalone frame so device/headless class attrs are visible to native ops.
         import builtins
         builtins.__xos_app_instance__ = self
@@ -1182,9 +1192,41 @@ class Application:
         """F3 UI scale as percent/100 (100% → 1.0, 25–500% → 0.25–5.0). Updated each tick."""
         return float(getattr(self, "xos_scale", 1.0))
 
+    @staticmethod
+    def _xos_trace_method_call(app_cls_name, method_name):
+        import xos
+        xos.print_color(f"&b{app_cls_name}&f.&5{method_name}&f()")
+
+    @staticmethod
+    def _xos_wrap_subclass_method(app_cls_name, method_name, fn):
+        if isinstance(fn, (staticmethod, classmethod)):
+            return fn
+
+        def wrapper(self, *args, **kwargs):
+            verb = getattr(self, "verbosities", None)
+            if verb is not None and getattr(verb, "function_calls", False):
+                Application._xos_trace_method_call(app_cls_name, method_name)
+            return fn(self, *args, **kwargs)
+
+        wrapper.__name__ = getattr(fn, "__name__", method_name)
+        return wrapper
+
     @classmethod
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
+        for name, attr in list(cls.__dict__.items()):
+            if name.startswith("_"):
+                continue
+            if not callable(attr):
+                continue
+            if isinstance(attr, (staticmethod, classmethod, property)):
+                continue
+            setattr(
+                cls,
+                name,
+                Application._xos_wrap_subclass_method(cls.__name__, name, attr),
+            )
+
         user_tick = cls.__dict__.get("tick")
         if user_tick is None:
             return

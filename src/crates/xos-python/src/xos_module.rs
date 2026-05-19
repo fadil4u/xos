@@ -1685,6 +1685,9 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     if let Ok(app_class) = scope.globals.get_item("Application", vm) {
         module.set_attr("Application", app_class, vm).unwrap();
     }
+    if let Ok(verb_cls) = scope.globals.get_item("Verbosities", vm) {
+        module.set_attr("Verbosities", verb_cls, vm).ok();
+    }
     if let Ok(engine_state_cls) = scope.globals.get_item("EngineState", vm) {
         vm.builtins
             .set_attr("EngineState", engine_state_cls.clone(), vm)
