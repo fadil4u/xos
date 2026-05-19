@@ -276,9 +276,10 @@ impl FrameState {
         self.cpu_dirty = false;
     }
 
-    /// Mark that CPU staging / the pixels mirror was written (conv must re-upload before GPU ops).
+    /// Mark that CPU staging / the pixels mirror was written (next GPU op re-uploads from CPU).
     pub fn mark_cpu_staging_dirty(&mut self) {
         self.cpu_dirty = true;
+        self.gpu_dirty = false;
     }
 
     /// Upload CPU staging (or pixels mirror) into the Burn GPU tensor when `cpu_dirty`.
@@ -308,7 +309,7 @@ impl FrameState {
     /// Copy the GPU frame tensor into CPU staging / the pixels mirror (for display after GPU ops).
     pub fn publish_gpu_to_staging(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
-        if self.gpu_dirty {
+        if self.gpu_dirty && !self.cpu_dirty {
             self.sync_tensor_to_cpu();
             self.gpu_dirty = false;
         }

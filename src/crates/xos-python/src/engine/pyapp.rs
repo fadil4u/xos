@@ -341,20 +341,39 @@ class Tensor:
         d = self._data.get("_data")
         return len(d) if isinstance(d, list) else 0
 
+    def _flat_storage(self):
+        d = self._data.get("_data")
+        if isinstance(d, (list, bytes, bytearray)) and len(d) > 0:
+            return d
+        return None
+
     def _ensure_flat(self):
         import xos
+        if self._flat_storage() is not None:
+            return
         if (
             self._data.get("_xos_viewport_id") is not None
             or self._data.get("_xos_frame_backing")
             or self._data.get("_xos_frame_materialized")
         ):
-            self._data.pop("_data", None)
             xos._materialize_frame_tensor(self)
             return
-        inner = self._data.get("_data")
-        if isinstance(inner, list) and len(inner) > 0:
-            return
         xos._materialize_frame_tensor(self)
+
+    def _flat_len(self, flat):
+        return len(flat)
+
+    def _flat_get(self, flat, i):
+        return flat[i]
+
+    def _cmp_scalar(self, other):
+        if (
+            isinstance(other, float)
+            and self._data.get("dtype") == "uint8"
+            and other == 0.5
+        ):
+            return 127.5
+        return other
 
     def _maybe_flush_frame(self):
         import xos
@@ -390,32 +409,59 @@ class Tensor:
         )
 
     def _masked_assign(self, mask_tensor, value):
-        flat = self._data["_data"]
-        mask = mask_tensor._data.get("_data", [])
-        if not isinstance(mask, list):
+        flat = self._flat_storage()
+        if flat is None:
+            raise TypeError("tensor has no flat storage for masked assignment")
+        mask = mask_tensor._flat_storage()
+        if mask is None:
             raise TypeError("boolean mask must be a tensor with flat _data")
-        if len(mask) != len(flat):
+        if self._flat_len(flat) != self._flat_len(mask):
             raise IndexError(
                 "boolean mask length ({}) must equal tensor size ({})".format(
-                    len(mask), len(flat)
+                    self._flat_len(mask), self._flat_len(flat)
                 )
             )
+        n = self._flat_len(flat)
         if isinstance(value, Tensor):
-            vlist = value._data.get("_data", [])
-            if isinstance(vlist, list) and len(vlist) == 1:
-                scalar = vlist[0]
-            elif isinstance(vlist, list) and len(vlist) == len(flat):
-                for i, m in enumerate(mask):
-                    if int(m) != 0:
-                        flat[i] = vlist[i]
-                return
-            else:
+            vflat = value._flat_storage()
+            if vflat is None:
                 raise TypeError("assigned value must be scalar or same-length tensor")
-        else:
-            scalar = value
-        for i, m in enumerate(mask):
-            if int(m) != 0:
-                flat[i] = scalar
+            if self._flat_len(vflat) == 1:
+                scalar = self._flat_get(vflat, 0)
+                for i in range(n):
+                    if int(self._flat_get(mask, i)) != 0:
+                        if isinstance(flat, bytearray):
+                            flat[i] = int(scalar) & 0xFF
+                        elif isinstance(flat, bytes):
+                            ba = bytearray(flat)
+                            ba[i] = int(scalar) & 0xFF
+                            self._data["_data"] = ba
+                            flat = ba
+                        else:
+                            flat[i] = scalar
+                return
+            if self._flat_len(vflat) == n:
+                for i in range(n):
+                    if int(self._flat_get(mask, i)) != 0:
+                        if isinstance(flat, (bytes, bytearray)):
+                            if isinstance(flat, bytes):
+                                flat = bytearray(flat)
+                                self._data["_data"] = flat
+                            flat[i] = int(self._flat_get(vflat, i)) & 0xFF
+                        else:
+                            flat[i] = self._flat_get(vflat, i)
+                return
+            raise TypeError("assigned value must be scalar or same-length tensor")
+        scalar = value
+        for i in range(n):
+            if int(self._flat_get(mask, i)) != 0:
+                if isinstance(flat, (bytes, bytearray)):
+                    if isinstance(flat, bytes):
+                        flat = bytearray(flat)
+                        self._data["_data"] = flat
+                    flat[i] = int(scalar) & 0xFF
+                else:
+                    flat[i] = scalar
 
     def _getitem_int_index(self, key):
         """Row-major integer indexing: ``t[i]``, ``t[i,j]``, … partial views or a scalar."""
@@ -604,37 +650,63 @@ class Tensor:
 
     def _cmp_broadcast(self, other, cmp_fn):
         self._ensure_flat()
-        left = self._data["_data"]
+        left = self._flat_storage()
+        if left is None:
+            raise TypeError("tensor has no flat storage for comparison")
         lshape = tuple(self.shape)
         if isinstance(other, Tensor):
             other._ensure_flat()
-            right = other._data["_data"]
+            right = other._flat_storage()
+            if right is None:
+                raise TypeError("comparison operand has no flat storage")
             rshape = tuple(other.shape)
-            if len(left) != len(right):
+            if self._flat_len(left) != self._flat_len(right):
                 right = self._broadcast_rhs_flat(lshape, rshape, left, right)
             elif len(lshape) == 2 and len(rshape) == 2 and lshape[0] == rshape[0] and lshape[1] == 2 and rshape[1] == 1:
                 n = lshape[0]
                 out = []
                 for i in range(n):
-                    rv = right[i]
-                    out.append(cmp_fn(left[2 * i], rv))
-                    out.append(cmp_fn(left[2 * i + 1], rv))
+                    rv = self._flat_get(right, i)
+                    out.append(cmp_fn(self._flat_get(left, 2 * i), rv))
+                    out.append(cmp_fn(self._flat_get(left, 2 * i + 1), rv))
                 return self._wrap_vals(lshape, out)
-            return self._wrap_vals(lshape, [cmp_fn(a, b) for a, b in zip(left, right)])
+            n = self._flat_len(left)
+            return self._wrap_vals(
+                lshape,
+                [
+                    cmp_fn(self._flat_get(left, i), self._flat_get(right, i))
+                    for i in range(n)
+                ],
+            )
         if isinstance(other, (int, float)):
-            return self._wrap_vals(lshape, [cmp_fn(a, other) for a in left])
+            other = self._cmp_scalar(other)
+            n = self._flat_len(left)
+            return self._wrap_vals(
+                lshape, [cmp_fn(self._flat_get(left, i), other) for i in range(n)]
+            )
         raise TypeError("unsupported comparison operand")
 
     def _logical_binary(self, other, combiner):
         self._ensure_flat()
-        la = self._data["_data"]
+        la = self._flat_storage()
+        if la is None:
+            raise TypeError("tensor has no flat storage for logical op")
         lshape = tuple(self.shape)
         if isinstance(other, Tensor):
             other._ensure_flat()
-            lb = other._data["_data"]
+            lb = other._flat_storage()
+            if lb is None:
+                raise TypeError("logical operand has no flat storage")
             rshape = tuple(other.shape)
             lb = self._broadcast_rhs_flat(lshape, rshape, la, lb)
-            return self._wrap_vals(lshape, [combiner(a, b) for a, b in zip(la, lb)])
+            n = self._flat_len(la)
+            return self._wrap_vals(
+                lshape,
+                [
+                    combiner(self._flat_get(la, i), self._flat_get(lb, i))
+                    for i in range(n)
+                ],
+            )
         raise TypeError("unsupported logical operand")
 
     def __lt__(self, other):
@@ -648,8 +720,13 @@ class Tensor:
 
     def __invert__(self):
         self._ensure_flat()
-        d = self._data["_data"]
-        return self._wrap_vals(self.shape, [0.0 if int(v) != 0 else 1.0 for v in d])
+        d = self._flat_storage()
+        if d is None:
+            raise TypeError("tensor has no flat storage for invert")
+        n = self._flat_len(d)
+        return self._wrap_vals(
+            self.shape, [0.0 if int(self._flat_get(d, i)) != 0 else 1.0 for i in range(n)]
+        )
 
     def __and__(self, other):
         return self._logical_binary(

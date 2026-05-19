@@ -6,7 +6,8 @@
 use crate::dtypes::DType;
 use once_cell::sync::Lazy;
 use rustpython_vm::{
-    builtins::PyDict, builtins::PyList, builtins::PyTuple, PyObjectRef, PyResult, VirtualMachine,
+    builtins::{PyBytes, PyDict, PyList, PyTuple},
+    PyObjectRef, PyResult, VirtualMachine,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -102,6 +103,9 @@ pub fn py_number_to_f64(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<f64>
 pub fn tensor_flat_data_list(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<Vec<f32>> {
     let mut cur = obj.clone();
     for _ in 0..8 {
+        if let Some(bytes) = cur.downcast_ref::<PyBytes>() {
+            return Ok(bytes.as_bytes().iter().map(|&b| b as f32).collect());
+        }
         if let Some(list) = cur.downcast_ref::<PyList>() {
             let vec = list.borrow_vec();
             // Nested `[[f32, ...]]` (shape (1, N)): flatten to match Whisper / burn `&[f32]`.

@@ -28,11 +28,13 @@ fn kernel_hwc_to_nchw(kernel: &[f32], kernel_size: usize) -> Vec<f32> {
 }
 
 /// When `Application.tick()` is active, convolve on [`FrameState`]'s GPU tensor (no per-frame CPU↔GPU vec path).
+/// Returns `Some(rgb_hwc_flat)` when `inplace` is false and the op succeeded.
 fn try_convolve_on_frame_gpu(
     kernel_nchw: &[f32],
     kernel_size: usize,
     stride: [usize; 2],
-) -> bool {
+    inplace: bool,
+) -> Option<Option<Vec<f32>>> {
     crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
         xos_core::burn_raster::convolve_rgb_same(
             &mut state.frame,
@@ -40,17 +42,19 @@ fn try_convolve_on_frame_gpu(
             kernel_size,
             kernel_size,
             stride,
+            inplace,
         )
-        .is_ok()
+        .ok()
     })
-    .unwrap_or(false)
+    .flatten()
 }
 
 fn try_convolve_depthwise_on_frame_gpu(
     kernel: Vec<f32>,
     kernel_size: usize,
     stride: [usize; 2],
-) -> bool {
+    inplace: bool,
+) -> Option<Option<Vec<f32>>> {
     crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
         xos_core::burn_raster::convolve_depthwise_rgb_same(
             &mut state.frame,
@@ -58,10 +62,19 @@ fn try_convolve_depthwise_on_frame_gpu(
             kernel_size,
             kernel_size,
             stride,
+            inplace,
         )
-        .is_ok()
+        .ok()
     })
-    .unwrap_or(false)
+    .flatten()
+}
+
+fn frame_dims_from_tick() -> Option<(usize, usize)> {
+    crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
+        let shape = state.frame.shape();
+        Some((shape[1], shape[0]))
+    })
+    .flatten()
 }
 
 /// Extract the underlying data list from an array/tensor (handles xos.Tensor, dict, or list)
@@ -212,31 +225,18 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let kernel_nchw = kernel_hwc_to_nchw(&kernel, kernel_size);
     let stride_pair = [stride, stride];
 
-    if engine_dev == ComputeDevice::Gpu
-        && try_convolve_on_frame_gpu(&kernel_nchw, kernel_size, stride_pair)
-    {
-        if inplace {
-            return direct_fill_sentinel(vm);
-        }
-        let buffer_ptr_opt = crate::rasterizer::CURRENT_FRAME_BUFFER
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|ptr| ptr.as_ptr());
-        let width = *crate::rasterizer::CURRENT_FRAME_WIDTH.lock().unwrap();
-        let height = *crate::rasterizer::CURRENT_FRAME_HEIGHT.lock().unwrap();
-        if let Some(buffer_ptr) = buffer_ptr_opt {
-            let buffer =
-                unsafe { std::slice::from_raw_parts(buffer_ptr, width * height * 4) };
-            let mut output_rgb = vec![0.0f32; width * height * 3];
-            for i in 0..(width * height) {
-                let src = i * 4;
-                let dst = i * 3;
-                output_rgb[dst] = buffer[src] as f32;
-                output_rgb[dst + 1] = buffer[src + 1] as f32;
-                output_rgb[dst + 2] = buffer[src + 2] as f32;
+    if engine_dev == ComputeDevice::Gpu {
+        if let Some(gpu_out) =
+            try_convolve_on_frame_gpu(&kernel_nchw, kernel_size, stride_pair, inplace)
+        {
+            if inplace {
+                return direct_fill_sentinel(vm);
             }
-            return wrap_output_tensor(vm, width, height, &output_rgb, engine_dev);
+            if let Some(output_rgb) = gpu_out {
+                if let Some((width, height)) = frame_dims_from_tick() {
+                    return wrap_output_tensor(vm, width, height, &output_rgb, engine_dev);
+                }
+            }
         }
     }
 
@@ -473,31 +473,21 @@ pub fn convolve_depthwise(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
     let stride_pair = [stride, stride];
 
-    if engine_dev == ComputeDevice::Gpu
-        && try_convolve_depthwise_on_frame_gpu(kernel.clone(), kernel_size, stride_pair)
-    {
-        if inplace {
-            return direct_fill_sentinel(vm);
-        }
-        let buffer_ptr_opt = crate::rasterizer::CURRENT_FRAME_BUFFER
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|ptr| ptr.as_ptr());
-        let width = *crate::rasterizer::CURRENT_FRAME_WIDTH.lock().unwrap();
-        let height = *crate::rasterizer::CURRENT_FRAME_HEIGHT.lock().unwrap();
-        if let Some(buffer_ptr) = buffer_ptr_opt {
-            let buffer =
-                unsafe { std::slice::from_raw_parts(buffer_ptr, width * height * 4) };
-            let mut output_rgb = vec![0.0f32; width * height * 3];
-            for i in 0..(width * height) {
-                let src = i * 4;
-                let dst = i * 3;
-                output_rgb[dst] = buffer[src] as f32;
-                output_rgb[dst + 1] = buffer[src + 1] as f32;
-                output_rgb[dst + 2] = buffer[src + 2] as f32;
+    if engine_dev == ComputeDevice::Gpu {
+        if let Some(gpu_out) = try_convolve_depthwise_on_frame_gpu(
+            kernel.clone(),
+            kernel_size,
+            stride_pair,
+            inplace,
+        ) {
+            if inplace {
+                return direct_fill_sentinel(vm);
             }
-            return wrap_output_tensor(vm, width, height, &output_rgb, engine_dev);
+            if let Some(output_rgb) = gpu_out {
+                if let Some((width, height)) = frame_dims_from_tick() {
+                    return wrap_output_tensor(vm, width, height, &output_rgb, engine_dev);
+                }
+            }
         }
     }
 

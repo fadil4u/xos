@@ -25,6 +25,8 @@ class TVApp(xos.Application):
     def tick(self):
         # convolution tv will convolve the random frame
         neighbor_counts = xos.ops.convolve(self.frame.tensor, self.kernel, inplace=False, padding="same").to(xos.uint8)
+        print(neighbor_counts, neighbor_counts.device)
+        exit()
 
         state = self.frame.tensor
 

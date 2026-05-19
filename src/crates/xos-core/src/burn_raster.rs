@@ -408,16 +408,26 @@ pub fn triangles(
     Ok(())
 }
 
+fn burn_hwc_rgb_to_flat(t: BurnTensor<3>) -> Vec<f32> {
+    t.into_data()
+        .as_slice::<f32>()
+        .expect("conv output f32")
+        .to_vec()
+}
+
 /// Same-size RGB convolution on the frame's GPU tensor (Burn `conv2d` on WGPU).
 ///
-/// `kernel_nchw` is `[out_c=3, in_c=3, kh, kw]`. After the op, staging is updated for display.
+/// `kernel_nchw` is `[out_c=3, in_c=3, kh, kw]`.
+/// When `inplace` is true the frame tensor is replaced; otherwise the frame is unchanged and
+/// interleaved `[H,W,3]` floats are returned for Python output wrapping.
 pub fn convolve_rgb_same(
     frame: &mut FrameState,
     kernel_nchw: Vec<f32>,
     kernel_h: usize,
     kernel_w: usize,
     stride: [usize; 2],
-) -> Result<(), String> {
+    inplace: bool,
+) -> Result<Option<Vec<f32>>, String> {
     if stride != [1, 1] {
         return Err("convolve_rgb_same currently requires stride [1, 1]".into());
     }
@@ -446,10 +456,14 @@ pub fn convolve_rgb_same(
         .swap_dims(0, 2)
         .swap_dims(0, 1)
         .clamp(0.0, 255.0);
-    let alpha = BurnTensor::<3>::full([h, w, 1], 255.0, &device);
-    let rgba = BurnTensor::<3>::cat(vec![out_hwc, alpha], 2);
-    frame.set_burn_tensor(rgba);
-    Ok(())
+    if inplace {
+        let alpha = BurnTensor::<3>::full([h, w, 1], 255.0, &device);
+        let rgba = BurnTensor::<3>::cat(vec![out_hwc, alpha], 2);
+        frame.set_burn_tensor(rgba);
+        Ok(None)
+    } else {
+        Ok(Some(burn_hwc_rgb_to_flat(out_hwc)))
+    }
 }
 
 /// Depthwise same-size convolution on the frame GPU tensor.
@@ -459,7 +473,8 @@ pub fn convolve_depthwise_rgb_same(
     kernel_h: usize,
     kernel_w: usize,
     stride: [usize; 2],
-) -> Result<(), String> {
+    inplace: bool,
+) -> Result<Option<Vec<f32>>, String> {
     if stride != [1, 1] {
         return Err("convolve_depthwise_rgb_same currently requires stride [1, 1]".into());
     }
@@ -498,10 +513,14 @@ pub fn convolve_depthwise_rgb_same(
         .swap_dims(0, 2)
         .swap_dims(0, 1)
         .clamp(0.0, 255.0);
-    let alpha = BurnTensor::<3>::full([h, w, 1], 255.0, &device);
-    let rgba = BurnTensor::<3>::cat(vec![out_hwc, alpha], 2);
-    frame.set_burn_tensor(rgba);
-    Ok(())
+    if inplace {
+        let alpha = BurnTensor::<3>::full([h, w, 1], 255.0, &device);
+        let rgba = BurnTensor::<3>::cat(vec![out_hwc, alpha], 2);
+        frame.set_burn_tensor(rgba);
+        Ok(None)
+    } else {
+        Ok(Some(burn_hwc_rgb_to_flat(out_hwc)))
+    }
 }
 
 /// Filled disk in pixel space (GPU).
