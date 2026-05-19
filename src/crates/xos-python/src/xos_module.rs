@@ -1585,6 +1585,16 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
             vm,
         )
         .unwrap();
+    module
+        .set_attr(
+            "_materialize_conv_output",
+            vm.new_function(
+                "_materialize_conv_output",
+                crate::ops::conv::materialize_conv_output,
+            ),
+            vm,
+        )
+        .unwrap();
 
     crate::burn_train::register_burn_module(&module, vm);
 

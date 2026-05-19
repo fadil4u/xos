@@ -6,7 +6,7 @@
 use crate::dtypes::DType;
 use once_cell::sync::Lazy;
 use rustpython_vm::{
-    builtins::{PyBytes, PyDict, PyList, PyTuple},
+    builtins::{PyByteArray, PyBytes, PyDict, PyList, PyTuple},
     PyObjectRef, PyResult, VirtualMachine,
 };
 use std::collections::HashMap;
@@ -99,12 +99,61 @@ pub fn py_number_to_f64(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<f64>
     Err(vm.new_type_error("Expected a number (int or float)".to_string()))
 }
 
+/// Copy flat tensor storage (`_data` list, ``bytes``, or ``bytearray``) into a byte vector.
+pub fn tensor_flat_bytes(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
+    let mut cur = obj.clone();
+    for _ in 0..12 {
+        if let Some(bytes) = cur.downcast_ref::<PyBytes>() {
+            return Ok(bytes.as_bytes().to_vec());
+        }
+        if let Some(ba) = cur.downcast_ref::<PyByteArray>() {
+            return Ok(ba.borrow_buf().to_vec());
+        }
+        if let Some(dict) = cur.downcast_ref::<PyDict>() {
+            if let Ok(item) = dict.get_item("_data", vm) {
+                cur = item;
+                continue;
+            }
+            if let Ok(item) = dict.get_item("data", vm) {
+                cur = item;
+                continue;
+            }
+            if let Ok(vid_obj) = dict.get_item("_xos_viewport_id", vm) {
+                if let Ok(vid) = vid_obj.try_into_value::<i64>(vm) {
+                    if let Some(bytes) = crate::xos_module::standalone_frame_buffer_copy(
+                        vid.max(0) as u64,
+                    ) {
+                        return Ok(bytes);
+                    }
+                }
+            }
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "_data") {
+            cur = attr;
+            continue;
+        }
+        break;
+    }
+    let floats = tensor_flat_data_list(obj, vm)?;
+    Ok(floats
+        .iter()
+        .map(|&v| v.clamp(0.0, 255.0) as u8)
+        .collect())
+}
+
 /// Resolve raw tensor dict, Python `Tensor` wrapper, or nested `_data` to the flat `PyList` of values.
 pub fn tensor_flat_data_list(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<Vec<f32>> {
     let mut cur = obj.clone();
     for _ in 0..8 {
         if let Some(bytes) = cur.downcast_ref::<PyBytes>() {
             return Ok(bytes.as_bytes().iter().map(|&b| b as f32).collect());
+        }
+        if let Some(ba) = cur.downcast_ref::<PyByteArray>() {
+            return Ok(ba
+                .borrow_buf()
+                .iter()
+                .map(|&b| b as f32)
+                .collect());
         }
         if let Some(list) = cur.downcast_ref::<PyList>() {
             let vec = list.borrow_vec();

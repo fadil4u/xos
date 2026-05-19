@@ -6,14 +6,17 @@
 //! The pointer is valid only on the engine thread, only for the dynamic extent of
 //! [`TickEngineStateGuard`], and must not alias an active `&mut EngineState` borrow in Rust.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use xos_core::compute_device::ComputeDevice;
 use xos_core::engine::EngineState;
+use xos_tensor::BurnTensor;
 
 thread_local! {
     static TICK_ENGINE: Cell<Option<*mut EngineState>> = const { Cell::new(None) };
     static TICK_COMPUTE_DEVICE: Cell<Option<ComputeDevice>> = const { Cell::new(None) };
+    /// Latest `convolve(..., inplace=False)` GPU result; stays on device until materialized.
+    static CONV_GPU_OUTPUT: RefCell<Option<BurnTensor<3>>> = const { RefCell::new(None) };
 }
 
 #[inline]
@@ -63,7 +66,40 @@ impl Drop for TickEngineStateGuard {
     fn drop(&mut self) {
         set_tick_engine_state(None);
         set_tick_compute_device(None);
+        clear_conv_gpu_output();
     }
+}
+
+/// Store the most recent GPU conv output (replaces any prior output).
+pub fn set_conv_gpu_output(tensor: BurnTensor<3>) {
+    CONV_GPU_OUTPUT.with(|c| *c.borrow_mut() = Some(tensor));
+}
+
+pub fn clear_conv_gpu_output() {
+    CONV_GPU_OUTPUT.with(|c| *c.borrow_mut() = None);
+}
+
+/// One host readback of the stored conv tensor into packed RGB `u8` (HWC).
+pub fn materialize_conv_gpu_output_rgb_u8() -> Option<Vec<u8>> {
+    CONV_GPU_OUTPUT.with(|c| {
+        let t = c.borrow();
+        let t = t.as_ref()?;
+        let [h, w, c_ch] = t.dims();
+        if c_ch < 3 {
+            return None;
+        }
+        let data = t.clone().into_data();
+        let s = data.as_slice::<f32>().ok()?;
+        let pixels = h * w;
+        let mut out = Vec::with_capacity(pixels * 3);
+        for i in 0..pixels {
+            let o = i * 4;
+            out.push(s[o].clamp(0., 255.) as u8);
+            out.push(s[o + 1].clamp(0., 255.) as u8);
+            out.push(s[o + 2].clamp(0., 255.) as u8);
+        }
+        Some(out)
+    })
 }
 
 // ---------------------------------------------------------------------------

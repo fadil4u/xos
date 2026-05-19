@@ -1,6 +1,6 @@
 //! Materialize / flush opaque frame tensors (no `_data` list) for numpy-style Python ops.
 
-use rustpython_vm::builtins::{PyBytes, PyDict, PyDictRef, PyList};
+use rustpython_vm::builtins::{PyByteArray, PyBytes, PyDict, PyDictRef, PyList};
 use rustpython_vm::{function::FuncArgs, PyObjectRef, PyResult, VirtualMachine};
 
 use crate::tensor_buf::tensor_shape_tuple;
@@ -182,12 +182,19 @@ pub fn materialize_frame_tensor(args: FuncArgs, vm: &VirtualMachine) -> PyResult
     })?;
     let dict = resolve_tensor_dict(tensor, vm)?;
     if let Ok(existing) = dict.get_item("_data", vm) {
-        if existing.downcast_ref::<PyList>().is_some() {
+        if existing.downcast_ref::<PyList>().is_some()
+            || existing.downcast_ref::<PyBytes>().is_some()
+            || existing.downcast_ref::<PyByteArray>().is_some()
+        {
             return Ok(vm.ctx.none());
         }
     }
     let bytes = read_rgba_bytes_for_tensor(&dict, vm)?;
-    dict.set_item("_data", vm.ctx.new_bytes(bytes).into(), vm)?;
+    dict.set_item(
+        "_data",
+        PyByteArray::new_ref(bytes, &vm.ctx).into(),
+        vm,
+    )?;
     dict.set_item(
         "_xos_frame_materialized",
         vm.ctx.new_bool(true).into(),
@@ -203,22 +210,7 @@ pub fn flush_frame_tensor(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         .first()
         .ok_or_else(|| vm.new_type_error("flush_frame_tensor() expects a tensor".to_string()))?;
     let dict = resolve_tensor_dict(tensor, vm)?;
-    let bytes: Vec<u8> = if let Ok(dict) = resolve_tensor_dict(tensor, vm) {
-        if let Ok(storage) = dict.get_item("_data", vm) {
-            if let Ok(py_bytes) = storage.clone().downcast::<PyBytes>() {
-                py_bytes.as_bytes().to_vec()
-            } else {
-                let flat = crate::tensor_buf::tensor_flat_data_list(tensor, vm)?;
-                flat.iter().map(|&v| v.clamp(0.0, 255.0) as u8).collect()
-            }
-        } else {
-            let flat = crate::tensor_buf::tensor_flat_data_list(tensor, vm)?;
-            flat.iter().map(|&v| v.clamp(0.0, 255.0) as u8).collect()
-        }
-    } else {
-        let flat = crate::tensor_buf::tensor_flat_data_list(tensor, vm)?;
-        flat.iter().map(|&v| v.clamp(0.0, 255.0) as u8).collect()
-    };
+    let bytes = crate::tensor_buf::tensor_flat_bytes(tensor, vm)?;
     let shape = tensor_shape_tuple(tensor, vm).unwrap_or_default();
     let expected = shape.iter().product::<usize>();
     if expected > 0 && bytes.len() != expected {

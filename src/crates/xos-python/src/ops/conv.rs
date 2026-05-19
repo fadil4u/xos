@@ -28,13 +28,11 @@ fn kernel_hwc_to_nchw(kernel: &[f32], kernel_size: usize) -> Vec<f32> {
 }
 
 /// When `Application.tick()` is active, convolve on [`FrameState`]'s GPU tensor (no per-frame CPU↔GPU vec path).
-/// Returns `Some(rgb_hwc_flat)` when `inplace` is false and the op succeeded.
 fn try_convolve_on_frame_gpu(
     kernel_nchw: &[f32],
     kernel_size: usize,
     stride: [usize; 2],
-    inplace: bool,
-) -> Option<Option<Vec<f32>>> {
+) -> bool {
     crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
         xos_core::burn_raster::convolve_rgb_same(
             &mut state.frame,
@@ -42,19 +40,40 @@ fn try_convolve_on_frame_gpu(
             kernel_size,
             kernel_size,
             stride,
-            inplace,
         )
-        .ok()
+        .is_ok()
     })
-    .flatten()
+    .unwrap_or(false)
+}
+
+fn try_convolve_on_frame_gpu_out(
+    kernel_nchw: Vec<f32>,
+    kernel_size: usize,
+    stride: [usize; 2],
+) -> bool {
+    crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
+        match xos_core::burn_raster::convolve_rgb_same_out(
+            &mut state.frame,
+            kernel_nchw,
+            kernel_size,
+            kernel_size,
+            stride,
+        ) {
+            Ok(t) => {
+                crate::engine::py_engine_tls::set_conv_gpu_output(t);
+                true
+            }
+            Err(_) => false,
+        }
+    })
+    .unwrap_or(false)
 }
 
 fn try_convolve_depthwise_on_frame_gpu(
     kernel: Vec<f32>,
     kernel_size: usize,
     stride: [usize; 2],
-    inplace: bool,
-) -> Option<Option<Vec<f32>>> {
+) -> bool {
     crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
         xos_core::burn_raster::convolve_depthwise_rgb_same(
             &mut state.frame,
@@ -62,11 +81,33 @@ fn try_convolve_depthwise_on_frame_gpu(
             kernel_size,
             kernel_size,
             stride,
-            inplace,
         )
-        .ok()
+        .is_ok()
     })
-    .flatten()
+    .unwrap_or(false)
+}
+
+fn try_convolve_depthwise_on_frame_gpu_out(
+    kernel: Vec<f32>,
+    kernel_size: usize,
+    stride: [usize; 2],
+) -> bool {
+    crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
+        match xos_core::burn_raster::convolve_depthwise_rgb_same_out(
+            &mut state.frame,
+            kernel,
+            kernel_size,
+            kernel_size,
+            stride,
+        ) {
+            Ok(t) => {
+                crate::engine::py_engine_tls::set_conv_gpu_output(t);
+                true
+            }
+            Err(_) => false,
+        }
+    })
+    .unwrap_or(false)
 }
 
 fn frame_dims_from_tick() -> Option<(usize, usize)> {
@@ -75,6 +116,79 @@ fn frame_dims_from_tick() -> Option<(usize, usize)> {
         Some((shape[1], shape[0]))
     })
     .flatten()
+}
+
+/// Opaque GPU conv result: no `_data` until [`materialize_conv_output`] (one readback).
+fn wrap_gpu_conv_output_tensor(
+    vm: &VirtualMachine,
+    width: usize,
+    height: usize,
+    device: ComputeDevice,
+) -> PyResult {
+    let tensor_dict = vm.ctx.new_dict();
+    tensor_dict.set_item(
+        "shape",
+        vm.ctx
+            .new_tuple(vec![
+                vm.ctx.new_int(height).into(),
+                vm.ctx.new_int(width).into(),
+                vm.ctx.new_int(3).into(),
+            ])
+            .into(),
+        vm,
+    )?;
+    tensor_dict.set_item("dtype", vm.ctx.new_str("float32").into(), vm)?;
+    tensor_dict.set_item(
+        "device",
+        vm.ctx.new_str(device.as_str()).into(),
+        vm,
+    )?;
+    tensor_dict.set_item("_xos_gpu_conv_output", vm.ctx.new_bool(true).into(), vm)?;
+
+    if let Ok(wrapper_class) = vm.builtins.get_attr("Tensor", vm) {
+        if let Ok(wrapped) = wrapper_class.call((tensor_dict.clone(),), vm) {
+            return Ok(wrapped);
+        }
+    }
+    Ok(tensor_dict.into())
+}
+
+/// Populate ``tensor._data`` from the tick-local GPU conv buffer (single readback).
+pub fn materialize_conv_output(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    use rustpython_vm::builtins::{PyByteArray, PyDictRef};
+
+    let tensor = args.args.first().ok_or_else(|| {
+        vm.new_type_error("materialize_conv_output() expects a tensor".to_string())
+    })?;
+    let mut cur = tensor.clone();
+    let dict: PyDictRef = loop {
+        if let Ok(d) = cur.clone().downcast::<rustpython_vm::builtins::PyDict>() {
+            if d.get_item("_xos_gpu_conv_output", vm).is_ok() {
+                break d;
+            }
+        }
+        cur = vm
+            .get_attribute_opt(cur, "_data")?
+            .ok_or_else(|| vm.new_type_error("expected conv output tensor".to_string()))?;
+    };
+
+    if dict.get_item("_data", vm).is_ok() {
+        return Ok(vm.ctx.none());
+    }
+
+    let bytes = crate::engine::py_engine_tls::materialize_conv_gpu_output_rgb_u8()
+        .ok_or_else(|| vm.new_runtime_error("no GPU conv output to materialize".to_string()))?;
+    dict.set_item(
+        "_data",
+        PyByteArray::new_ref(bytes, &vm.ctx).into(),
+        vm,
+    )?;
+    dict.set_item(
+        "_xos_conv_materialized",
+        vm.ctx.new_bool(true).into(),
+        vm,
+    )?;
+    Ok(vm.ctx.none())
 }
 
 /// Extract the underlying data list from an array/tensor (handles xos.Tensor, dict, or list)
@@ -226,21 +340,15 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let stride_pair = [stride, stride];
 
     if engine_dev == ComputeDevice::Gpu {
-        if let Some(gpu_out) =
-            try_convolve_on_frame_gpu(&kernel_nchw, kernel_size, stride_pair, inplace)
-        {
-            if inplace {
+        if inplace {
+            if try_convolve_on_frame_gpu(&kernel_nchw, kernel_size, stride_pair) {
                 return direct_fill_sentinel(vm);
             }
-            if let Some(output_rgb) = gpu_out {
-                if let Some((width, height)) = frame_dims_from_tick() {
-                    return wrap_output_tensor(vm, width, height, &output_rgb, engine_dev);
-                }
+        } else if let Some((width, height)) = frame_dims_from_tick() {
+            if try_convolve_on_frame_gpu_out(kernel_nchw, kernel_size, stride_pair) {
+                return wrap_gpu_conv_output_tensor(vm, width, height, engine_dev);
             }
         }
-    }
-
-    if engine_dev == ComputeDevice::Gpu {
         return Err(vm.new_runtime_error(
             "convolve(): GPU frame path unavailable (engine state not bound during tick)"
                 .to_string(),
@@ -474,24 +582,15 @@ pub fn convolve_depthwise(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let stride_pair = [stride, stride];
 
     if engine_dev == ComputeDevice::Gpu {
-        if let Some(gpu_out) = try_convolve_depthwise_on_frame_gpu(
-            kernel.clone(),
-            kernel_size,
-            stride_pair,
-            inplace,
-        ) {
-            if inplace {
+        if inplace {
+            if try_convolve_depthwise_on_frame_gpu(kernel.clone(), kernel_size, stride_pair) {
                 return direct_fill_sentinel(vm);
             }
-            if let Some(output_rgb) = gpu_out {
-                if let Some((width, height)) = frame_dims_from_tick() {
-                    return wrap_output_tensor(vm, width, height, &output_rgb, engine_dev);
-                }
+        } else if let Some((width, height)) = frame_dims_from_tick() {
+            if try_convolve_depthwise_on_frame_gpu_out(kernel, kernel_size, stride_pair) {
+                return wrap_gpu_conv_output_tensor(vm, width, height, engine_dev);
             }
         }
-    }
-
-    if engine_dev == ComputeDevice::Gpu {
         return Err(vm.new_runtime_error(
             "convolve_depthwise(): GPU frame path unavailable (engine state not bound during tick)"
                 .to_string(),

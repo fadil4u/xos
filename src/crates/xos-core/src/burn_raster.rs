@@ -408,38 +408,23 @@ pub fn triangles(
     Ok(())
 }
 
-fn burn_hwc_rgb_to_flat(t: BurnTensor<3>) -> Vec<f32> {
-    t.into_data()
-        .as_slice::<f32>()
-        .expect("conv output f32")
-        .to_vec()
-}
-
-/// Same-size RGB convolution on the frame's GPU tensor (Burn `conv2d` on WGPU).
-///
-/// `kernel_nchw` is `[out_c=3, in_c=3, kh, kw]`.
-/// When `inplace` is true the frame tensor is replaced; otherwise the frame is unchanged and
-/// interleaved `[H,W,3]` floats are returned for Python output wrapping.
-pub fn convolve_rgb_same(
-    frame: &mut FrameState,
+fn rgb_conv_same_rgba(
+    input: BurnTensor<3>,
+    device: &WgpuDevice,
+    h: usize,
+    w: usize,
     kernel_nchw: Vec<f32>,
     kernel_h: usize,
     kernel_w: usize,
     stride: [usize; 2],
-    inplace: bool,
-) -> Result<Option<Vec<f32>>, String> {
+) -> Result<BurnTensor<3>, String> {
     if stride != [1, 1] {
         return Err("convolve_rgb_same currently requires stride [1, 1]".into());
     }
     let pad_h = (kernel_h.saturating_sub(1)) / 2;
     let pad_w = (kernel_w.saturating_sub(1)) / 2;
 
-    frame.ensure_gpu_from_cpu();
-    let device = frame.device().clone();
-    let [h, w, _] = frame.tensor_dims();
-
-    let t = frame.burn_tensor().clone();
-    let rgb = t.clone().slice([0..h, 0..w, 0..3]);
+    let rgb = input.slice([0..h, 0..w, 0..3]);
     let x = rgb
         .swap_dims(0, 2)
         .swap_dims(1, 2)
@@ -447,7 +432,7 @@ pub fn convolve_rgb_same(
 
     let weight = BurnTensor::<4>::from_data(
         TensorData::new(kernel_nchw, [3, 3, kernel_h, kernel_w]),
-        &device,
+        device,
     );
     let options = ConvOptions::new(stride, [pad_h, pad_w], [1, 1], 1);
     let out = conv2d(x, weight, None, options);
@@ -456,33 +441,24 @@ pub fn convolve_rgb_same(
         .swap_dims(0, 2)
         .swap_dims(0, 1)
         .clamp(0.0, 255.0);
-    if inplace {
-        let alpha = BurnTensor::<3>::full([h, w, 1], 255.0, &device);
-        let rgba = BurnTensor::<3>::cat(vec![out_hwc, alpha], 2);
-        frame.set_burn_tensor(rgba);
-        Ok(None)
-    } else {
-        Ok(Some(burn_hwc_rgb_to_flat(out_hwc)))
-    }
+    let alpha = BurnTensor::<3>::full([h, w, 1], 255.0, device);
+    Ok(BurnTensor::<3>::cat(vec![out_hwc, alpha], 2))
 }
 
-/// Depthwise same-size convolution on the frame GPU tensor.
-pub fn convolve_depthwise_rgb_same(
-    frame: &mut FrameState,
-    kernel: Vec<f32>,
+fn depthwise_conv_same_rgba(
+    input: BurnTensor<3>,
+    device: &WgpuDevice,
+    h: usize,
+    w: usize,
+    kernel: &[f32],
     kernel_h: usize,
     kernel_w: usize,
     stride: [usize; 2],
-    inplace: bool,
-) -> Result<Option<Vec<f32>>, String> {
+) -> Result<BurnTensor<3>, String> {
     if stride != [1, 1] {
         return Err("convolve_depthwise_rgb_same currently requires stride [1, 1]".into());
     }
     let pad = (kernel_h.saturating_sub(1)) / 2;
-
-    frame.ensure_gpu_from_cpu();
-    let device = frame.device().clone();
-    let [h, w, _] = frame.tensor_dims();
 
     let mut kernel_dw = vec![0.0f32; 3 * kernel_h * kernel_w];
     for c in 0..3 {
@@ -495,8 +471,7 @@ pub fn convolve_depthwise_rgb_same(
         }
     }
 
-    let t = frame.burn_tensor().clone();
-    let rgb = t.clone().slice([0..h, 0..w, 0..3]);
+    let rgb = input.slice([0..h, 0..w, 0..3]);
     let x = rgb
         .swap_dims(0, 2)
         .swap_dims(1, 2)
@@ -504,7 +479,7 @@ pub fn convolve_depthwise_rgb_same(
 
     let weight = BurnTensor::<4>::from_data(
         TensorData::new(kernel_dw, [3, 1, kernel_h, kernel_w]),
-        &device,
+        device,
     );
     let options = ConvOptions::new(stride, [pad, pad], [1, 1], 3);
     let out = conv2d(x, weight, None, options);
@@ -513,14 +488,75 @@ pub fn convolve_depthwise_rgb_same(
         .swap_dims(0, 2)
         .swap_dims(0, 1)
         .clamp(0.0, 255.0);
-    if inplace {
-        let alpha = BurnTensor::<3>::full([h, w, 1], 255.0, &device);
-        let rgba = BurnTensor::<3>::cat(vec![out_hwc, alpha], 2);
-        frame.set_burn_tensor(rgba);
-        Ok(None)
-    } else {
-        Ok(Some(burn_hwc_rgb_to_flat(out_hwc)))
-    }
+    let alpha = BurnTensor::<3>::full([h, w, 1], 255.0, device);
+    Ok(BurnTensor::<3>::cat(vec![out_hwc, alpha], 2))
+}
+
+/// Same-size RGB convolution on the frame's GPU tensor (Burn `conv2d` on WGPU).
+///
+/// `kernel_nchw` is `[out_c=3, in_c=3, kh, kw]`. Replaces the frame GPU tensor in place.
+pub fn convolve_rgb_same(
+    frame: &mut FrameState,
+    kernel_nchw: Vec<f32>,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride: [usize; 2],
+) -> Result<(), String> {
+    frame.ensure_gpu_from_cpu();
+    let device = frame.device().clone();
+    let [h, w, _] = frame.tensor_dims();
+    let input = frame.burn_tensor().clone();
+    let rgba = rgb_conv_same_rgba(input, &device, h, w, kernel_nchw, kernel_h, kernel_w, stride)?;
+    frame.set_burn_tensor(rgba);
+    Ok(())
+}
+
+/// RGB same-size conv on the frame GPU tensor without modifying the frame.
+pub fn convolve_rgb_same_out(
+    frame: &mut FrameState,
+    kernel_nchw: Vec<f32>,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride: [usize; 2],
+) -> Result<BurnTensor<3>, String> {
+    frame.ensure_gpu_from_cpu();
+    let device = frame.device().clone();
+    let [h, w, _] = frame.tensor_dims();
+    let input = frame.burn_tensor().clone();
+    rgb_conv_same_rgba(input, &device, h, w, kernel_nchw, kernel_h, kernel_w, stride)
+}
+
+/// Depthwise same-size convolution on the frame GPU tensor (in place).
+pub fn convolve_depthwise_rgb_same(
+    frame: &mut FrameState,
+    kernel: Vec<f32>,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride: [usize; 2],
+) -> Result<(), String> {
+    frame.ensure_gpu_from_cpu();
+    let device = frame.device().clone();
+    let [h, w, _] = frame.tensor_dims();
+    let input = frame.burn_tensor().clone();
+    let rgba =
+        depthwise_conv_same_rgba(input, &device, h, w, &kernel, kernel_h, kernel_w, stride)?;
+    frame.set_burn_tensor(rgba);
+    Ok(())
+}
+
+/// Depthwise same-size conv on the frame GPU tensor without modifying the frame.
+pub fn convolve_depthwise_rgb_same_out(
+    frame: &mut FrameState,
+    kernel: Vec<f32>,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride: [usize; 2],
+) -> Result<BurnTensor<3>, String> {
+    frame.ensure_gpu_from_cpu();
+    let device = frame.device().clone();
+    let [h, w, _] = frame.tensor_dims();
+    let input = frame.burn_tensor().clone();
+    depthwise_conv_same_rgba(input, &device, h, w, &kernel, kernel_h, kernel_w, stride)
 }
 
 /// Filled disk in pixel space (GPU).

@@ -351,6 +351,9 @@ class Tensor:
         import xos
         if self._flat_storage() is not None:
             return
+        if self._data.get("_xos_gpu_conv_output"):
+            xos._materialize_conv_output(self)
+            return
         if (
             self._data.get("_xos_viewport_id") is not None
             or self._data.get("_xos_frame_backing")
@@ -798,24 +801,37 @@ class Tensor:
         return name in self._DEVICE_NAMES or name in self._DEVICE_ALIASES
 
     def _to_device(self, device):
-        if "_data" not in self._data:
+        if self._data.get("_xos_gpu_conv_output") and self._flat_storage() is None:
+            import xos
+            xos._materialize_conv_output(self)
+        flat = self._flat_storage()
+        if flat is None:
             raise TypeError("tensor has no element data for to()")
         dev = self._normalize_device(device)
         if dev not in self._DEVICE_NAMES:
             raise ValueError(f"unsupported device for to(): {device}")
-        data = self._data["_data"]
-        if not isinstance(data, list):
+        if isinstance(flat, list):
+            data = list(flat)
+        elif isinstance(flat, (bytes, bytearray)):
+            data = bytearray(flat)
+        else:
             raise TypeError("tensor has no element data for to()")
         return Tensor({
             "shape": tuple(self.shape),
             "dtype": self.dtype,
             "device": dev,
-            "_data": list(data),
+            "_data": data,
         })
 
     def to(self, target=None, *, dtype=None, device=None):
         """Cast ``dtype`` and/or set ``device`` (metadata; compute still uses the active backend)."""
-        if "_data" not in self._data or not isinstance(self._data["_data"], list):
+        if self._data.get("_xos_gpu_conv_output") and self._flat_storage() is None:
+            import xos
+            xos._materialize_conv_output(self)
+        if self._flat_storage() is None:
+            raise TypeError("tensor has no element data for to()")
+        flat = self._flat_storage()
+        if not isinstance(flat, list) and not isinstance(flat, (bytes, bytearray)):
             raise TypeError("tensor has no element data for to()")
 
         if device is not None:
@@ -855,20 +871,27 @@ class Tensor:
         }
         target = alias.get(target, target)
 
-        src = base._data["_data"]
+        src = base._flat_storage()
         if target == "uint8":
             out = []
-            for v in src:
-                iv = int(v)
-                if iv < 0:
-                    iv = 0
-                elif iv > 255:
-                    iv = 255
-                out.append(iv)
+            if isinstance(src, (bytes, bytearray)):
+                for v in src:
+                    out.append(int(v))
+            else:
+                for v in src:
+                    iv = int(v)
+                    if iv < 0:
+                        iv = 0
+                    elif iv > 255:
+                        iv = 255
+                    out.append(iv)
         elif target in ("int8", "int16", "int32", "int64", "uint16", "uint32", "uint64"):
             out = [int(v) for v in src]
         elif target in ("float16", "float32", "float64"):
-            out = [float(v) for v in src]
+            if isinstance(src, (bytes, bytearray)):
+                out = [float(v) for v in src]
+            else:
+                out = [float(v) for v in src]
         else:
             raise ValueError(f"unsupported dtype for to(): {target}")
 

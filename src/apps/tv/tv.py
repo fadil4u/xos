@@ -12,6 +12,7 @@ class TVApp(xos.Application):
         # frame is initialized with random static
         self.randomize_frame()
         self.kernel = xos.tensor([[1, 1, 1], [1, 0, 1], [1, 1, 1]], device="gpu")
+        print(self.kernel, self.kernel.dtype)
 
     def randomize_frame(self):
         xos.random.uniform_fill(self.frame.tensor, 0.0, 1.0)
@@ -48,4 +49,6 @@ class TVApp(xos.Application):
 
 
 if __name__ == "__main__":
-    TVApp().run()
+    app = TVApp()
+    app.verbosities.function_calls = True
+    app.run()
