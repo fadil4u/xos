@@ -542,13 +542,73 @@ class Tensor:
         })
 
     def reshape(self, new_shape):
-        flat = self._data["_data"]
+        self._ensure_flat()
+        flat = self._flat_storage()
+        if flat is None:
+            raise TypeError("tensor has no flat storage for reshape")
+        if isinstance(flat, (bytes, bytearray)):
+            flat = list(flat)
         prod = 1
         for d in new_shape:
             prod *= d
         if prod != len(flat):
             raise ValueError("reshape size mismatch")
         return self._wrap_vals(tuple(new_shape), flat)
+
+    def unsqueeze(self, axis):
+        """Insert a length-1 dimension at ``axis`` (supports negative indices)."""
+        self._ensure_flat()
+        flat = self._flat_storage()
+        if flat is None:
+            raise TypeError("tensor has no flat storage for unsqueeze")
+        if isinstance(flat, (bytes, bytearray)):
+            flat = list(flat)
+        shape = list(self.shape)
+        ndim = len(shape)
+        ax = int(axis)
+        if ax < 0:
+            ax += ndim + 1
+        if ax < 0 or ax > ndim:
+            raise IndexError("unsqueeze axis out of range")
+        new_shape = shape[:ax] + [1] + shape[ax:]
+        return self._wrap_vals(tuple(new_shape), flat)
+
+    def repeat(self, count, axis=-1):
+        """Repeat elements along ``axis`` (numpy-style; default last axis)."""
+        self._ensure_flat()
+        if int(count) < 1:
+            raise ValueError("repeat count must be >= 1")
+        count = int(count)
+        flat = self._flat_storage()
+        if flat is None:
+            raise TypeError("tensor has no flat storage for repeat")
+        if isinstance(flat, (bytes, bytearray)):
+            flat = list(flat)
+        shape = list(self.shape)
+        ndim = len(shape)
+        ax = int(axis)
+        if ax < 0:
+            ax += ndim
+        if ax < 0 or ax >= ndim:
+            raise IndexError("repeat axis out of range")
+        outer = 1
+        for s in shape[:ax]:
+            outer *= int(s)
+        axis_len = int(shape[ax])
+        inner = 1
+        for s in shape[ax + 1 :]:
+            inner *= int(s)
+        block = axis_len * inner
+        out = []
+        for o in range(outer):
+            base = o * block
+            for a in range(axis_len):
+                chunk = flat[base + a * inner : base + (a + 1) * inner]
+                for _ in range(count):
+                    out.extend(chunk)
+        new_shape = shape[:]
+        new_shape[ax] = axis_len * count
+        return self._wrap_vals(tuple(new_shape), out)
 
     def _gather_rows(self, idx_tensor):
         """Numpy-style fancy indexing along axis 0.
@@ -592,6 +652,32 @@ class Tensor:
             out.extend(flat[base : base + inner_size])
         return self._wrap_vals((len(rows),) + inner_shape, out)
 
+    def _hwc3_to_rgba(self, value):
+        """Expand ``(H, W, 3)`` uint8/float tensor to ``(H, W, 4)`` with alpha 255."""
+        value._ensure_flat()
+        vshape = tuple(value.shape)
+        flat = value._flat_storage()
+        if flat is None:
+            raise TypeError("expected tensor with flat _data for RGB upload")
+        if isinstance(flat, (bytes, bytearray)):
+            flat = list(flat)
+        if len(vshape) != 3 or int(vshape[2]) != 3:
+            return value
+        h, w = int(vshape[0]), int(vshape[1])
+        rgba = []
+        for i in range(h * w):
+            o = i * 3
+            rgba.append(int(self._flat_get(flat, o)) & 0xFF)
+            rgba.append(int(self._flat_get(flat, o + 1)) & 0xFF)
+            rgba.append(int(self._flat_get(flat, o + 2)) & 0xFF)
+            rgba.append(255)
+        return Tensor({
+            "shape": (h, w, 4),
+            "dtype": value.dtype,
+            "device": value._data.get("device", "cpu"),
+            "_data": rgba,
+        })
+
     def __setitem__(self, key, value):
         if isinstance(key, slice) and key == slice(None, None, None):
             # Full slice assignment
@@ -600,6 +686,11 @@ class Tensor:
                 # Data already written directly to buffer by Rust - drop stale flat cache.
                 self._data.pop("_data", None)
                 return
+            if isinstance(value, Tensor):
+                fshape = tuple(self.shape)
+                vshape = tuple(value.shape)
+                if len(fshape) == 3 and len(vshape) == 3 and int(fshape[2]) == 4 and int(vshape[2]) == 3:
+                    value = self._hwc3_to_rgba(value)
             # Call Rust function to fill buffer (handles lists and Tensor)
             import xos
             xos.rasterizer._fill_buffer(self._data, value)
@@ -766,6 +857,7 @@ class Tensor:
         return self._wrap_like_self([other - a for a in left])
 
     def __mul__(self, other):
+        self._ensure_flat()
         return self._binary_op(other, lambda a, b: a * b)
 
     def __rmul__(self, other):
