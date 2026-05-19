@@ -25,8 +25,8 @@ class TVApp(xos.Application):
         device = self.frame.tensor.device
 
         # allocate resolution-matching simulation buffers (0/1)
-        self.state = xos.tensor.zeros((h, w), dtype=xos.uint8, device=device)
-        self.next_state = xos.tensor.zeros_like(self.state)
+        self.state = xos.zeros((h, w), dtype=xos.uint8, device=device)
+        self.next_state = xos.zeros_like(self.state)
 
         xos.random.uniform_fill(self.state, 0.0, 1.0)
         self.state = (self.state > 0.5).to(xos.uint8)
