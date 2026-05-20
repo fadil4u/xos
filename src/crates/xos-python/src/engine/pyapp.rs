@@ -908,12 +908,10 @@ class Tensor:
         return self._data.get('device', 'cpu')
 
     def printpack(self, compress=False):
-        """Serialize tensor to a single-line pack string (optionally deflate-compressed)."""
+        """Return a single-line pack string (optionally deflate-compressed). Does not print."""
         import xos
         self._ensure_flat()
-        packed = xos._tensor_printpack(self, compress=compress)
-        xos.print(packed)
-        return packed
+        return xos._tensor_printpack(self, compress=compress)
 
     def randomize(self):
         """Fill all elements with random values between this tensor's dtype MIN and MAX."""
