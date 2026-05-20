@@ -11,7 +11,6 @@ def test_squares(dtype):
     tensor = xos.zeros((250, 1000, 3), dtype=dtype)
 
     rects = xos.tensor([
-        [0, 0, 100, 100],
         [10, 10, 20, 20],
         [30, 30, 40, 40],
         [50, 50, 60, 60],
@@ -31,6 +30,7 @@ def test_squares(dtype):
 
     # this should be the api for rendering the frame to the screen
     viewport = xos.render(tensor)
+    # print(tensor.to_string(full=True))
     viewport.pause()
     # viewport = xos.render(tensor)
     # viewport.pause()
