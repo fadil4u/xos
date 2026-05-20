@@ -8,7 +8,7 @@ def blank_test():
 @xos.test
 @xos.parametrize("dtype", [xos.uint8, xos.float32])
 def test_squares(dtype):
-    tensor = xos.zeros((100, 100, 3), dtype=dtype)
+    tensor = xos.zeros((250, 1000, 3), dtype=dtype)
 
     rects = xos.tensor([
         [0, 0, 100, 100],
