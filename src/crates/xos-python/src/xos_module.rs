@@ -1308,6 +1308,24 @@ fn frame_present_standalone(_args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 }
 
 /// Create the xos module with Application base class
+fn tensor_registry_bytes(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let id = args
+        .args
+        .first()
+        .ok_or_else(|| vm.new_type_error("_tensor_registry_bytes(id, dtype) requires id".to_string()))?
+        .clone()
+        .try_into_value::<i64>(vm)?;
+    let dtype_label = args
+        .args
+        .get(1)
+        .map(|o| o.clone().try_into_value::<String>(vm))
+        .transpose()?
+        .unwrap_or_else(|| "float32".to_string());
+    let dtype = crate::dtypes::DType::from_str(&dtype_label).unwrap_or(crate::dtypes::DType::Float32);
+    crate::tensor_buf::tensor_registry_as_bytearray(id.max(0) as u64, dtype, vm)
+        .ok_or_else(|| vm.new_runtime_error("tensor registry id not found".to_string()))
+}
+
 pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     let module = vm.new_module("xos", vm.ctx.new_dict(), None);
 
@@ -1599,6 +1617,14 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
                 "_materialize_conv_output",
                 crate::ops::conv::materialize_conv_output,
             ),
+            vm,
+        )
+        .unwrap();
+
+    module
+        .set_attr(
+            "_tensor_registry_bytes",
+            vm.new_function("_tensor_registry_bytes", tensor_registry_bytes),
             vm,
         )
         .unwrap();

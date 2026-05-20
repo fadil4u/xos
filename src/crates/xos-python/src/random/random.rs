@@ -344,6 +344,96 @@ fn uniform(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     }
 }
 
+/// Fill a standalone tensor's flat ``_data`` (e.g. Game-of-Life ``state``), not ``frame.tensor``.
+fn fill_tensor_uniform(
+    tensor_hint: &PyObjectRef,
+    low: f64,
+    high: f64,
+    vm: &VirtualMachine,
+) -> PyResult<()> {
+    use crate::dtypes::DType;
+    use crate::tensor_buf::{tensor_flat_data_list, tensor_shape_tuple};
+    use rustpython_vm::builtins::{PyDict, PyList};
+
+    let shape = tensor_shape_tuple(tensor_hint, vm)?;
+    let total: usize = shape.iter().product();
+    let mut flat = tensor_flat_data_list(tensor_hint, vm)?;
+    if flat.len() != total {
+        flat.resize(total, 0.0);
+    }
+
+    let mut cur = tensor_hint.clone();
+    let mut dtype_label = "float32".to_string();
+    for _ in 0..8 {
+        if let Some(dict) = cur.downcast_ref::<PyDict>() {
+            if let Ok(dt) = dict.get_item("dtype", vm) {
+                if let Ok(s) = dt.str(vm) {
+                    dtype_label = s.to_string();
+                }
+            }
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "_data") {
+            cur = attr;
+            continue;
+        }
+        break;
+    }
+    let dtype = DType::from_str(&dtype_label).unwrap_or(DType::Float32);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        for v in flat.iter_mut() {
+            let r: f64 = rng.random();
+            let sample = low + r * (high - low);
+            *v = if dtype == DType::UInt8 {
+                (sample.clamp(0.0, 1.0) * 255.0).round() as f32
+            } else {
+                sample as f32
+            };
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        for v in flat.iter_mut() {
+            let r = js_sys::Math::random();
+            let sample = low + r * (high - low);
+            *v = if dtype == DType::UInt8 {
+                (sample.clamp(0.0, 1.0) * 255.0).round() as f32
+            } else {
+                sample as f32
+            };
+        }
+    }
+
+    // Sync registry + visible Python list.
+    if let Some(dict) = tensor_hint.downcast_ref::<PyDict>() {
+        if let Ok(id_obj) = dict.get_item("_rust_tensor", vm) {
+            if let Ok(id) = id_obj.try_into_value::<i64>(vm) {
+                crate::tensor_buf::write_tensor_data_by_id(id.max(0) as u64, &flat);
+            }
+        }
+        if let Ok(data_obj) = dict.get_item("_data", vm) {
+            if let Some(list) = data_obj.downcast_ref::<PyList>() {
+                let mut vec = list.borrow_vec_mut();
+                for (i, &v) in flat.iter().enumerate() {
+                    if i >= vec.len() {
+                        break;
+                    }
+                    vec[i] = if dtype.is_float() {
+                        vm.ctx.new_float(v as f64).into()
+                    } else {
+                        vm.ctx.new_int(v as i64).into()
+                    };
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// xos.random.uniform_fill(array, low, high) - fill array directly with random values (ZERO COPY)
 ///
 /// Fills the frame buffer array directly with random values without any Python allocations.
@@ -364,6 +454,13 @@ fn uniform_fill(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
     let frame_dev = device_policy::tensor_device_label(tensor_hint, vm)?;
     let engine_dev = device_policy::require_engine_device(vm, "uniform_fill", &frame_dev)?;
+
+    if !device_policy::is_frame_backed_tensor(tensor_hint, vm) {
+        fill_tensor_uniform(tensor_hint, low, high, vm)?;
+        let sentinel = vm.ctx.new_dict();
+        sentinel.set_item("_direct_fill", vm.ctx.new_bool(true).into(), vm)?;
+        return Ok(sentinel.into());
+    }
 
     if engine_dev == ComputeDevice::Gpu {
         if crate::engine::py_engine_tls::with_engine_state_mut(|state| {

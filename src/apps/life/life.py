@@ -44,13 +44,15 @@ class GameOfLife(xos.Application):
             padding="same"
         )
 
-        # Conway rule (vector form)
-        self.next_state = ((N == 3) | ((self.state == 1) & (N == 2))).to(xos.uint8)
+        # # Conway rule (vector form)
+        # self.next_state = ((N == 3) | ((self.state == 1) & (N == 2))).to(xos.uint8)
+        # print(self.next_state)
 
-        # swap buffers
-        self.state, self.next_state = self.next_state, self.state
+        # # swap buffers
+        # self.state, self.next_state = self.next_state, self.state
 
-        self.update_framebuffer()
+        # self.update_framebuffer()
+        pass
 
     # ------------------------------------------------------------------ resize
 

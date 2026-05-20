@@ -89,6 +89,23 @@ pub fn conv_gpu_output_shape() -> Option<(usize, usize, usize)> {
     })
 }
 
+/// One host readback of the stored conv tensor into flat HWC `f32`.
+pub fn materialize_conv_gpu_output_hwc_f32() -> Option<(Vec<usize>, Vec<f32>)> {
+    CONV_GPU_OUTPUT.with(|c| {
+        let t = c.borrow();
+        let t = t.as_ref()?;
+        let [h, w, c_ch] = t.dims();
+        let data = t.clone().into_data();
+        let s = data.as_slice::<f32>().ok()?;
+        let shape = if c_ch == 1 {
+            vec![h, w]
+        } else {
+            vec![h, w, c_ch]
+        };
+        Some((shape, s.to_vec()))
+    })
+}
+
 /// One host readback of the stored conv tensor into packed RGBA `u8` (HWC).
 pub fn materialize_conv_gpu_output_rgba_u8() -> Option<Vec<u8>> {
     CONV_GPU_OUTPUT.with(|c| {

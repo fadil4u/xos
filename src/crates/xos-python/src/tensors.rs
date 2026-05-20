@@ -354,7 +354,11 @@ pub fn zeros_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let shape_arg = parse_shape_arg(&args.args[0], vm)?;
     let total: usize = shape_arg.iter().product();
     let py_tensor = create_tensor_from_data(vec![0.0f32; total], shape_arg, dtype);
-    wrap_tensor_dict(py_tensor.to_py_dict_on(vm, dtype, &device)?, vm)
+    let registry_only = crate::tensor_buf::use_registry_only_tensor(&device, total);
+    wrap_tensor_dict(
+        crate::tensor_buf::wrap_registry_tensor(vm, &py_tensor, dtype, &device, registry_only)?,
+        vm,
+    )
 }
 
 pub fn zeros_like_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
@@ -366,7 +370,11 @@ pub fn zeros_like_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let device = crate::device_policy::tensor_device_label(ref_tensor, vm)?;
     let total: usize = shape.iter().product();
     let py_tensor = create_tensor_from_data(vec![0.0f32; total], shape, dtype);
-    wrap_tensor_dict(py_tensor.to_py_dict_on(vm, dtype, &device)?, vm)
+    let registry_only = crate::tensor_buf::use_registry_only_tensor(&device, total);
+    wrap_tensor_dict(
+        crate::tensor_buf::wrap_registry_tensor(vm, &py_tensor, dtype, &device, registry_only)?,
+        vm,
+    )
 }
 
 pub fn ones_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {

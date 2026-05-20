@@ -50,6 +50,25 @@ pub fn engine_compute_device(vm: &VirtualMachine) -> PyResult<ComputeDevice> {
     })
 }
 
+/// True when ``obj`` is ``frame.tensor`` (or another tensor dict tied to the display framebuffer).
+pub fn is_frame_backed_tensor(obj: &PyObjectRef, vm: &VirtualMachine) -> bool {
+    use rustpython_vm::builtins::PyDict;
+    let mut cur = obj.clone();
+    for _ in 0..12 {
+        if let Some(dict) = cur.downcast_ref::<PyDict>() {
+            if dict.get_item("_xos_frame_backing", vm).is_ok() {
+                return true;
+            }
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "_data") {
+            cur = attr;
+            continue;
+        }
+        break;
+    }
+    false
+}
+
 /// Read `device` from a tensor dict / `_TensorWrapper` / frame.tensor dict.
 pub fn tensor_device_label(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<String> {
     if let Ok(data_attr) = obj.get_attr("_data", vm) {

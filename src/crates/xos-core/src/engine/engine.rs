@@ -255,8 +255,9 @@ impl FrameState {
         }
     }
 
+    /// GPU device used by the frame Burn tensor (Metal/WGPU). Public for ops that run on the same device as the viewport.
     #[inline]
-    pub(crate) fn device(&self) -> &WgpuDevice {
+    pub fn device(&self) -> &WgpuDevice {
         &self.device
     }
 

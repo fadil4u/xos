@@ -351,6 +351,8 @@ class Tensor:
         import xos
         if self._flat_storage() is not None:
             return
+        if self._data.get("_rust_tensor") is not None and self._attach_registry_flat():
+            return
         if self._data.get("_xos_gpu_conv_output"):
             xos._materialize_conv_output(self)
             return
@@ -367,7 +369,21 @@ class Tensor:
         return len(flat)
 
     def _flat_get(self, flat, i):
+        if isinstance(flat, (bytes, bytearray)) and self.dtype == "float32":
+            import struct
+            return struct.unpack_from("<f", flat, i * 4)[0]
         return flat[i]
+
+    def _attach_registry_flat(self):
+        rid = self._data.get("_rust_tensor")
+        if rid is None:
+            return False
+        import xos
+        ba = xos._tensor_registry_bytes(int(rid), str(self._data.get("dtype", "float32")))
+        if ba is None:
+            return False
+        self._data["_data"] = ba
+        return True
 
     def _cmp_scalar(self, other):
         if (
@@ -389,6 +405,22 @@ class Tensor:
 
     def _broadcast_rhs_flat(self, lshape, rshape, left, right):
         if len(left) == len(right):
+            return right
+        if (
+            len(lshape) == 2
+            and len(rshape) == 3
+            and lshape[0] == rshape[0]
+            and lshape[1] == rshape[1]
+            and rshape[2] == 1
+        ):
+            return right
+        if (
+            len(lshape) == 3
+            and len(rshape) == 2
+            and lshape[0] == rshape[0]
+            and lshape[1] == rshape[1]
+            and lshape[2] == 1
+        ):
             return right
         if (
             len(lshape) == 3
@@ -1216,6 +1248,9 @@ class Verbosities:
 class Application:
     """Base class for xos applications. Extend this class and implement __init__() and tick().
 
+    Set ``function_calls = True`` on a subclass to trace method entry (including ``__init__``)
+    before ``app.run()`` — instance ``app.verbosities.function_calls`` only applies after creation.
+
     ``self.safe_region`` is an ``xos.SafeRegion`` (``x1,y1,x2,y2`` in the same normalized space as ``xos.ui.Text``)
     refreshed each engine tick — use ``safe_region.renormalize(lx1, ly1, lx2, ly2)`` for inset-local ``0..1`` rects.
 
@@ -1227,7 +1262,9 @@ class Application:
     Conventional order is ``self.keyboard.on_events(self)`` then ``self.text.on_events(self)`` for
     pointer, ``key_char``, and shortcuts alike — no special cases per event type are required.
     """
-    
+
+    function_calls = False
+
     def __init__(self, headless=None, device=None):
         import builtins
         next_id = int(getattr(builtins, "__xos_next_viewport_id__", 0))
@@ -1257,6 +1294,8 @@ class Application:
         class_verb = getattr(type(self), "verbosities", None)
         if isinstance(class_verb, Verbosities):
             self.verbosities.function_calls = bool(class_verb.function_calls)
+        elif bool(getattr(type(self), "function_calls", False)):
+            self.verbosities.function_calls = True
 
         # Register before standalone frame so device/headless class attrs are visible to native ops.
         import builtins
@@ -1285,20 +1324,34 @@ class Application:
         return float(getattr(self, "xos_scale", 1.0))
 
     @staticmethod
-    def _xos_trace_method_call(app_cls_name, method_name):
-        import xos
-        xos.print_color(f"&b{app_cls_name}&f.&5{method_name}&f()")
-
-    @staticmethod
     def _xos_wrap_subclass_method(app_cls_name, method_name, fn):
         if isinstance(fn, (staticmethod, classmethod)):
             return fn
 
         def wrapper(self, *args, **kwargs):
+            import builtins
+            import time
+            import xos
+
             verb = getattr(self, "verbosities", None)
-            if verb is not None and getattr(verb, "function_calls", False):
-                Application._xos_trace_method_call(app_cls_name, method_name)
-            return fn(self, *args, **kwargs)
+            trace = verb is not None and getattr(verb, "function_calls", False)
+            depth = 0
+            if trace:
+                depth = int(getattr(builtins, "__xos_trace_depth__", 0))
+                prefix = ("│   " * depth) + "├── "
+                xos.print_color(f"{prefix}&b{app_cls_name}&f.&5{method_name}&f()")
+                builtins.__xos_trace_depth__ = depth + 1
+                t0 = time.perf_counter()
+            try:
+                return fn(self, *args, **kwargs)
+            finally:
+                if trace:
+                    ms = (time.perf_counter() - t0) * 1000.0
+                    out_prefix = ("│   " * depth) + "└── "
+                    xos.print_color(
+                        f"{out_prefix}&8{ms:,.2f} ms&f  &7{app_cls_name}.{method_name}&f"
+                    )
+                    builtins.__xos_trace_depth__ = depth
 
         wrapper.__name__ = getattr(fn, "__name__", method_name)
         return wrapper

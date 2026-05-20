@@ -453,6 +453,77 @@ fn rgb_conv_same_rgba(
     Ok(BurnTensor::<3>::cat(vec![out_hwc, alpha], 2))
 }
 
+/// Depthwise same conv on ``[h, w, c]`` (Burn `conv2d`, groups = channels). ``kernel`` is one K×K stencil.
+fn depthwise_conv_same_hwc_tensor(
+    input: BurnTensor<3>,
+    device: &WgpuDevice,
+    h: usize,
+    w: usize,
+    channels: usize,
+    kernel: &[f32],
+    kernel_h: usize,
+    kernel_w: usize,
+) -> Result<BurnTensor<3>, String> {
+    if kernel_h * kernel_w != kernel.len() {
+        return Err(format!(
+            "depthwise kernel length {} does not match {}x{}",
+            kernel.len(),
+            kernel_h,
+            kernel_w
+        ));
+    }
+    let pad = (kernel_h.saturating_sub(1)) / 2;
+
+    let mut kernel_dw = vec![0.0f32; channels * kernel_h * kernel_w];
+    for c in 0..channels {
+        for ky in 0..kernel_h {
+            for kx in 0..kernel_w {
+                let src = ky * kernel_w + kx;
+                let dst = (c * kernel_h + ky) * kernel_w + kx;
+                kernel_dw[dst] = kernel[src];
+            }
+        }
+    }
+
+    let x = input
+        .slice([0..h, 0..w, 0..channels])
+        .swap_dims(0, 2)
+        .swap_dims(1, 2)
+        .unsqueeze_dim::<4>(0);
+
+    let weight = BurnTensor::<4>::from_data(
+        TensorData::new(kernel_dw, [channels, 1, kernel_h, kernel_w]),
+        device,
+    );
+    let options = ConvOptions::new([1, 1], [pad, pad], [1, 1], channels);
+    let out = conv2d(x, weight, None, options);
+    // Only drop batch dim; `squeeze::<3>()` would also drop C=1 → [h, w] and panic.
+    let out = out.squeeze_dim(0);
+    Ok(out.swap_dims(0, 2).swap_dims(0, 1))
+}
+
+/// Depthwise same conv from a flat HWC buffer (simulation tensors, etc.). Stays on GPU.
+pub fn depthwise_conv_same_hwc(
+    device: &WgpuDevice,
+    h: usize,
+    w: usize,
+    channels: usize,
+    input_hwc: &[f32],
+    kernel: &[f32],
+    kernel_h: usize,
+    kernel_w: usize,
+) -> Result<BurnTensor<3>, String> {
+    if input_hwc.len() != h * w * channels {
+        return Err(format!(
+            "depthwise_conv_same_hwc: expected {} elements, got {}",
+            h * w * channels,
+            input_hwc.len()
+        ));
+    }
+    let t = BurnTensor::<3>::from_data(TensorData::new(input_hwc.to_vec(), [h, w, channels]), device);
+    depthwise_conv_same_hwc_tensor(t, device, h, w, channels, kernel, kernel_h, kernel_w)
+}
+
 fn depthwise_conv_same_rgba(
     input: BurnTensor<3>,
     device: &WgpuDevice,
@@ -466,7 +537,6 @@ fn depthwise_conv_same_rgba(
     if stride != [1, 1] {
         return Err("convolve_depthwise_rgb_same currently requires stride [1, 1]".into());
     }
-    let pad = (kernel_h.saturating_sub(1)) / 2;
     let c_in = input.dims()[2];
     let (rgb, alpha) = if c_in >= 4 {
         let alpha = input.clone().slice([0..h, 0..w, 3..4]);
@@ -478,32 +548,7 @@ fn depthwise_conv_same_rgba(
         (rgb, alpha)
     };
 
-    let mut kernel_dw = vec![0.0f32; 3 * kernel_h * kernel_w];
-    for c in 0..3 {
-        for ky in 0..kernel_h {
-            for kx in 0..kernel_w {
-                let src = ky * kernel_w + kx;
-                let dst = (c * kernel_h + ky) * kernel_w + kx;
-                kernel_dw[dst] = kernel[src];
-            }
-        }
-    }
-
-    let x = rgb
-        .swap_dims(0, 2)
-        .swap_dims(1, 2)
-        .unsqueeze_dim::<4>(0);
-
-    let weight = BurnTensor::<4>::from_data(
-        TensorData::new(kernel_dw, [3, 1, kernel_h, kernel_w]),
-        device,
-    );
-    let options = ConvOptions::new(stride, [pad, pad], [1, 1], 3);
-    let out = conv2d(x, weight, None, options);
-    let out_hwc = out
-        .squeeze::<3>()
-        .swap_dims(0, 2)
-        .swap_dims(0, 1)
+    let out_hwc = depthwise_conv_same_hwc_tensor(rgb, device, h, w, 3, kernel, kernel_h, kernel_w)?
         .clamp(0.0, 255.0);
     Ok(BurnTensor::<3>::cat(vec![out_hwc, alpha], 2))
 }

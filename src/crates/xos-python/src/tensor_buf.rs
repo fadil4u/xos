@@ -78,6 +78,54 @@ impl Tensor {
 
         Ok(dict.into())
     }
+
+    /// Registry-backed dict without materializing millions of Python scalars (GPU simulation buffers).
+    pub fn to_py_dict_registry_only(
+        &self,
+        vm: &VirtualMachine,
+        dtype: DType,
+        device: &str,
+    ) -> PyResult<PyObjectRef> {
+        let dict = vm.ctx.new_dict();
+        dict.set_item(
+            "shape",
+            vm.ctx
+                .new_tuple(
+                    self.shape
+                        .iter()
+                        .map(|&s| vm.ctx.new_int(s).into())
+                        .collect(),
+                )
+                .into(),
+            vm,
+        )?;
+        dict.set_item("dtype", vm.ctx.new_str(dtype.name()).into(), vm)?;
+        dict.set_item("device", vm.ctx.new_str(device).into(), vm)?;
+        dict.set_item("_rust_tensor", vm.ctx.new_int(self.id as i64).into(), vm)?;
+        dict.set_item("_xos_registry_only", vm.ctx.new_bool(true).into(), vm)?;
+        Ok(dict.into())
+    }
+}
+
+/// True when ``device`` should use registry-only tensors (no per-element Python list).
+pub fn use_registry_only_tensor(device: &str, element_count: usize) -> bool {
+    let d = device.trim().to_lowercase();
+    (d == "gpu" || d == "cuda" || d == "metal" || d == "mps" || d == "wgpu") && element_count > 4096
+}
+
+/// Pack registry ``f32`` storage as a little-endian ``bytearray`` for fast element access.
+pub fn tensor_registry_as_bytearray(id: u64, dtype: DType, vm: &VirtualMachine) -> Option<PyObjectRef> {
+    let flat = try_get_tensor_data_by_id(id)?;
+    let bytes: Vec<u8> = if dtype.is_float() {
+        flat.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect()
+    } else {
+        flat.iter()
+            .map(|&v| v.clamp(0.0, 255.0) as u8)
+            .collect()
+    };
+    Some(PyByteArray::new_ref(bytes, &vm.ctx).into())
 }
 
 fn try_get_tensor_data_by_id(id: u64) -> Option<Vec<f32>> {
@@ -86,6 +134,24 @@ fn try_get_tensor_data_by_id(id: u64) -> Option<Vec<f32>> {
     drop(reg);
     let guard = data.lock().ok()?;
     Some(guard.clone())
+}
+
+/// Update registry storage for a tensor id (used by ``uniform_fill`` on simulation buffers).
+pub fn write_tensor_data_by_id(id: u64, flat: &[f32]) -> bool {
+    let reg = match TENSOR_REGISTRY.lock() {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let Some(data) = reg.get(&id) else {
+        return false;
+    };
+    let data = data.clone();
+    drop(reg);
+    if let Ok(mut guard) = data.lock() {
+        *guard = flat.to_vec();
+        return true;
+    }
+    false
 }
 
 /// Extract f64 from Python int or float.
@@ -240,4 +306,19 @@ pub fn tensor_shape_tuple(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<Ve
 /// Create tensor from flat data and shape.
 pub fn create_tensor_from_data(flat_data: Vec<f32>, shape: Vec<usize>, _dtype: DType) -> Tensor {
     Tensor::new(flat_data, shape)
+}
+
+/// Wrap a registry [`Tensor`] for Python (optionally without a materialized ``_data`` list).
+pub fn wrap_registry_tensor(
+    vm: &VirtualMachine,
+    tensor: &Tensor,
+    dtype: DType,
+    device: &str,
+    registry_only: bool,
+) -> PyResult<PyObjectRef> {
+    if registry_only {
+        tensor.to_py_dict_registry_only(vm, dtype, device)
+    } else {
+        tensor.to_py_dict_on(vm, dtype, device)
+    }
 }
