@@ -21,6 +21,8 @@ pub mod mouse;
 pub mod nn;
 pub mod ops;
 pub mod path;
+pub mod render;
+pub mod testing;
 pub mod python_whiteboard;
 pub mod whiteboard_kernel;
 pub mod random;
@@ -44,7 +46,7 @@ use rustpython_vm::{builtins::PyModule, PyRef, VirtualMachine};
 pub use json_codec::decode_mesh_jpeg_bytes_best_effort;
 pub use runtime::{
     parse_script_cli_flags, python_app_wants_headless, run_python_app, run_python_file,
-    run_python_interactive,
+    run_python_interactive, run_test_suite,
 };
 
 pub fn make_tensors_module(vm: &VirtualMachine) -> PyRef<PyModule> {

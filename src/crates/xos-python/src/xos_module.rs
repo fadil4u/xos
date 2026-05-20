@@ -1,5 +1,7 @@
 use rustpython_vm::{
-    builtins::PyModule, function::FuncArgs, AsObject, PyRef, PyResult, VirtualMachine,
+    builtins::{PyDict, PyModule},
+    function::FuncArgs,
+    AsObject, PyObjectRef, PyRef, PyResult, VirtualMachine,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -16,7 +18,7 @@ use winit::{
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{Key, NamedKey},
-    platform::pump_events::{EventLoopExtPumpEvents, PumpStatus},
+    platform::pump_events::EventLoopExtPumpEvents,
     window::{CursorIcon, Window, WindowAttributes, WindowId},
 };
 
@@ -1015,6 +1017,206 @@ fn frame_clear(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     Ok(vm.ctx.none())
 }
 
+pub(crate) fn tensor_rust_id(obj: &PyObjectRef, vm: &VirtualMachine) -> Option<u64> {
+    let mut cur = obj.clone();
+    for _ in 0..8 {
+        if let Some(dict) = cur.downcast_ref::<PyDict>() {
+            if let Ok(id_obj) = dict.get_item("_rust_tensor", vm) {
+                if let Ok(id) = id_obj.try_into_value::<i64>(vm) {
+                    return Some(id.max(0) as u64);
+                }
+            }
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur, "_data") {
+            cur = attr;
+            continue;
+        }
+        break;
+    }
+    None
+}
+
+fn hwc_flat_to_rgba(flat: &[f32], height: usize, width: usize, channels: usize) -> Vec<u8> {
+    let mut rgba = vec![0u8; height.saturating_mul(width).saturating_mul(4)];
+    let ch = channels.max(1);
+    for y in 0..height {
+        for x in 0..width {
+            let src = (y * width + x) * ch;
+            let dst = (y * width + x) * 4;
+            if src + ch <= flat.len() && dst + 3 < rgba.len() {
+                rgba[dst] = flat[src].clamp(0.0, 255.0) as u8;
+                if ch > 1 {
+                    rgba[dst + 1] = flat[src + 1].clamp(0.0, 255.0) as u8;
+                }
+                if ch > 2 {
+                    rgba[dst + 2] = flat[src + 2].clamp(0.0, 255.0) as u8;
+                }
+                rgba[dst + 3] = if ch >= 4 {
+                    flat[src + 3].clamp(0.0, 255.0) as u8
+                } else {
+                    255
+                };
+            }
+        }
+    }
+    rgba
+}
+
+fn ensure_standalone_buffer(viewport_id: u64, width: usize, height: usize, vm: &VirtualMachine) -> PyResult {
+    let mut buffers = STANDALONE_FRAME_BUFFERS.lock().map_err(|_| {
+        vm.new_runtime_error("standalone frame buffer lock poisoned".to_string())
+    })?;
+    let buf = buffers.entry(viewport_id).or_default();
+    let required = width.saturating_mul(height).saturating_mul(4);
+    if buf.len() != required {
+        buf.resize(required, 0);
+    }
+    crate::rasterizer::set_frame_buffer_context(buf.as_mut_slice(), width, height);
+    STANDALONE_FRAME_DIMS
+        .lock()
+        .map_err(|_| vm.new_runtime_error("standalone frame dims lock poisoned".to_string()))?
+        .insert(viewport_id, (width, height));
+    Ok(vm.ctx.none())
+}
+
+/// xos._sync_tensor_to_standalone(tensor, viewport_id)
+fn sync_tensor_to_standalone(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let args_vec = args.args;
+    if args_vec.len() < 2 {
+        return Err(vm.new_type_error(
+            "_sync_tensor_to_standalone(tensor, viewport_id)".to_string(),
+        ));
+    }
+    let tensor = &args_vec[0];
+    let viewport_id: u64 = args_vec[1].clone().try_into_value::<i64>(vm)?.max(0) as u64;
+    let shape = crate::tensor_buf::tensor_shape_tuple(tensor, vm)?;
+    if shape.len() < 2 {
+        return Err(vm.new_type_error("tensor needs (height, width, ...)".to_string()));
+    }
+    let height = shape[0].max(1);
+    let width = shape[1].max(1);
+    let channels = shape.get(2).copied().unwrap_or(4).max(1);
+    ensure_standalone_buffer(viewport_id, width, height, vm)?;
+    let flat = crate::tensor_buf::tensor_flat_data_list(tensor, vm)?;
+    let rgba = hwc_flat_to_rgba(&flat, height, width, channels);
+    write_standalone_frame_buffer(viewport_id, &rgba);
+    Ok(vm.ctx.none())
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+fn standalone_present_viewport_inner(viewport_id: u64, vm: &VirtualMachine) -> PyResult<()> {
+    use winit::event_loop::EventLoop;
+    use winit::platform::pump_events::EventLoopExtPumpEvents;
+
+    let width = *crate::rasterizer::CURRENT_FRAME_WIDTH
+        .lock()
+        .unwrap() as u32;
+    let height = *crate::rasterizer::CURRENT_FRAME_HEIGHT
+        .lock()
+        .unwrap() as u32;
+    let frame = STANDALONE_FRAME_BUFFERS
+        .lock()
+        .map_err(|_| vm.new_runtime_error("standalone frame buffer lock poisoned".to_string()))?
+        .get(&viewport_id)
+        .cloned()
+        .unwrap_or_default();
+
+    STANDALONE_PREVIEW_HOST.with(|slot| {
+        let mut opt = slot.borrow_mut();
+        if opt.is_none() {
+            let event_loop = EventLoop::new().map_err(|e| {
+                vm.new_runtime_error(format!("failed to create preview event loop: {e}"))
+            })?;
+            *opt = Some(StandalonePreviewHost {
+                event_loop,
+                app: StandalonePreviewApp::new(),
+            });
+        }
+        if let Some(host) = opt.as_mut() {
+            host.app.pending_frames.insert(
+                viewport_id,
+                StandalonePendingFrame {
+                    width: width.max(1),
+                    height: height.max(1),
+                    rgba: frame,
+                },
+            );
+            if let Some(pf) = host.app.pending_frames.get(&viewport_id) {
+                host.app.source_frames.insert(
+                    viewport_id,
+                    StandalonePendingFrame {
+                        width: pf.width,
+                        height: pf.height,
+                        rgba: pf.rgba.clone(),
+                    },
+                );
+            }
+            if !host.app.viewport_to_window.contains_key(&viewport_id) {
+                host.app.pending_window_creates.insert(
+                    viewport_id,
+                    (width.max(1), height.max(1)),
+                );
+            }
+            host.app.render_viewport(viewport_id);
+            let timeout = Some(xos_core::time::Duration::ZERO);
+            let _ = host.event_loop.pump_app_events(timeout, &mut host.app);
+        }
+        Ok(())
+    })
+}
+
+#[cfg(any(target_arch = "wasm32", target_os = "ios"))]
+fn standalone_present_viewport_inner(_viewport_id: u64, _vm: &VirtualMachine) -> PyResult<()> {
+    Ok(())
+}
+
+/// xos.frame._present_viewport(viewport_id) — show / refresh without blocking.
+fn frame_present_viewport(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let viewport_id: u64 = if !args.args.is_empty() {
+        args.args[0].clone().try_into_value::<i64>(vm)?.max(0) as u64
+    } else {
+        0
+    };
+    standalone_present_viewport_inner(viewport_id, vm)?;
+    Ok(vm.ctx.none())
+}
+
+/// xos.frame._pause_viewport(viewport_id) — block until the preview window is closed.
+fn frame_pause_viewport(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
+    {
+        return Ok(vm.ctx.none());
+    }
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+    {
+        use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
+
+        let viewport_id: u64 = if !args.args.is_empty() {
+            args.args[0].clone().try_into_value::<i64>(vm)?.max(0) as u64
+        } else {
+            0
+        };
+        standalone_present_viewport_inner(viewport_id, vm)?;
+        STANDALONE_PREVIEW_HOST.with(|slot| {
+            let mut opt = slot.borrow_mut();
+            if let Some(host) = opt.as_mut() {
+                if let Some(es) = host.app.f3_engine_state.get_mut(&viewport_id) {
+                    es.paused = true;
+                }
+                loop {
+                    let timeout = Some(xos_core::time::Duration::from_millis(250));
+                    match host.event_loop.pump_app_events(timeout, &mut host.app) {
+                        PumpStatus::Continue => {}
+                        PumpStatus::Exit(_) => {}
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(vm.ctx.none())
+    }
+}
+
 /// xos.frame._begin_standalone(width=800, height=600) -> frame dict
 /// Initializes a temporary framebuffer context so `app.tick()` can be called directly from Python.
 fn frame_begin_standalone(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
@@ -1038,21 +1240,7 @@ fn frame_begin_standalone(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         600
     };
 
-    {
-        let mut buffers = STANDALONE_FRAME_BUFFERS.lock().map_err(|_| {
-            vm.new_runtime_error("standalone frame buffer lock poisoned".to_string())
-        })?;
-        let buf = buffers.entry(viewport_id).or_default();
-        let required = width.saturating_mul(height).saturating_mul(4);
-        if buf.len() != required {
-            buf.resize(required, 0);
-        }
-        crate::rasterizer::set_frame_buffer_context(buf.as_mut_slice(), width, height);
-        STANDALONE_FRAME_DIMS
-            .lock()
-            .map_err(|_| vm.new_runtime_error("standalone frame dims lock poisoned".to_string()))?
-            .insert(viewport_id, (width, height));
-    }
+    ensure_standalone_buffer(viewport_id, width, height, vm)?;
 
     let tensor_dict = vm.ctx.new_dict();
     tensor_dict.set_item(
@@ -1202,109 +1390,14 @@ fn frame_standalone_ui_scale(_args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 }
 
 /// xos.frame._present_standalone() - presents standalone buffer in a non-blocking native window.
-fn frame_present_standalone(_args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
-    {
-        return Ok(vm.ctx.none());
-    }
-    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
-    {
-        let viewport_id: u64 = if !_args.args.is_empty() {
-            let id: i64 = _args.args[0].clone().try_into_value(vm)?;
-            id.max(0) as u64
-        } else {
-            0
-        };
-        let width = *crate::rasterizer::CURRENT_FRAME_WIDTH
-            .lock()
-            .unwrap() as u32;
-        let height = *crate::rasterizer::CURRENT_FRAME_HEIGHT
-            .lock()
-            .unwrap() as u32;
-        let frame = STANDALONE_FRAME_BUFFERS
-            .lock()
-            .map_err(|_| vm.new_runtime_error("standalone frame buffer lock poisoned".to_string()))?
-            .get(&viewport_id)
-            .cloned()
-            .unwrap_or_default();
-
-        STANDALONE_PREVIEW_HOST.with(|slot| {
-            let mut opt = slot.borrow_mut();
-            if opt.is_none() {
-                let event_loop = EventLoop::new().map_err(|e| {
-                    vm.new_runtime_error(format!("failed to create preview event loop: {e}"))
-                })?;
-                *opt = Some(StandalonePreviewHost {
-                    event_loop,
-                    app: StandalonePreviewApp::new(),
-                });
-            }
-            if let Some(host) = opt.as_mut() {
-                host.app.pending_frames.insert(
-                    viewport_id,
-                    StandalonePendingFrame {
-                        width: width.max(1),
-                        height: height.max(1),
-                        rgba: frame,
-                    },
-                );
-                if let Some(pf) = host.app.pending_frames.get(&viewport_id) {
-                    host.app.source_frames.insert(
-                        viewport_id,
-                        StandalonePendingFrame {
-                            width: pf.width,
-                            height: pf.height,
-                            rgba: pf.rgba.clone(),
-                        },
-                    );
-                    if host.app.viewport_paused(viewport_id) {
-                        host.app.paused_base_frames.insert(
-                            viewport_id,
-                            StandalonePendingFrame {
-                                width: pf.width,
-                                height: pf.height,
-                                rgba: pf.rgba.clone(),
-                            },
-                        );
-                    }
-                }
-                if !host.app.viewport_to_window.contains_key(&viewport_id) {
-                    host.app
-                        .pending_window_creates
-                        .insert(viewport_id, (width.max(1), height.max(1)));
-                }
-                host.app.render_viewport(viewport_id);
-                loop {
-                    let timeout = if host.app.viewport_paused(viewport_id) {
-                        Some(xos_core::time::Duration::from_millis(250))
-                    } else {
-                        Some(xos_core::time::Duration::ZERO)
-                    };
-                    match host.event_loop.pump_app_events(timeout, &mut host.app) {
-                        PumpStatus::Continue => {}
-                        PumpStatus::Exit(_) => {
-                            // Keep EventLoop alive: many platforms allow only one per process.
-                        }
-                    }
-                    let mut stepped = false;
-                    if let Some(es) = host.app.f3_engine_state.get_mut(&viewport_id) {
-                        if es.paused && es.pending_step_ticks > 0 {
-                            es.pending_step_ticks = es.pending_step_ticks.saturating_sub(1);
-                            stepped = true;
-                        }
-                    }
-                    if stepped {
-                        break;
-                    }
-                    if !host.app.viewport_paused(viewport_id) {
-                        break;
-                    }
-                }
-            }
-            Ok(())
-        })?;
-        Ok(vm.ctx.none())
-    }
+fn frame_present_standalone(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let viewport_id: u64 = if !args.args.is_empty() {
+        args.args[0].clone().try_into_value::<i64>(vm)?.max(0) as u64
+    } else {
+        0
+    };
+    standalone_present_viewport_inner(viewport_id, vm)?;
+    Ok(vm.ctx.none())
 }
 
 /// Create the xos module with Application base class
@@ -1459,12 +1552,36 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
         .unwrap();
     frame_module
         .set_attr(
+            "_present_viewport",
+            vm.new_function("_present_viewport", frame_present_viewport),
+            vm,
+        )
+        .unwrap();
+    frame_module
+        .set_attr(
+            "_pause_viewport",
+            vm.new_function("_pause_viewport", frame_pause_viewport),
+            vm,
+        )
+        .unwrap();
+    frame_module
+        .set_attr(
             "_standalone_tensor_data",
             vm.new_function("_standalone_tensor_data", frame_standalone_tensor_data),
             vm,
         )
         .unwrap();
     module.set_attr("frame", frame_module, vm).unwrap();
+
+    crate::testing::install_testing(vm, module.clone());
+    crate::render::install_render(vm, module.clone());
+    module
+        .set_attr(
+            "_sync_tensor_to_standalone",
+            vm.new_function("_sync_tensor_to_standalone", sync_tensor_to_standalone),
+            vm,
+        )
+        .unwrap();
 
     crate::json_api::register_json(&module, vm);
 

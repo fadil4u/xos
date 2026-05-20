@@ -1251,6 +1251,135 @@ fn rects_filled(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     Ok(vm.ctx.none())
 }
 
+/// xos.rasterizer.fill_rectangles(tensor, rects, colors)
+///
+/// Pixel-space rectangles: each row is `[x1, y1, x2, y2]`. Colors are `(r,g,b)` or `(r,g,b,a)`
+/// with one row broadcast to all rects, or one color per rect.
+fn fill_rectangles(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let args_vec = args.args;
+    if args_vec.len() != 3 {
+        return Err(vm.new_type_error(format!(
+            "fill_rectangles(tensor, rects, colors) takes 3 arguments ({} given)",
+            args_vec.len()
+        )));
+    }
+    let tensor = &args_vec[0];
+    let rects_obj = &args_vec[1];
+    let colors_obj = &args_vec[2];
+
+    let shape = tensor_shape_tuple(tensor, vm)?;
+    if shape.len() < 2 {
+        return Err(vm.new_type_error("tensor needs shape (height, width, ...)".to_string()));
+    }
+    let height = shape[0].max(1);
+    let width = shape[1].max(1);
+    let channels = shape.get(2).copied().unwrap_or(1).max(1);
+
+    let rect_flat = tensor_flat_data_list(rects_obj, vm)?;
+    if rect_flat.len() < 4 || rect_flat.len() % 4 != 0 {
+        return Err(vm.new_type_error(
+            "rects must be shape (N, 4) with pixel coords [x1, y1, x2, y2]".to_string(),
+        ));
+    }
+    let num_rects = rect_flat.len() / 4;
+
+    let color_flat = tensor_flat_data_list(colors_obj, vm)?;
+    let color_shape = tensor_shape_tuple(colors_obj, vm).unwrap_or_default();
+    let (num_colors, color_stride) = if color_shape.len() >= 2 {
+        (
+            color_shape[0].max(1),
+            color_shape[1].max(3),
+        )
+    } else if color_flat.len() >= 3 {
+        (1usize, color_flat.len())
+    } else {
+        return Err(vm.new_type_error("colors must be (r,g,b) or (N,3)".to_string()));
+    };
+
+    let mut flat = tensor_flat_data_list(tensor, vm)?;
+    let expected = height.saturating_mul(width).saturating_mul(channels);
+    if flat.len() < expected {
+        flat.resize(expected, 0.0);
+    }
+
+    let mut fill_pixel_rect =
+        |x1: i32, y1: i32, x2: i32, y2: i32, r: f32, g: f32, b: f32, a: f32| {
+            let x_start = x1.max(0).min(width as i32) as usize;
+            let x_end = x2.max(0).min(width as i32) as usize;
+            let y_start = y1.max(0).min(height as i32) as usize;
+            let y_end = y2.max(0).min(height as i32) as usize;
+            let src_a = if a > 1.0 {
+                (a / 255.0).clamp(0.0, 1.0)
+            } else {
+                a.clamp(0.0, 1.0)
+            };
+            let inv_a = 1.0 - src_a;
+            for y in y_start..y_end {
+                for x in x_start..x_end {
+                    let idx = (y * width + x) * channels;
+                    if idx + channels > flat.len() {
+                        continue;
+                    }
+                    if channels >= 1 {
+                        flat[idx] = (r * src_a + flat[idx] * inv_a).round().clamp(0.0, 255.0);
+                    }
+                    if channels >= 2 {
+                        flat[idx + 1] =
+                            (g * src_a + flat[idx + 1] * inv_a).round().clamp(0.0, 255.0);
+                    }
+                    if channels >= 3 {
+                        flat[idx + 2] =
+                            (b * src_a + flat[idx + 2] * inv_a).round().clamp(0.0, 255.0);
+                    }
+                    if channels >= 4 {
+                        flat[idx + 3] = if a > 1.0 {
+                            a.clamp(0.0, 255.0)
+                        } else {
+                            (src_a * 255.0).round().clamp(0.0, 255.0)
+                        };
+                    }
+                }
+            }
+        };
+
+    for r in 0..num_rects {
+        let base = r * 4;
+        let x1 = rect_flat[base].round() as i32;
+        let y1 = rect_flat[base + 1].round() as i32;
+        let x2 = rect_flat[base + 2].round() as i32;
+        let y2 = rect_flat[base + 3].round() as i32;
+        let cidx = r % num_colors;
+        let cbase = cidx * color_stride;
+        if cbase + 2 >= color_flat.len() {
+            continue;
+        }
+        let cr = color_flat[cbase];
+        let cg = color_flat[cbase + 1];
+        let cb = color_flat[cbase + 2];
+        let ca = if color_stride >= 4 && cbase + 3 < color_flat.len() {
+            color_flat[cbase + 3]
+        } else {
+            255.0
+        };
+        fill_pixel_rect(x1, y1, x2, y2, cr, cg, cb, ca);
+    }
+
+    if let Some(id) = crate::xos_module::tensor_rust_id(tensor, vm) {
+        crate::tensor_buf::write_tensor_data_by_id(id, &flat);
+    } else if let Some(dict) = tensor.downcast_ref::<rustpython_vm::builtins::PyDict>() {
+        let bytes: Vec<u8> = flat.iter().map(|v| v.clamp(0.0, 255.0) as u8).collect();
+        dict.set_item(
+            "_data",
+            rustpython_vm::builtins::PyByteArray::new_ref(bytes, &vm.ctx).into(),
+            vm,
+        )?;
+    } else {
+        return Err(vm.new_type_error("fill_rectangles: expected a tensor".to_string()));
+    }
+
+    Ok(vm.ctx.none())
+}
+
 /// xos.rasterizer.rectangles() - draw rectangle outlines from normalized boxes
 ///
 /// Usage: xos.rasterizer.rectangles(frame, boxes, color, thickness=1.0)
@@ -1802,6 +1931,13 @@ pub fn make_rasterizer_module(vm: &VirtualMachine) -> PyRef<PyModule> {
         .set_attr(
             "rects_filled",
             vm.new_function("rects_filled", rects_filled),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr(
+            "fill_rectangles",
+            vm.new_function("fill_rectangles", fill_rectangles),
             vm,
         )
         .unwrap();

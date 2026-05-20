@@ -454,6 +454,119 @@ pub fn run_python_file(file_path: &PathBuf, script_flags: &[String]) {
     }
 }
 
+fn collect_test_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_test_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("py") {
+            out.push(path);
+        }
+    }
+}
+
+/// Discover `src/tests/**/*.py`, register `@xos.test` functions, run them. Returns process exit code.
+pub fn run_test_suite(tests_dir: &std::path::Path) -> i32 {
+    let mut files = Vec::new();
+    collect_test_files(tests_dir, &mut files);
+    files.sort();
+
+    if files.is_empty() {
+        eprintln!("no tests found under {}", tests_dir.display());
+        return 1;
+    }
+
+    let interpreter = Interpreter::with_init(Default::default(), |vm| {
+        vm.add_native_module(
+            "xos".to_owned(),
+            Box::new(crate::xos_module::make_module),
+        );
+    });
+
+    interpreter.enter(|vm| {
+        let scope = vm.new_scope_with_builtins();
+        let _ = scope
+            .globals
+            .set_item("__name__", vm.ctx.new_str("__main__").into(), vm);
+        let setup = "import xos";
+        if let Err(e) = vm.run_code_string(scope.clone(), setup, "<test-setup>".to_string()) {
+            eprintln!(
+                "test setup failed:\n{}",
+                format_python_exception(vm, &e)
+            );
+            return 1;
+        }
+
+        let mut load_failures = 0usize;
+        for path in &files {
+            let code = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("failed to read {}: {e}", path.display());
+                    load_failures += 1;
+                    continue;
+                }
+            };
+            let label = path.to_string_lossy().to_string();
+            if let Err(e) = vm.run_code_string(scope.clone(), &code, label) {
+                eprintln!(
+                    "failed to load {}:\n{}",
+                    path.display(),
+                    format_python_exception(vm, &e)
+                );
+                load_failures += 1;
+                continue;
+            }
+            if let Err(e) = vm.run_code_string(
+                scope.clone(),
+                "xos._register_module_tests(globals())",
+                "<register-tests>".to_string(),
+            ) {
+                eprintln!(
+                    "failed to register tests from {}:\n{}",
+                    path.display(),
+                    format_python_exception(vm, &e)
+                );
+                load_failures += 1;
+            }
+        }
+
+        let xos_obj = match scope.globals.get_item("xos", vm) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("xos module missing: {}", format_python_exception(vm, &e));
+                return 1;
+            }
+        };
+        let run_all = match vm.get_attribute_opt(xos_obj, "_run_all") {
+            Ok(Some(f)) => f,
+            Ok(None) | Err(_) => {
+                eprintln!("xos._run_all missing");
+                return 1;
+            }
+        };
+        let result = match run_all.call((), vm) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "test run failed:\n{}",
+                    format_python_exception(vm, &e)
+                );
+                return 1;
+            }
+        };
+        let ok = result.try_into_value::<bool>(vm).unwrap_or(false);
+        if load_failures > 0 || !ok {
+            1
+        } else {
+            0
+        }
+    })
+}
+
 /// Run an interactive Python console (`xpy` / `xos py` with no script).
 pub fn run_python_interactive() {
     let interpreter = Interpreter::with_init(Default::default(), |vm| {
