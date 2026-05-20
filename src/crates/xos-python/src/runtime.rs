@@ -491,7 +491,7 @@ pub fn run_test_suite(tests_dir: &std::path::Path) -> i32 {
         let _ = scope
             .globals
             .set_item("__name__", vm.ctx.new_str("__main__").into(), vm);
-        let setup = "import xos";
+        let setup = "import xos\nxos._clear_registry()";
         if let Err(e) = vm.run_code_string(scope.clone(), setup, "<test-setup>".to_string()) {
             eprintln!(
                 "test setup failed:\n{}",
@@ -500,9 +500,17 @@ pub fn run_test_suite(tests_dir: &std::path::Path) -> i32 {
             return 1;
         }
 
+        let xos_obj = match scope.globals.get_item("xos", vm) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("xos module missing: {}", format_python_exception(vm, &e));
+                return 1;
+            }
+        };
+
         let mut load_failures = 0usize;
         for path in &files {
-            let code = match fs::read_to_string(path) {
+            let code = match read_python_source(path) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("failed to read {}: {e}", path.display());
@@ -510,8 +518,26 @@ pub fn run_test_suite(tests_dir: &std::path::Path) -> i32 {
                     continue;
                 }
             };
-            let label = path.to_string_lossy().to_string();
-            if let Err(e) = vm.run_code_string(scope.clone(), &code, label) {
+            let label = path
+                .canonicalize()
+                .unwrap_or_else(|_| path.clone())
+                .to_string_lossy()
+                .to_string();
+
+            let file_scope = vm.new_scope_with_builtins();
+            let _ = file_scope
+                .globals
+                .set_item("xos", xos_obj.clone(), vm);
+            let _ = file_scope.globals.set_item(
+                "__file__",
+                vm.ctx.new_str(label.as_str()).into(),
+                vm,
+            );
+            let _ = file_scope
+                .globals
+                .set_item("__name__", vm.ctx.new_str("__main__").into(), vm);
+
+            if let Err(e) = vm.run_code_string(file_scope.clone(), &code, label.clone()) {
                 eprintln!(
                     "failed to load {}:\n{}",
                     path.display(),
@@ -521,7 +547,7 @@ pub fn run_test_suite(tests_dir: &std::path::Path) -> i32 {
                 continue;
             }
             if let Err(e) = vm.run_code_string(
-                scope.clone(),
+                file_scope,
                 "xos._register_module_tests(globals())",
                 "<register-tests>".to_string(),
             ) {
@@ -534,13 +560,6 @@ pub fn run_test_suite(tests_dir: &std::path::Path) -> i32 {
             }
         }
 
-        let xos_obj = match scope.globals.get_item("xos", vm) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("xos module missing: {}", format_python_exception(vm, &e));
-                return 1;
-            }
-        };
         let run_all = match vm.get_attribute_opt(xos_obj, "_run_all") {
             Ok(Some(f)) => f,
             Ok(None) | Err(_) => {

@@ -265,6 +265,10 @@ pub fn tensor_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             for item in list.borrow_vec().iter() {
                 flatten_list(item, flat, vm)?;
             }
+        } else if let Some(tup) = obj.downcast_ref::<rustpython_vm::builtins::PyTuple>() {
+            for item in tup.as_slice().iter() {
+                flatten_list(item, flat, vm)?;
+            }
         } else {
             flat.push(py_number_to_f64(obj, vm)? as f32);
         }

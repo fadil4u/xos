@@ -23,7 +23,13 @@ pub fn install_testing(vm: &VirtualMachine, module: PyRef<PyModule>) {
         );
         return;
     }
-    for name in ["test", "parametrize", "_register_module_tests", "_run_all"] {
+    for name in [
+        "test",
+        "parametrize",
+        "_clear_registry",
+        "_register_module_tests",
+        "_run_all",
+    ] {
         if let Ok(obj) = scope.globals.get_item(name, vm) {
             let _ = module.set_attr(name, obj, vm);
         }

@@ -35,7 +35,12 @@ def _collect_cases(fn):
     return [(fn.__name__, {}, fn)]
 
 
+def _clear_registry():
+    _REGISTRY[:] = []
+
+
 def _register_module_tests(namespace):
+    """Register @xos.test callables from the current module namespace."""
     for _key, obj in namespace.items():
         if callable(obj) and getattr(obj, "_xos_is_test", False):
             for test_id, kwargs, fn in _collect_cases(obj):
@@ -62,6 +67,10 @@ def _run_all():
     passed = 0
     failed = 0
     errors = []
+
+    if not _REGISTRY:
+        xos.print_color("&cNo tests collected&r (check @xos.test and src/tests/**/*.py)")
+        return False
 
     for test_id, kwargs, fn in list(_REGISTRY):
         label = test_id

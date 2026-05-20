@@ -1,5 +1,9 @@
 import xos
 
+@xos.test
+def blank_test():
+    # just a blank passing test. a freebie!
+    pass
 
 @xos.test
 @xos.parametrize("dtype", [xos.uint8, xos.float32])
