@@ -18,7 +18,6 @@ use winit::{
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{Key, NamedKey},
-    platform::pump_events::EventLoopExtPumpEvents,
     window::{CursorIcon, Window, WindowAttributes, WindowId},
 };
 

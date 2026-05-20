@@ -11,7 +11,7 @@ use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use rustpython_vm::builtins::{PyByteArray, PyBytes, PyDict};
 use rustpython_vm::function::FuncArgs;
-use rustpython_vm::{PyObjectRef, PyResult, VirtualMachine};
+use rustpython_vm::{PyObjectRef, PyRef, PyResult, VirtualMachine};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
@@ -47,7 +47,7 @@ fn resolve_tensor_dict(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<rustp
     Err(vm.new_type_error("expected a Tensor".to_string()))
 }
 
-fn device_label_from_dict(dict: &PyDict, vm: &VirtualMachine) -> String {
+fn device_label_from_dict(dict: PyRef<PyDict>, vm: &VirtualMachine) -> String {
     dict.get_item("device", vm)
         .ok()
         .and_then(|o| o.str(vm).ok())
@@ -89,7 +89,7 @@ fn payload_from_tensor(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<PackP
     let dict = resolve_tensor_dict(obj, vm)?;
     let shape = tensor_shape_tuple(obj, vm)?;
     let dtype = tensor_dtype_from_ref(obj, vm)?;
-    let device = device_label_from_dict(&dict, vm);
+    let device = device_label_from_dict(dict, vm);
     let flat = tensor_flat_data_list(obj, vm)?;
     let data: Vec<f64> = flat.iter().map(|&v| v as f64).collect();
     Ok(PackPayload {

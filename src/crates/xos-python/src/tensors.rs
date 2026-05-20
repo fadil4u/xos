@@ -338,7 +338,7 @@ fn dtype_from_args(args: &FuncArgs, args_vec: &[PyObjectRef], vm: &VirtualMachin
     Ok(DType::Float32)
 }
 
-fn tensor_dtype_from_ref(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<DType> {
+pub(crate) fn tensor_dtype_from_ref(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<DType> {
     let mut cur = obj.clone();
     for _ in 0..8 {
         if let Some(dict) = cur.downcast_ref::<rustpython_vm::builtins::PyDict>() {

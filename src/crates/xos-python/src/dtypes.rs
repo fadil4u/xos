@@ -210,8 +210,8 @@ pub fn make_dtypes_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     };
 
     let attach_bounds = |dt: &rustpython_vm::PyObjectRef, dtype: DType| {
-        let _ = dt.set_attr("MIN", vm.ctx.new_float(dtype.min_f64()).into(), vm);
-        let _ = dt.set_attr("MAX", vm.ctx.new_float(dtype.max_f64()).into(), vm);
+        let _ = dt.set_attr("MIN", vm.ctx.new_float(dtype.min_f64()), vm);
+        let _ = dt.set_attr("MAX", vm.ctx.new_float(dtype.max_f64()), vm);
     };
 
     // Helper to create dtype instances
