@@ -89,6 +89,15 @@ fn tensor_min_max_mean_triplet(obj: PyObjectRef, vm: &VirtualMachine) -> PyResul
         });
     }
 
+    if let Some(ba) = storage.downcast_ref::<PyByteArray>() {
+        let b = ba.borrow_buf();
+        return u8_slice_min_max_mean(&b).ok_or_else(|| {
+            vm.new_value_error(
+                "zero-size array to reduction operation which has no identity".to_string(),
+            )
+        });
+    }
+
     if let Some(lst) = storage.downcast_ref::<PyList>() {
         return pylist_min_max_mean(lst, vm)?.ok_or_else(|| {
             vm.new_value_error(
@@ -98,7 +107,7 @@ fn tensor_min_max_mean_triplet(obj: PyObjectRef, vm: &VirtualMachine) -> PyResul
     }
 
     Err(vm.new_type_error(
-        "Tensor reduction: expected flat _data as bytes or list".to_string(),
+        "Tensor reduction: expected flat _data as bytes, bytearray, or list".to_string(),
     ))
 }
 
@@ -577,7 +586,6 @@ fn write_flat_to_tensor(
 ) -> PyResult<()> {
     if let Some(id) = crate::xos_module::tensor_rust_id(tensor, vm) {
         crate::tensor_buf::write_tensor_data_by_id(id, flat);
-        return Ok(());
     }
     let dict = resolve_tensor_dict(tensor, vm)?;
     if dtype == DType::UInt8 {

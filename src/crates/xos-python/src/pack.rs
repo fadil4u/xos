@@ -182,7 +182,7 @@ pub fn tensor_from_pack_string(s: &str, vm: &VirtualMachine) -> PyResult<PyObjec
         )));
     }
 
-    if dtype == DType::UInt8 {
+    let dict = if dtype == DType::UInt8 {
         let bytes: Vec<u8> = flat.iter().map(|&v| v.clamp(0.0, 255.0) as u8).collect();
         let dict = vm.ctx.new_dict();
         dict.set_item(
@@ -205,14 +205,12 @@ pub fn tensor_from_pack_string(s: &str, vm: &VirtualMachine) -> PyResult<PyObjec
             PyByteArray::new_ref(bytes, &vm.ctx).into(),
             vm,
         )?;
-        return wrap_tensor_dict(dict.into(), vm);
-    }
-
-    let py_tensor = create_tensor_from_data(flat, payload.shape, dtype);
-    wrap_tensor_dict(
-        py_tensor.to_py_dict_on(vm, dtype, &payload.device)?,
-        vm,
-    )
+        dict.into()
+    } else {
+        let py_tensor = create_tensor_from_data(flat, payload.shape, dtype);
+        py_tensor.to_py_dict_on(vm, dtype, &payload.device)?
+    };
+    wrap_tensor_dict(dict, vm)
 }
 
 /// ``xos._tensor_printpack(tensor, compress=False)`` → single-line pack string.
