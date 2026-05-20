@@ -3,7 +3,7 @@ import xos
 
 class GameOfLife(xos.Application):
     headless: bool = False
-    device: None | str = None  # auto
+    device: None | str = "gpu"  # None is auto
 
     def __init__(self):
         super().__init__()
@@ -13,7 +13,7 @@ class GameOfLife(xos.Application):
             [[1, 1, 1],
              [1, 0, 1],
              [1, 1, 1]],
-            device="gpu",
+            device=self.device,
             dtype=xos.uint8
         )
 
@@ -22,10 +22,9 @@ class GameOfLife(xos.Application):
 
     def randomize_state(self):
         h, w, _ = self.frame.tensor.shape
-        device = self.frame.tensor.device
 
         # allocate resolution-matching simulation buffers (0/1)
-        self.state = xos.zeros((h, w), dtype=xos.uint8, device=device)
+        self.state = xos.zeros((h, w), dtype=xos.uint8, device=self.device)
         self.next_state = xos.zeros_like(self.state)
 
         xos.random.uniform_fill(self.state, 0.0, 1.0)
