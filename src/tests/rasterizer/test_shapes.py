@@ -8,7 +8,7 @@ def blank_test():
 @xos.test
 @xos.parametrize("dtype", [xos.uint8, xos.float32])
 def test_squares(dtype):
-    tensor = xos.zeros((250, 1000, 3), dtype=dtype)
+    tensor = xos.zeros((180, 180, 3), dtype=dtype)
 
     rects = xos.tensor([
         [10, 10, 20, 20],
@@ -30,7 +30,6 @@ def test_squares(dtype):
 
     # this should be the api for rendering the frame to the screen
     viewport = xos.render(tensor)
-    # print(tensor.to_string(full=True))
     viewport.pause()
     # viewport = xos.render(tensor)
     # viewport.pause()
