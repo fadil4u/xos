@@ -42,9 +42,23 @@ def _register_module_tests(namespace):
                 _REGISTRY.append((test_id, kwargs, fn))
 
 
-def _run_all():
-    import traceback
+def _format_failure(exc):
+    """Format an exception without importing stdlib (traceback/sys not available)."""
+    lines = ["{}: {}".format(type(exc).__name__, exc)]
+    tb = exc.__traceback__
+    while tb is not None:
+        frame = tb.tb_frame
+        code = frame.f_code
+        lines.append(
+            '  File "{}", line {}, in {}'.format(
+                code.co_filename, tb.tb_lineno, code.co_name
+            )
+        )
+        tb = tb.tb_next
+    return "\n".join(lines)
 
+
+def _run_all():
     passed = 0
     failed = 0
     errors = []
@@ -63,12 +77,12 @@ def _run_all():
                 fn()
             passed += 1
             xos.print_color("  &a✓ passed&r")
-        except Exception:
+        except Exception as e:
             failed += 1
-            tb = traceback.format_exc()
-            errors.append((label, tb))
+            report = _format_failure(e)
+            errors.append((label, report))
             xos.print_color("  &c✗ failed&r")
-            for line in tb.strip().split("\n"):
+            for line in report.split("\n"):
                 xos.print_color("  &8{}&r".format(line))
 
     xos.print("")
