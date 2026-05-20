@@ -34,6 +34,25 @@ def test_squares(dtype):
     # viewport = xos.render(tensor)
     # viewport.pause()
 
+    tensor.printpack()
+
     # viewport.render(tensor)  # this could also be called for subsequent updates to this frame, especially with pause=False for a live loop animation  TODO: testing for that
 
     # TODO: hard-code what the raster should look like after verifying
+
+
+@xos.test
+@xos.parametrize("compress", [True, False])
+def test_printpack(compress):
+    # print packing is a good way for us to generate and maintain test cases super easily.
+    tensor = xos.zeros((180, 180, 3), dtype=xos.uint8)
+    packed_str = tensor.printpack(compress=compress)
+    assert type(packed_str) == str
+    print(packed_str)
+
+    # make sure that we can unpack it into the original tensor. it should automatically recognize when its compressed or not as well.
+    tensor2 = xos.tensor(packed_str)
+
+    # it should be capable of knowing that its a printpacked string, and just automatically unpack and initialize the tensor from it.
+    # that includes dtype, shape, data, and device. this will also be used in jsonification as well.
+    assert xos.all(tensor == tensor2)
