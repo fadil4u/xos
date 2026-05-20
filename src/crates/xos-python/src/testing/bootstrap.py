@@ -47,15 +47,81 @@ def _register_module_tests(namespace):
                 _REGISTRY.append((test_id, kwargs, fn))
 
 
+def _read_source_line(path, lineno):
+    if not path or path.startswith("<"):
+        return None
+    try:
+        f = open(path, "r")
+        try:
+            for i, line in enumerate(f, 1):
+                if i == lineno:
+                    return line.rstrip("\n\r")
+                if i > lineno:
+                    break
+        finally:
+            f.close()
+    except Exception:
+        return None
+    return None
+
+
+def _short_path(path):
+    if "/" in path:
+        return path.split("/")[-1]
+    if "\\" in path:
+        return path.split("\\")[-1]
+    return path
+
+
+def _is_test_source_path(path):
+    norm = path.replace("\\", "/")
+    if not path or path.startswith("<"):
+        return False
+    return "/tests/" in norm
+
+
+def _failure_site(exc):
+    """Innermost traceback frame in a user test file (not bootstrap/stdlib)."""
+    tb = exc.__traceback__
+    site = None
+    while tb is not None:
+        frame = tb.tb_frame
+        path = frame.f_code.co_filename
+        if _is_test_source_path(path):
+            site = (path, tb.tb_lineno, frame.f_code.co_name)
+        tb = tb.tb_next
+    return site
+
+
 def _format_failure(exc):
     """Format an exception without importing stdlib (traceback/sys not available)."""
-    lines = ["{}: {}".format(type(exc).__name__, exc)]
+    name = type(exc).__name__
+    msg = str(exc)
+    if not msg and getattr(exc, "args", ()):
+        parts = [repr(a) for a in exc.args if a is not None]
+        if parts:
+            msg = ", ".join(parts)
+    lines = []
+    site = _failure_site(exc)
+    if site:
+        path, lineno, func = site
+        src = _read_source_line(path, lineno)
+        lines.append("{} at {}:{} in {}".format(name, _short_path(path), lineno, func))
+        if src:
+            lines.append("  > {}".format(src))
+        elif msg:
+            lines.append("  {}".format(msg))
+    else:
+        if name == "AssertionError" and not msg:
+            msg = "condition was false (use assert cond, \"message\" for details)"
+        lines.append("{}: {}".format(name, msg))
     tb = exc.__traceback__
+    lines.append("  traceback:")
     while tb is not None:
         frame = tb.tb_frame
         code = frame.f_code
         lines.append(
-            '  File "{}", line {}, in {}'.format(
+            '    File "{}", line {}, in {}'.format(
                 code.co_filename, tb.tb_lineno, code.co_name
             )
         )
@@ -92,7 +158,14 @@ def _run_all():
             errors.append((label, report))
             xos.print_color("  &c✗ failed&r")
             for line in report.split("\n"):
-                xos.print_color("  &8{}&r".format(line))
+                if line.startswith("  > "):
+                    xos.print_color("  &c{}&r".format(line))
+                elif line.startswith("AssertionError at ") or line.startswith(
+                    "AssertionError:"
+                ):
+                    xos.print_color("  &c{}&r".format(line))
+                else:
+                    xos.print_color("  &8{}&r".format(line))
 
     xos.print("")
     if failed == 0:

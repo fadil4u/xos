@@ -2,7 +2,7 @@
 
 use crate::dtypes::DType;
 use crate::tensor_buf::{
-    create_tensor_from_data, tensor_flat_data_list, tensor_shape_tuple,
+    create_tensor_from_data, tensor_flat_bytes, tensor_flat_data_list, tensor_shape_tuple,
 };
 use crate::tensors::{tensor_dtype_from_ref, wrap_tensor_dict};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -13,6 +13,7 @@ use rustpython_vm::builtins::{PyByteArray, PyBytes, PyDict};
 use rustpython_vm::function::FuncArgs;
 use rustpython_vm::{PyObjectRef, PyRef, PyResult, VirtualMachine};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::io::{Read, Write};
 
 pub const PACK_PREFIX: &str = "xos.pack:";
@@ -24,7 +25,8 @@ struct PackPayload {
     shape: Vec<usize>,
     dtype: String,
     device: String,
-    data: Vec<f64>,
+    /// Per-element values (JSON integers for integral dtypes, floats for float dtypes).
+    data: Vec<Value>,
 }
 
 fn resolve_tensor_dict(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<rustpython_vm::PyRef<PyDict>> {
@@ -85,13 +87,49 @@ pub fn decompress_bytes(encoded: &str) -> Result<Vec<u8>, String> {
     inflate_bytes(&compressed)
 }
 
+fn pack_data_values(obj: &PyObjectRef, dtype: DType, vm: &VirtualMachine) -> PyResult<Vec<Value>> {
+    if dtype == DType::UInt8 {
+        let bytes = tensor_flat_bytes(obj, vm)?;
+        return Ok(bytes.into_iter().map(|b| Value::from(b as u64)).collect());
+    }
+    let flat = tensor_flat_data_list(obj, vm)?;
+    if dtype.is_float() {
+        Ok(flat.into_iter().map(|v| Value::from(v as f64)).collect())
+    } else {
+        Ok(flat
+            .into_iter()
+            .map(|v| Value::from(dtype.cast_from_f32(v) as i64))
+            .collect())
+    }
+}
+
+fn unpack_flat_from_values(values: &[Value], dtype: DType) -> Result<Vec<f32>, String> {
+    values
+        .iter()
+        .map(|v| {
+            if dtype.is_float() {
+                v.as_f64()
+                    .ok_or_else(|| format!("expected float in pack data, got {v}"))
+                    .map(|n| dtype.cast_from_f32(n as f32))
+            } else if let Some(n) = v.as_u64() {
+                Ok(dtype.cast_from_f32(n as f32))
+            } else if let Some(n) = v.as_i64() {
+                Ok(dtype.cast_from_f32(n as f32))
+            } else if let Some(n) = v.as_f64() {
+                Ok(dtype.cast_from_f32(n as f32))
+            } else {
+                Err(format!("invalid pack data element: {v}"))
+            }
+        })
+        .collect()
+}
+
 fn payload_from_tensor(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<PackPayload> {
     let dict = resolve_tensor_dict(obj, vm)?;
     let shape = tensor_shape_tuple(obj, vm)?;
     let dtype = tensor_dtype_from_ref(obj, vm)?;
     let device = device_label_from_dict(dict, vm);
-    let flat = tensor_flat_data_list(obj, vm)?;
-    let data: Vec<f64> = flat.iter().map(|&v| v as f64).collect();
+    let data = pack_data_values(obj, dtype, vm)?;
     Ok(PackPayload {
         shape,
         dtype: dtype.name().to_string(),
@@ -133,11 +171,8 @@ pub fn tensor_from_pack_string(s: &str, vm: &VirtualMachine) -> PyResult<PyObjec
     let payload = decode_pack_string(s).map_err(|e| vm.new_value_error(e))?;
     let dtype = DType::from_str(&payload.dtype)
         .ok_or_else(|| vm.new_value_error(format!("unknown dtype: {}", payload.dtype)))?;
-    let flat: Vec<f32> = payload
-        .data
-        .iter()
-        .map(|&v| dtype.cast_from_f32(v as f32))
-        .collect();
+    let flat = unpack_flat_from_values(&payload.data, dtype)
+        .map_err(|e| vm.new_value_error(e))?;
     let expected: usize = payload.shape.iter().product();
     if expected > 0 && flat.len() != expected {
         return Err(vm.new_value_error(format!(
@@ -146,6 +181,33 @@ pub fn tensor_from_pack_string(s: &str, vm: &VirtualMachine) -> PyResult<PyObjec
             expected
         )));
     }
+
+    if dtype == DType::UInt8 {
+        let bytes: Vec<u8> = flat.iter().map(|&v| v.clamp(0.0, 255.0) as u8).collect();
+        let dict = vm.ctx.new_dict();
+        dict.set_item(
+            "shape",
+            vm.ctx
+                .new_tuple(
+                    payload
+                        .shape
+                        .iter()
+                        .map(|&s| vm.ctx.new_int(s as i64).into())
+                        .collect(),
+                )
+                .into(),
+            vm,
+        )?;
+        dict.set_item("dtype", vm.ctx.new_str(dtype.name()).into(), vm)?;
+        dict.set_item("device", vm.ctx.new_str(payload.device.as_str()).into(), vm)?;
+        dict.set_item(
+            "_data",
+            PyByteArray::new_ref(bytes, &vm.ctx).into(),
+            vm,
+        )?;
+        return wrap_tensor_dict(dict.into(), vm);
+    }
+
     let py_tensor = create_tensor_from_data(flat, payload.shape, dtype);
     wrap_tensor_dict(
         py_tensor.to_py_dict_on(vm, dtype, &payload.device)?,
