@@ -4,7 +4,7 @@ import xos
 @xos.test
 @xos.parametrize("dtype", [xos.uint8, xos.float32])
 def test_squares(dtype):
-    frame = xos.zeros((100, 100, 3), dtype=dtype)
+    tensor = xos.zeros((100, 100, 3), dtype=dtype)
 
     rects = xos.tensor([
         [0, 0, 100, 100],
@@ -18,14 +18,16 @@ def test_squares(dtype):
         [150, 150, 160, 160],
     ])
 
-    # TODO: test all configuration of squeeze shapes and whatnot
+    # TODO: test all configuration of squeeze shapes/tuple initializations and whatnot
     colors = xos.tensor([
-        (255, 0, 0),
+        (255, 0, 0),  # same color for them all
     ])
 
-    xos.rasterizer.fill_rectangles(frame, rects, colors)
+    xos.rasterizer.fill_rectangles(tensor, rects, colors)
 
     # this should be the api for rendering the frame to the screen
-    xos.render(frame)
+    viewport = xos.render(tensor, pause=True)
+
+    # viewport.render(tensor)  # this could also be called for subsequent updates to this frame, especially with pause=False for a live loop animation  TODO: testing for that
 
     # TODO: hard-code what the raster should look like after verifying
