@@ -20,6 +20,7 @@ pub mod mesh;
 pub mod mouse;
 pub mod nn;
 pub mod ops;
+pub mod pack;
 pub mod path;
 pub mod render;
 pub mod testing;

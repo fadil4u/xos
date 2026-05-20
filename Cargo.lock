@@ -11266,6 +11266,7 @@ dependencies = [
  "csv",
  "ct2rs",
  "dialoguer",
+ "flate2",
  "fontdue",
  "image 0.25.10",
  "include_dir",

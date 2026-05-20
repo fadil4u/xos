@@ -1761,6 +1761,37 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
             vm,
         )
         .unwrap();
+    module
+        .set_attr(
+            "_tensor_printpack",
+            vm.new_function("_tensor_printpack", crate::pack::tensor_printpack),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr(
+            "_tensor_randomize",
+            vm.new_function("_tensor_randomize", crate::tensors::tensor_randomize),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr("all", vm.new_function("all", crate::pack::all_fn), vm)
+        .unwrap();
+    module
+        .set_attr(
+            "compress",
+            vm.new_function("compress", crate::pack::compress_fn),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr(
+            "decompress",
+            vm.new_function("decompress", crate::pack::decompress_fn),
+            vm,
+        )
+        .unwrap();
 
     crate::burn_train::register_burn_module(&module, vm);
 

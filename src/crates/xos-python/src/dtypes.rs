@@ -58,6 +58,42 @@ impl DType {
         matches!(self, DType::Float16 | DType::Float32 | DType::Float64)
     }
 
+    /// Inclusive minimum value for this dtype (for randomize / finfo-style bounds).
+    pub fn min_f64(&self) -> f64 {
+        match self {
+            DType::Float16 => -65504.0,
+            DType::Float32 => f64::from(f32::MIN),
+            DType::Float64 => f64::MIN,
+            DType::Int8 => i8::MIN as f64,
+            DType::Int16 => i16::MIN as f64,
+            DType::Int32 => i32::MIN as f64,
+            DType::Int64 => i64::MIN as f64,
+            DType::UInt8 => 0.0,
+            DType::UInt16 => 0.0,
+            DType::UInt32 => 0.0,
+            DType::UInt64 => 0.0,
+            DType::Bool => 0.0,
+        }
+    }
+
+    /// Inclusive maximum value for this dtype.
+    pub fn max_f64(&self) -> f64 {
+        match self {
+            DType::Float16 => 65504.0,
+            DType::Float32 => f64::from(f32::MAX),
+            DType::Float64 => f64::MAX,
+            DType::Int8 => i8::MAX as f64,
+            DType::Int16 => i16::MAX as f64,
+            DType::Int32 => i32::MAX as f64,
+            DType::Int64 => i64::MAX as f64,
+            DType::UInt8 => u8::MAX as f64,
+            DType::UInt16 => u16::MAX as f64,
+            DType::UInt32 => u32::MAX as f64,
+            DType::UInt64 => u64::MAX as f64,
+            DType::Bool => 1.0,
+        }
+    }
+
     /// Check if this is an integer type
     pub fn is_int(&self) -> bool {
         matches!(
@@ -173,52 +209,59 @@ pub fn make_dtypes_module(vm: &VirtualMachine) -> PyRef<PyModule> {
         Err(_) => return module,
     };
 
+    let attach_bounds = |dt: &rustpython_vm::PyObjectRef, dtype: DType| {
+        let _ = dt.set_attr("MIN", vm.ctx.new_float(dtype.min_f64()).into(), vm);
+        let _ = dt.set_attr("MAX", vm.ctx.new_float(dtype.max_f64()).into(), vm);
+    };
+
     // Helper to create dtype instances
-    let create_dtype = |name: &str| -> Option<rustpython_vm::PyObjectRef> {
+    let create_dtype = |name: &str, dtype: DType| -> Option<rustpython_vm::PyObjectRef> {
         let name_str: rustpython_vm::PyObjectRef = vm.ctx.new_str(name).into();
-        dtype_class.call((name_str,), vm).ok()
+        let dt = dtype_class.call((name_str,), vm).ok()?;
+        attach_bounds(&dt, dtype);
+        Some(dt)
     };
 
     // Create all dtype constants
-    if let Some(dt) = create_dtype("float16") {
+    if let Some(dt) = create_dtype("float16", DType::Float16) {
         let _ = module.set_attr("float16", dt, vm);
     }
-    if let Some(dt) = create_dtype("float32") {
+    if let Some(dt) = create_dtype("float32", DType::Float32) {
         let _ = module.set_attr("float32", dt.clone(), vm);
         let _ = module.set_attr("float", dt, vm); // Alias
     }
-    if let Some(dt) = create_dtype("float64") {
+    if let Some(dt) = create_dtype("float64", DType::Float64) {
         let _ = module.set_attr("float64", dt, vm);
     }
 
-    if let Some(dt) = create_dtype("int8") {
+    if let Some(dt) = create_dtype("int8", DType::Int8) {
         let _ = module.set_attr("int8", dt, vm);
     }
-    if let Some(dt) = create_dtype("int16") {
+    if let Some(dt) = create_dtype("int16", DType::Int16) {
         let _ = module.set_attr("int16", dt, vm);
     }
-    if let Some(dt) = create_dtype("int32") {
+    if let Some(dt) = create_dtype("int32", DType::Int32) {
         let _ = module.set_attr("int32", dt.clone(), vm);
         let _ = module.set_attr("int", dt, vm); // Alias
     }
-    if let Some(dt) = create_dtype("int64") {
+    if let Some(dt) = create_dtype("int64", DType::Int64) {
         let _ = module.set_attr("int64", dt, vm);
     }
 
-    if let Some(dt) = create_dtype("uint8") {
+    if let Some(dt) = create_dtype("uint8", DType::UInt8) {
         let _ = module.set_attr("uint8", dt, vm);
     }
-    if let Some(dt) = create_dtype("uint16") {
+    if let Some(dt) = create_dtype("uint16", DType::UInt16) {
         let _ = module.set_attr("uint16", dt, vm);
     }
-    if let Some(dt) = create_dtype("uint32") {
+    if let Some(dt) = create_dtype("uint32", DType::UInt32) {
         let _ = module.set_attr("uint32", dt, vm);
     }
-    if let Some(dt) = create_dtype("uint64") {
+    if let Some(dt) = create_dtype("uint64", DType::UInt64) {
         let _ = module.set_attr("uint64", dt, vm);
     }
 
-    if let Some(dt) = create_dtype("bool") {
+    if let Some(dt) = create_dtype("bool", DType::Bool) {
         let _ = module.set_attr("bool", dt, vm);
     }
 

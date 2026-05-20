@@ -45,7 +45,7 @@ def test_squares(dtype):
 @xos.parametrize("compress", [True, False])
 def test_printpack(compress):
     # print packing is a good way for us to generate and maintain test cases super easily.
-    tensor = xos.zeros((180, 180, 3), dtype=xos.uint8)
+    tensor = xos.zeros((180, 180, 3), dtype=xos.uint8).randomize()  # .randomize() will automatically randomize the tensor according to the max and min values of the dtype.
     packed_str = tensor.printpack(compress=compress)
     assert type(packed_str) == str
     print(packed_str)
@@ -56,3 +56,8 @@ def test_printpack(compress):
     # it should be capable of knowing that its a printpacked string, and just automatically unpack and initialize the tensor from it.
     # that includes dtype, shape, data, and device. this will also be used in jsonification as well.
     assert xos.all(tensor == tensor2)
+
+    if compress:
+        # check that len is less than non-compressed
+        non_compressed_len = len(tensor.printpack(compress=False))
+        assert len(packed_str) < non_compressed_len

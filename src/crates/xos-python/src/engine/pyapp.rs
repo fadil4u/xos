@@ -907,6 +907,20 @@ class Tensor:
     def device(self):
         return self._data.get('device', 'cpu')
 
+    def printpack(self, compress=False):
+        """Serialize tensor to a single-line pack string (optionally deflate-compressed)."""
+        import xos
+        self._ensure_flat()
+        packed = xos._tensor_printpack(self, compress=compress)
+        xos.print(packed)
+        return packed
+
+    def randomize(self):
+        """Fill all elements with random values between this tensor's dtype MIN and MAX."""
+        import xos
+        xos._tensor_randomize(self)
+        return self
+
     _DEVICE_NAMES = frozenset({"cpu", "gpu", "wasm"})
     _DEVICE_ALIASES = {
         "cuda": "gpu",

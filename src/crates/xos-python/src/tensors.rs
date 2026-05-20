@@ -4,7 +4,7 @@ use crate::dtypes::DType;
 pub use crate::tensor_buf::{
     create_tensor_from_data, py_number_to_f64, tensor_flat_data_list, tensor_shape_tuple, Tensor,
 };
-use rustpython_vm::builtins::{PyBytes, PyDict, PyList, PyModule};
+use rustpython_vm::builtins::{PyByteArray, PyBytes, PyDict, PyList, PyModule};
 use rustpython_vm::{function::FuncArgs, PyObjectRef, PyRef, PyResult, VirtualMachine};
 
 /// One pass over uint8 RGBA / tensor bytes—min, max, arithmetic mean (as f64).
@@ -170,7 +170,7 @@ pub fn tensor_mean(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     Ok(vm.ctx.new_float(av).into())
 }
 
-fn wrap_tensor_dict(dict: rustpython_vm::PyObjectRef, vm: &VirtualMachine) -> PyResult {
+pub(crate) fn wrap_tensor_dict(dict: rustpython_vm::PyObjectRef, vm: &VirtualMachine) -> PyResult {
     if let Ok(wrapper_class) = vm.builtins.get_attr("Tensor", vm) {
         if let Ok(wrapped) = wrapper_class.call((dict.clone(),), vm) {
             return Ok(wrapped);
@@ -243,6 +243,12 @@ pub fn tensor_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         return Err(vm.new_type_error("tensor() requires at least 1 argument".to_string()));
     }
     let data_arg = &args_vec[0];
+    if let Ok(s) = data_arg.str(vm) {
+        let text = s.to_string();
+        if crate::pack::is_pack_string(&text) {
+            return crate::pack::tensor_from_pack_string(&text, vm);
+        }
+    }
     let dtype = if args_vec.len() > 2 && !vm.is_none(&args_vec[2]) {
         DType::from_py_object(&args_vec[2], vm).unwrap_or(DType::Float32)
     } else if let Some(dtype_kwarg) = args.kwargs.get("dtype") {
@@ -501,6 +507,116 @@ pub fn stack_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let dtype = DType::Float32;
     let py_tensor = create_tensor_from_data(flat, shape, dtype);
     wrap_tensor_dict(py_tensor.to_py_dict(vm, dtype)?, vm)
+}
+
+fn resolve_tensor_dict(
+    obj: &PyObjectRef,
+    vm: &VirtualMachine,
+) -> PyResult<rustpython_vm::PyRef<PyDict>> {
+    let mut cur = obj.clone();
+    for _ in 0..12 {
+        if let Ok(dict) = cur.clone().downcast::<PyDict>() {
+            if dict.get_item("shape", vm).is_ok()
+                || dict.get_item("_data", vm).is_ok()
+                || dict.get_item("_rust_tensor", vm).is_ok()
+            {
+                return Ok(dict);
+            }
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "_data") {
+            cur = attr;
+            continue;
+        }
+        break;
+    }
+    Err(vm.new_type_error("expected a Tensor".to_string()))
+}
+
+fn random_value_for_dtype(dtype: DType) -> f32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let low = dtype.min_f64();
+        let high = dtype.max_f64();
+        let t = js_sys::Math::random();
+        let v = low + t * (high - low);
+        return dtype.cast_from_f32(v as f32);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        let v = match dtype {
+            DType::Bool => {
+                if rng.random_bool(0.5) {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            DType::Int8 => rng.random_range(i8::MIN..=i8::MAX) as f64,
+            DType::Int16 => rng.random_range(i16::MIN..=i16::MAX) as f64,
+            DType::Int32 => rng.random_range(i32::MIN..=i32::MAX) as f64,
+            DType::Int64 => rng.random_range(i64::MIN..=i64::MAX) as f64,
+            DType::UInt8 => rng.random_range(0u8..=u8::MAX) as f64,
+            DType::UInt16 => rng.random_range(0u16..=u16::MAX) as f64,
+            DType::UInt32 => rng.random_range(0u32..=u32::MAX) as f64,
+            DType::UInt64 => rng.random_range(0u64..=u64::MAX) as f64,
+            DType::Float16 | DType::Float32 | DType::Float64 => {
+                rng.random_range(dtype.min_f64()..=dtype.max_f64())
+            }
+        };
+        dtype.cast_from_f32(v as f32)
+    }
+}
+
+fn write_flat_to_tensor(
+    tensor: &PyObjectRef,
+    flat: &[f32],
+    dtype: DType,
+    vm: &VirtualMachine,
+) -> PyResult<()> {
+    if let Some(id) = crate::xos_module::tensor_rust_id(tensor, vm) {
+        crate::tensor_buf::write_tensor_data_by_id(id, flat);
+        return Ok(());
+    }
+    let dict = resolve_tensor_dict(tensor, vm)?;
+    if dtype == DType::UInt8 {
+        let bytes: Vec<u8> = flat.iter().map(|&v| v.clamp(0.0, 255.0) as u8).collect();
+        dict.set_item(
+            "_data",
+            PyByteArray::new_ref(bytes, &vm.ctx).into(),
+            vm,
+        )?;
+    } else if dtype.is_float() {
+        let py: Vec<PyObjectRef> = flat
+            .iter()
+            .map(|&v| vm.ctx.new_float(v as f64).into())
+            .collect();
+        dict.set_item("_data", vm.ctx.new_list(py).into(), vm)?;
+    } else {
+        let py: Vec<PyObjectRef> = flat
+            .iter()
+            .map(|&v| vm.ctx.new_int(v as i64).into())
+            .collect();
+        dict.set_item("_data", vm.ctx.new_list(py).into(), vm)?;
+    }
+    Ok(())
+}
+
+/// ``xos._tensor_randomize(tensor)`` — fill every element with a random value in [dtype.MIN, dtype.MAX].
+pub fn tensor_randomize(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let tensor = args.args.first().ok_or_else(|| {
+        vm.new_type_error("_tensor_randomize() expects a tensor".to_string())
+    })?;
+    let dtype = tensor_dtype_from_ref(tensor, vm)?;
+    let shape = tensor_shape_tuple(tensor, vm)?;
+    let n: usize = shape.iter().product();
+    if n == 0 {
+        return Ok(vm.ctx.none());
+    }
+    let flat: Vec<f32> = (0..n).map(|_| random_value_for_dtype(dtype)).collect();
+    write_flat_to_tensor(tensor, &flat, dtype, vm)?;
+    Ok(vm.ctx.none())
 }
 
 pub fn register_tensors_functions(module: &PyRef<PyModule>, vm: &VirtualMachine) {
