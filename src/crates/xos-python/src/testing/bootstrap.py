@@ -93,12 +93,37 @@ def _failure_site(exc):
     return site
 
 
+def _assertion_message(exc):
+    args = getattr(exc, "args", ())
+    if not args or args[0] is None:
+        return None
+    try:
+        text = str(args[0])
+    except Exception:
+        text = repr(args[0])
+    if text:
+        return text
+    return None
+
+
 def _format_failure(exc):
     """Format an exception without importing stdlib (traceback/sys not available)."""
     name = type(exc).__name__
     msg = str(exc)
+    assert_msg = None
+    if name == "AssertionError":
+        assert_msg = _assertion_message(exc)
+        if assert_msg and not msg:
+            msg = assert_msg
     if not msg and getattr(exc, "args", ()):
-        parts = [repr(a) for a in exc.args if a is not None]
+        parts = []
+        for a in exc.args:
+            if a is None:
+                continue
+            try:
+                parts.append(str(a))
+            except Exception:
+                parts.append(repr(a))
         if parts:
             msg = ", ".join(parts)
     lines = []
@@ -109,12 +134,16 @@ def _format_failure(exc):
         lines.append("{} at {}:{} in {}".format(name, _short_path(path), lineno, func))
         if src:
             lines.append("  > {}".format(src))
-        elif msg:
+        if assert_msg:
+            lines.append("  assert: {}".format(assert_msg))
+        elif msg and not src:
             lines.append("  {}".format(msg))
     else:
         if name == "AssertionError" and not msg:
             msg = "condition was false (use assert cond, \"message\" for details)"
         lines.append("{}: {}".format(name, msg))
+        if assert_msg and assert_msg != msg:
+            lines.append("  assert: {}".format(assert_msg))
     tb = exc.__traceback__
     lines.append("  traceback:")
     while tb is not None:
@@ -158,7 +187,7 @@ def _run_all():
             errors.append((label, report))
             xos.print_color("  &c✗ failed&r")
             for line in report.split("\n"):
-                if line.startswith("  > "):
+                if line.startswith("  > ") or line.startswith("  assert: "):
                     xos.print_color("  &c{}&r".format(line))
                 elif line.startswith("AssertionError at ") or line.startswith(
                     "AssertionError:"

@@ -55,7 +55,7 @@ def test_printpack(compress):
 
     # it should be capable of knowing that its a printpacked string, and just automatically unpack and initialize the tensor from it.
     # that includes dtype, shape, data, and device. this will also be used in jsonification as well.
-    assert xos.all(tensor == tensor2)
+    assert xos.all(tensor == tensor2), f"tensor and tensor2 are not equal: {tensor} != {tensor2}"
 
     if compress:
         # check that len is less than non-compressed
