@@ -3,7 +3,7 @@ use rustpython_vm::{
     function::FuncArgs,
     AsObject, PyObjectRef, PyRef, PyResult, VirtualMachine,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::{LazyLock, Mutex};
 
@@ -259,6 +259,8 @@ struct StandalonePreviewApp {
     command_held: HashMap<u64, bool>,
     shift_held: HashMap<u64, bool>,
     frame_pan_dragging: HashMap<u64, bool>,
+    /// Viewports currently inside `frame._pause_viewport` (close button ends wait only).
+    pause_blocking: HashSet<u64>,
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
@@ -276,7 +278,25 @@ impl StandalonePreviewApp {
             command_held: HashMap::new(),
             shift_held: HashMap::new(),
             frame_pan_dragging: HashMap::new(),
+            pause_blocking: HashSet::new(),
         }
+    }
+
+    /// Tear down one preview window and its viewport state (does not exit the process).
+    fn close_viewport(&mut self, viewport_id: u64) {
+        if let Some(window_id) = self.viewport_to_window.remove(&viewport_id) {
+            self.states.remove(&window_id);
+        }
+        self.f3_engine_state.remove(&viewport_id);
+        self.pending_frames.remove(&viewport_id);
+        self.source_frames.remove(&viewport_id);
+        self.paused_base_frames.remove(&viewport_id);
+        self.pending_window_creates.remove(&viewport_id);
+        self.last_tick_instant.remove(&viewport_id);
+        self.command_held.remove(&viewport_id);
+        self.shift_held.remove(&viewport_id);
+        self.frame_pan_dragging.remove(&viewport_id);
+        self.pause_blocking.remove(&viewport_id);
     }
 
     fn viewport_paused(&self, viewport_id: u64) -> bool {
@@ -512,11 +532,8 @@ impl ApplicationHandler for StandalonePreviewApp {
         };
         match event {
             WindowEvent::CloseRequested => {
-                // Standalone preview is typically driven by user script loops
-                // (e.g. `while ...: app.tick()`). Closing any preview window should
-                // terminate the script immediately and close all windows together.
-                let _ = viewport_id;
-                std::process::exit(0);
+                // Close only this preview window; `pause()` and test runners continue.
+                self.close_viewport(viewport_id);
             }
             WindowEvent::Resized(new_size) => {
                 let Some(state) = self.states.get_mut(&_window_id) else {
@@ -714,9 +731,6 @@ impl ApplicationHandler for StandalonePreviewApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.ensure_windows_created(event_loop);
-        if self.states.is_empty() {
-            event_loop.exit();
-        }
     }
 }
 
@@ -1189,7 +1203,7 @@ fn frame_pause_viewport(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     }
     #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
     {
-        use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
+        use winit::platform::pump_events::EventLoopExtPumpEvents;
 
         let viewport_id: u64 = if !args.args.is_empty() {
             args.args[0].clone().try_into_value::<i64>(vm)?.max(0) as u64
@@ -1200,16 +1214,18 @@ fn frame_pause_viewport(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         STANDALONE_PREVIEW_HOST.with(|slot| {
             let mut opt = slot.borrow_mut();
             if let Some(host) = opt.as_mut() {
+                host.app.pause_blocking.insert(viewport_id);
                 if let Some(es) = host.app.f3_engine_state.get_mut(&viewport_id) {
                     es.paused = true;
                 }
-                loop {
-                    let timeout = Some(xos_core::time::Duration::from_millis(250));
-                    match host.event_loop.pump_app_events(timeout, &mut host.app) {
-                        PumpStatus::Continue => {}
-                        PumpStatus::Exit(_) => {}
+                while host.app.pause_blocking.contains(&viewport_id) {
+                    if !host.app.viewport_to_window.contains_key(&viewport_id) {
+                        break;
                     }
+                    let timeout = Some(xos_core::time::Duration::from_millis(250));
+                    let _ = host.event_loop.pump_app_events(timeout, &mut host.app);
                 }
+                host.app.pause_blocking.remove(&viewport_id);
             }
             Ok(())
         })?;

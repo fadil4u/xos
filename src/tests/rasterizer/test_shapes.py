@@ -32,6 +32,8 @@ def test_squares(dtype):
     # this should be the api for rendering the frame to the screen
     viewport = xos.render(tensor)
     viewport.pause()
+    # viewport = xos.render(tensor)
+    # viewport.pause()
 
     # viewport.render(tensor)  # this could also be called for subsequent updates to this frame, especially with pause=False for a live loop animation  TODO: testing for that
 
