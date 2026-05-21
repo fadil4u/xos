@@ -335,11 +335,15 @@ class Tensor:
         d = self._data.get("_data")
         if isinstance(d, list):
             return iter(d)
+        if isinstance(d, (bytes, bytearray)):
+            return iter(d)
         return iter([])
 
     def __len__(self):
         d = self._data.get("_data")
-        return len(d) if isinstance(d, list) else 0
+        if isinstance(d, (list, bytes, bytearray)):
+            return len(d)
+        return 0
 
     def _flat_storage(self):
         d = self._data.get("_data")
@@ -369,9 +373,11 @@ class Tensor:
         return len(flat)
 
     def _flat_get(self, flat, i):
-        if isinstance(flat, (bytes, bytearray)) and self.dtype == "float32":
-            import struct
-            return struct.unpack_from("<f", flat, i * 4)[0]
+        if isinstance(flat, (bytes, bytearray)):
+            if self.dtype == "float32":
+                import struct
+                return struct.unpack_from("<f", flat, i * 4)[0]
+            return flat[i]
         return flat[i]
 
     def _attach_registry_flat(self):
