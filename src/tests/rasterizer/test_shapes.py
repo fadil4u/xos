@@ -7,7 +7,7 @@ def blank_test():
 
 @xos.test
 @xos.parametrize("dtype", [xos.uint8, xos.float32])
-def test_squares(dtype):
+def test_rectangles(dtype):
     tensor = xos.zeros((180, 180, 3), dtype=dtype)
 
     rects = xos.tensor([
@@ -26,7 +26,30 @@ def test_squares(dtype):
         (255, 0, 0),  # same color for them all
     ])
 
-    xos.rasterizer.fill_rectangles(tensor, rects, colors)
+    # xos.rasterizer.fill_rectangles(tensor, rects, colors)  # old api
+
+
+
+    xos.shapes.rectangles(tensor, rects, colors)
+
+    xos.space  # containing definitions for spaces, transformations, and coordinate systems.
+
+    rects = xos.shapes.rectangles()  # returns a tensor of shape with dimensionalities defined
+    rects = xos.shapes.hyperrectangles()  # returns a tensor of shape with dimensionalities defined
+    rects.render(frame, space)
+
+    # to define a space, each axis is normalized to the range 0-1. therefore all spaces are normalized, but they can be 
+
+    # rectangles can be positioned anywhere in the frame, as long as 
+
+    # the space that is defined can be used to transform the rectangles into the desired space.
+    # for example, if we have a 0-1 normalized coordinate system for the vh and vw of the viewport
+    # or if we have a 0-1 normalized coordinate system for a subspace within the viewport, relative to the vh and vw itself but having things like
+    # mobile responsiveness or whatever, allowing us to define these shapes and systems and move them between spaces easily.
+
+
+
+
 
     # this should be the api for rendering the frame to the screen
     viewport = xos.render(tensor)
