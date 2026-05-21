@@ -1902,5 +1902,8 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     crate::mesh::register_mesh(&module, vm);
     crate::mouse::register_mouse(&module, vm);
 
+    // Last: patch module __dict__ so ``xos.clipboard`` / ``xos.clipboard = ...`` hit OS clipboard.
+    crate::clipboard::install_clipboard(vm, module.clone());
+
     module
 }

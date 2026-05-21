@@ -136,7 +136,7 @@ def _format_failure(exc):
             lines.append("  > {}".format(src))
         if assert_msg:
             lines.append("  assert: {}".format(assert_msg))
-        elif msg and not src:
+        elif msg:
             lines.append("  {}".format(msg))
     else:
         if name == "AssertionError" and not msg:
@@ -189,8 +189,18 @@ def _run_all():
             for line in report.split("\n"):
                 if line.startswith("  > ") or line.startswith("  assert: "):
                     xos.print_color("  &c{}&r".format(line))
-                elif line.startswith("AssertionError at ") or line.startswith(
-                    "AssertionError:"
+                elif (
+                    line.startswith("AssertionError at ")
+                    or line.startswith("AssertionError:")
+                    or line.startswith("NameError at ")
+                    or line.startswith("NameError:")
+                    or (
+                        line.startswith("  ")
+                        and not line.startswith("  > ")
+                        and not line.startswith("  assert: ")
+                        and not line.startswith("  traceback:")
+                        and not line.startswith('    File "')
+                    )
                 ):
                     xos.print_color("  &c{}&r".format(line))
                 else:

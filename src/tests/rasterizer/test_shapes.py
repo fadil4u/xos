@@ -30,6 +30,9 @@ def test_squares(dtype):
 
     # this should be the api for rendering the frame to the screen
     viewport = xos.render(tensor)
+
+    xos.clipboard = tensor.printpack()
+    # print(len(tensor.printpack()))
     # viewport.pause()
     # viewport = xos.render(tensor)
     # viewport.pause()
