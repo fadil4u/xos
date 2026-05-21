@@ -7,7 +7,7 @@ def _assert_space_properties(space, dtype, device):
     assert type(space.min) == xos.Tensor
     assert type(space.max) == xos.Tensor
     assert space.dtype is dtype
-    assert space.dimensionality == 3
+    assert space.dimensionality == 2
 
     assert space.device == device
     assert space.origin.device == device
@@ -24,15 +24,14 @@ def test_frame_transforms():
 
     height = 128
     width = 256
-    channels = 3
     device = "cpu"
 
     # spoof a viewport space and pixel space transform
     # viewport_space = xos.space()  # TODO (origins, units, dtypes, definitions per axis, scale, units, etc.)
     viewport_pixel_space = xos.space(
-        origin=(0, 0, 0),
-        min=(0, 0, 0),
-        max=(width, height, channels),
+        origin=(0, 0),
+        min=(0, 0),
+        max=(width, height),
         # units=("px", "px", "px"),  # TODO: labels later
         dtype=xos.uint8,  # cells of pixels
         device=device,
@@ -42,9 +41,9 @@ def test_frame_transforms():
 
     # normal_space = xos.space()  # TODO (origins, units, dtypes, definitions per axis, scale, units, etc.)
     normal_space = xos.space(
-        origin=(0, 0, 0),
-        min=(0.0, 0.0, 0.0),
-        max=(1.0, 1.0, 1.0),
+        origin=(0, 0),
+        min=(0.0, 0.0),
+        max=(1.0, 1.0),
         # units=("px", "px", "px"),
         dtype=xos.float32,
         device=device,
@@ -65,17 +64,24 @@ def test_frame_transforms():
     print(normal_to_pixels)
     print(pixels_to_normal)
 
+    # (x, y, z), (x, y, z), in this case where z is channels-span
     pixel_rectangles = xos.shapes.rectangles(
-        # (x, y, z), (x, y, z), in this case where z is channels-span
-        ((10, 10, 0), (20, 20, 2)),  # rect0
-        ((30, 30, 0), (40, 40, 2)),  # rect1
-        ((50, 50, 0), (800, 60, 2)),  # rect2
+        vertices=(
+            ((10, 10), (20, 20)),     # rect0
+            ((30, 30), (40, 40)),     # rect1
+            ((50, 50), (80, 60)),    # rect2
+        ),
     )
 
     print(pixel_rectangles.vertices.tostring(full=True))
 
     normal_rectangles = pixels_to_normal.apply(pixel_rectangles)
     print(normal_rectangles.vertices.tostring(full=True))
+
+    frame = xos.zeros((height, width, channels), dtype=xos.uint8, device=device)
+    xos.rasterizer.fill_rectangles(frame, pixel_rectangles.vertices, colors=(255, 0, 0))
+    viewport = xos.render(frame)
+    viewport.pause()
 
     # TODO: other shapes besides rectangles
 
