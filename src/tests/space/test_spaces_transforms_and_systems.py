@@ -72,10 +72,10 @@ def test_frame_transforms():
         ((50, 50, 0), (800, 60, 2)),  # rect2
     )
 
-    print(pixel_rectangles.vertices)
+    print(pixel_rectangles.vertices.tostring(full=True))
 
     normal_rectangles = pixels_to_normal.apply(pixel_rectangles)
-    print(normal_rectangles.vertices)
+    print(normal_rectangles.vertices.tostring(full=True))
 
     # TODO: other shapes besides rectangles
 

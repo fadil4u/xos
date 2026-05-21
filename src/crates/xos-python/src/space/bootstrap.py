@@ -1,6 +1,19 @@
 # Loaded into xos by install_space (test files: import xos only).
 
 
+def _format_coords(coords):
+    """Format a coordinate tuple with integer-like floats as ints."""
+    parts = []
+    for v in coords:
+        if isinstance(v, float) and v == float(int(v)):
+            parts.append(str(int(v)))
+        elif isinstance(v, float):
+            parts.append("{:.6g}".format(v))
+        else:
+            parts.append(repr(v))
+    return "(" + ", ".join(parts) + ")"
+
+
 def _coords_tensor(values, dtype, device):
     import xos
 
@@ -38,14 +51,19 @@ class Space:
     def into_from(self, other):
         return Transform.from_spaces(other, self)
 
-    def __str__(self):
-        return "xos.space(origin={}, min={}, max={}, dtype={}, device={!r})".format(
-            self.origin.astuple(),
-            self.min.astuple(),
-            self.max.astuple(),
-            self.dtype,
-            self.device,
+    def tostring(self, full=False):
+        origin = _format_coords(self.origin.astuple())
+        mn = _format_coords(self.min.astuple())
+        mx = _format_coords(self.max.astuple())
+        base = "xos.space(origin={}, min={}, max={}, dtype={}, device={!r})".format(
+            origin, mn, mx, self.dtype, self.device
         )
+        if not full:
+            return base
+        return base
+
+    def __str__(self):
+        return self.tostring(full=False)
 
     def __repr__(self):
         return self.__str__()
@@ -80,6 +98,14 @@ class Transform:
             return shapes._map_corners(self._map_point, self._to)
         raise TypeError("Transform.apply() expects shapes from xos.shapes")
 
+    def tostring(self, full=False):
+        if not full:
+            return str(self)
+        return "xos.Transform(\n  from={},\n  to={}\n)".format(
+            self._from.tostring(full=True),
+            self._to.tostring(full=True),
+        )
+
     def __str__(self):
         return "xos.Transform(from={}, to={})".format(self._from, self._to)
 
@@ -113,6 +139,22 @@ class Rectangles:
         return xos.tensor(
             flat, (n, 2, dim), dtype=self._dtype, device=self._device
         )
+
+    def tostring(self, full=False):
+        if not full:
+            return str(self)
+        lines = [
+            "xos.shapes.Rectangles(n={}, dim={}):".format(
+                len(self._corners), self._dimensionality
+            )
+        ]
+        for i, (c0, c1) in enumerate(self._corners):
+            lines.append(
+                "  [{}]: {} .. {}".format(i, _format_coords(c0), _format_coords(c1))
+            )
+        lines.append("vertices:")
+        lines.append(self.vertices.tostring(full=True))
+        return "\n".join(lines)
 
     def __str__(self):
         return "xos.shapes.Rectangles(n={}, dim={})".format(

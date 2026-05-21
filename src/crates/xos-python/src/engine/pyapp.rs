@@ -316,6 +316,31 @@ def _nested_list_to_tuple(nested):
         return tuple(_nested_list_to_tuple(x) for x in nested)
     return nested
 
+def _format_scalar_value(v):
+    if isinstance(v, bool):
+        return "True" if v else "False"
+    if isinstance(v, float):
+        if v == float(int(v)) and abs(v) < 1e15:
+            return str(int(v))
+        return "{:.6g}".format(v)
+    return repr(v)
+
+def _format_nested_values(data, indent=0):
+    """Pretty nested tuple formatting for ``tostring(full=True)``."""
+    pad = "  " * indent
+    if isinstance(data, tuple):
+        if not data:
+            return "()"
+        if isinstance(data[0], tuple):
+            lines = [pad + "("]
+            for row in data:
+                lines.append(pad + "  " + _format_nested_values(row, indent + 1) + ",")
+            lines.append(pad + ")")
+            return "\n".join(lines)
+        inner = ", ".join(_format_scalar_value(x) for x in data)
+        return pad + "(" + inner + ")"
+    return pad + _format_scalar_value(data)
+
 class Tensor:
     """xos.Tensor — dict-backed tensor (``shape``, ``dtype``, ``_data``) or flat list + optional ``shape``."""
     def __init__(self, data, shape=None):
@@ -1134,19 +1159,48 @@ class Tensor:
 
         return xos._tensor_mean(self)
 
-    def __str__(self):
+    def tostring(self, full=False):
+        """Human-readable string; ``full=True`` prints every element."""
+        if not full:
+            return self._summary_string()
+        self._ensure_flat()
         if "_data" not in self._data:
-            return f"xos.Tensor(shape={self.shape}, dtype=u8)"
+            return "xos.Tensor(shape={}, dtype={}, device={!r}, empty)".format(
+                self.shape, self.dtype, self.device
+            )
+        try:
+            data = self.astuple()
+        except Exception:
+            return "xos.Tensor(shape={}, dtype={}, device={!r}, <opaque>)".format(
+                self.shape, self.dtype, self.device
+            )
+        values = _format_nested_values(data, indent=1)
+        return "xos.Tensor(shape={}, dtype={}, device={!r}, values=\n{})".format(
+            self.shape, self.dtype, self.device, values
+        )
+
+    def _summary_string(self):
+        if "_data" not in self._data:
+            return "xos.Tensor(shape={}, dtype=u8)".format(self.shape)
         import xos
 
         try:
             mn, mx, av = xos._tensor_min_max_mean(self)
         except ValueError:
-            return f"xos.Tensor(shape={self.shape}, dtype={self.dtype}, empty)"
+            return "xos.Tensor(shape={}, dtype={}, empty)".format(
+                self.shape, self.dtype
+            )
         except TypeError:
-            return f"xos.Tensor(shape={self.shape}, dtype={self.dtype}, <opaque flat storage>)"
-        return f"xos.Tensor(shape={self.shape}, dtype={self.dtype}, min={float(mn):.3f}, max={float(mx):.3f}, mean={float(av):.3f})"
-    
+            return "xos.Tensor(shape={}, dtype={}, <opaque flat storage>)".format(
+                self.shape, self.dtype
+            )
+        return "xos.Tensor(shape={}, dtype={}, min={:.3f}, max={:.3f}, mean={:.3f})".format(
+            self.shape, self.dtype, float(mn), float(mx), float(av)
+        )
+
+    def __str__(self):
+        return self._summary_string()
+
     def __repr__(self):
         return self.__str__()
 
