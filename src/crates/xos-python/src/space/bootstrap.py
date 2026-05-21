@@ -124,7 +124,12 @@ class Rectangles:
         mapped = []
         for c0, c1 in self._corners:
             mapped.append((map_fn(c0), map_fn(c1)))
-        return Rectangles(mapped, target_space.dtype, target_space.device, self._dimensionality)
+        return Rectangles(
+            mapped,
+            target_space.dtype,
+            target_space.device,
+            self._dimensionality,
+        )
 
     @property
     def vertices(self):
@@ -164,11 +169,14 @@ class Rectangles:
         return self.__str__()
 
 
-def rectangles(*corner_pairs):
+def rectangles(vertices=None, dtype=None, device="cpu"):
     import xos
 
+    if vertices is None:
+        raise TypeError("rectangles(vertices=...) is required")
+    corner_pairs = tuple(vertices)
     if not corner_pairs:
-        raise TypeError("rectangles() requires at least one ((min), (max)) pair")
+        raise TypeError("rectangles(vertices=...) needs at least one corner pair")
     dim = len(corner_pairs[0][0])
     for pair in corner_pairs:
         if len(pair) != 2:
@@ -176,10 +184,12 @@ def rectangles(*corner_pairs):
         c0, c1 = pair
         if len(c0) != dim or len(c1) != dim:
             raise ValueError("rectangle corners must match dimensionality")
+    if dtype is None:
+        dtype = xos.float32
     return Rectangles(
         [((tuple(a)), tuple(b)) for a, b in corner_pairs],
-        xos.float32,
-        "cpu",
+        dtype,
+        device,
         dim,
     )
 

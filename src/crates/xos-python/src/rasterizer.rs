@@ -1,4 +1,4 @@
-use crate::tensor_buf::tensor_flat_bytes;
+use crate::tensor_buf::{py_number_to_f64, tensor_flat_bytes};
 use crate::tensors::{tensor_flat_data_list, tensor_shape_tuple};
 use xos_core::rasterizer::shapes::lines::draw_line_direct;
 use xos_core::rasterizer::text::fonts::{self, FontFamily};
@@ -1251,21 +1251,74 @@ fn rects_filled(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     Ok(vm.ctx.none())
 }
 
+/// Parse ``colors`` as a flat buffer plus ``(num_colors, stride)`` for broadcast / per-rect rows.
+fn parse_fill_colors(
+    colors_obj: &PyObjectRef,
+    vm: &VirtualMachine,
+) -> PyResult<(Vec<f32>, usize, usize)> {
+    if let Some(tup) = colors_obj.downcast_ref::<PyTuple>() {
+        let flat: Vec<f32> = tup
+            .as_slice()
+            .iter()
+            .map(|x| py_number_to_f64(x, vm).map(|v| v as f32))
+            .collect::<Result<_, _>>()?;
+        if flat.len() >= 3 {
+            let stride = flat.len();
+            return Ok((flat, 1, stride));
+        }
+    }
+    if let Some(list) = colors_obj.downcast_ref::<PyList>() {
+        let vec = list.borrow_vec();
+        if !vec.is_empty() && vec[0].downcast_ref::<PyTuple>().is_none() {
+            let flat: Vec<f32> = vec
+                .iter()
+                .map(|x| py_number_to_f64(x, vm).map(|v| v as f32))
+                .collect::<Result<_, _>>()?;
+            if flat.len() >= 3 && flat.len() <= 4 {
+                let stride = flat.len();
+                return Ok((flat, 1, stride));
+            }
+        }
+    }
+    let color_flat = tensor_flat_data_list(colors_obj, vm)?;
+    let color_shape = tensor_shape_tuple(colors_obj, vm).unwrap_or_default();
+    let (num_colors, color_stride) = if color_shape.len() >= 2 {
+        (color_shape[0].max(1), color_shape[1].max(3))
+    } else if color_flat.len() >= 3 {
+        (1usize, color_flat.len())
+    } else {
+        return Err(vm.new_type_error(
+            "colors must be (r,g,b), (r,g,b,a), or tensor shape (N,3)".to_string(),
+        ));
+    };
+    Ok((color_flat, num_colors, color_stride))
+}
+
 /// xos.rasterizer.fill_rectangles(tensor, rects, colors)
 ///
 /// Pixel-space rectangles: each row is `[x1, y1, x2, y2]`. Colors are `(r,g,b)` or `(r,g,b,a)`
 /// with one row broadcast to all rects, or one color per rect.
 fn fill_rectangles(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let args_vec = args.args;
-    if args_vec.len() != 3 {
-        return Err(vm.new_type_error(format!(
-            "fill_rectangles(tensor, rects, colors) takes 3 arguments ({} given)",
-            args_vec.len()
-        )));
+    if args_vec.len() < 2 {
+        return Err(vm.new_type_error(
+            "fill_rectangles(tensor, rects, colors) needs at least tensor and rects".to_string(),
+        ));
     }
     let tensor = &args_vec[0];
     let rects_obj = &args_vec[1];
-    let colors_obj = &args_vec[2];
+    let colors_obj = if args_vec.len() > 2 {
+        args_vec[2].clone()
+    } else {
+        args.kwargs
+            .get("colors")
+            .cloned()
+            .ok_or_else(|| {
+                vm.new_type_error(
+                    "fill_rectangles(tensor, rects, colors=...) requires colors".to_string(),
+                )
+            })?
+    };
 
     let shape = tensor_shape_tuple(tensor, vm)?;
     if shape.len() < 2 {
@@ -1275,26 +1328,51 @@ fn fill_rectangles(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let width = shape[1].max(1);
     let channels = shape.get(2).copied().unwrap_or(1).max(1);
 
+    let rect_shape = tensor_shape_tuple(rects_obj, vm).unwrap_or_default();
     let rect_flat = tensor_flat_data_list(rects_obj, vm)?;
-    if rect_flat.len() < 4 || rect_flat.len() % 4 != 0 {
-        return Err(vm.new_type_error(
-            "rects must be shape (N, 4) with pixel coords [x1, y1, x2, y2]".to_string(),
-        ));
-    }
-    let num_rects = rect_flat.len() / 4;
-
-    let color_flat = tensor_flat_data_list(colors_obj, vm)?;
-    let color_shape = tensor_shape_tuple(colors_obj, vm).unwrap_or_default();
-    let (num_colors, color_stride) = if color_shape.len() >= 2 {
-        (
-            color_shape[0].max(1),
-            color_shape[1].max(3),
-        )
-    } else if color_flat.len() >= 3 {
-        (1usize, color_flat.len())
+    let (num_rects, rect_flat) = if rect_shape.len() == 3 && rect_shape[1] == 2 {
+        let n = rect_shape[0].max(1);
+        let d = rect_shape[2].max(1);
+        if rect_flat.len() < n * 2 * d {
+            return Err(vm.new_type_error(
+                "rects shape (N, 2, D): flat data length mismatch".to_string(),
+            ));
+        }
+        if d < 2 {
+            return Err(vm.new_type_error(
+                "rects shape (N, 2, D): D must be at least 2 for x,y".to_string(),
+            ));
+        }
+        let mut boxes = Vec::with_capacity(n * 4);
+        for r in 0..n {
+            let base = r * 2 * d;
+            let c0x = rect_flat[base];
+            let c0y = rect_flat[base + 1];
+            let c1x = rect_flat[base + d];
+            let c1y = rect_flat[base + d + 1];
+            boxes.push(c0x.min(c1x).round());
+            boxes.push(c0y.min(c1y).round());
+            boxes.push(c0x.max(c1x).round());
+            boxes.push(c0y.max(c1y).round());
+        }
+        (n, boxes)
+    } else if rect_shape.len() == 2 && rect_shape[1] == 4 {
+        let n = rect_shape[0].max(1);
+        if rect_flat.len() < n * 4 {
+            return Err(vm.new_type_error(
+                "rects shape (N, 4): flat data length mismatch".to_string(),
+            ));
+        }
+        (n, rect_flat)
+    } else if rect_flat.len() >= 4 && rect_flat.len() % 4 == 0 {
+        (rect_flat.len() / 4, rect_flat)
     } else {
-        return Err(vm.new_type_error("colors must be (r,g,b) or (N,3)".to_string()));
+        return Err(vm.new_type_error(
+            "rects must be shape (N, 4) as [x1,y1,x2,y2] or (N, 2, D) corner pairs".to_string(),
+        ));
     };
+
+    let (color_flat, num_colors, color_stride) = parse_fill_colors(&colors_obj, vm)?;
 
     let mut flat = tensor_flat_data_list(tensor, vm)?;
     let expected = height.saturating_mul(width).saturating_mul(channels);

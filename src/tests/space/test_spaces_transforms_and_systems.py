@@ -78,7 +78,7 @@ def test_frame_transforms():
     normal_rectangles = pixels_to_normal.apply(pixel_rectangles)
     print(normal_rectangles.vertices.tostring(full=True))
 
-    frame = xos.zeros((height, width, channels), dtype=xos.uint8, device=device)
+    frame = xos.zeros((height, width, 3), dtype=xos.uint8, device=device)
     xos.rasterizer.fill_rectangles(frame, pixel_rectangles.vertices, colors=(255, 0, 0))
     viewport = xos.render(frame)
     viewport.pause()
