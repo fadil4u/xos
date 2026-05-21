@@ -26,17 +26,17 @@ def test_rectangles(dtype):
         (255, 0, 0),  # same color for them all
     ])
 
-    # xos.rasterizer.fill_rectangles(tensor, rects, colors)  # old api
+    xos.rasterizer.fill_rectangles(tensor, rects, colors)  # old api
 
 
 
-    xos.shapes.rectangles(tensor, rects, colors)
+    # xos.shapes.rectangles(tensor, rects, colors)
 
-    xos.space  # containing definitions for spaces, transformations, and coordinate systems.
+    # xos.space  # containing definitions for spaces, transformations, and coordinate systems.
 
-    rects = xos.shapes.rectangles()  # returns a tensor of shape with dimensionalities defined
-    rects = xos.shapes.hyperrectangles()  # returns a tensor of shape with dimensionalities defined
-    rects.render(frame, space)
+    # rects = xos.shapes.rectangles()  # returns a tensor of shape with dimensionalities defined
+    # rects = xos.shapes.hyperrectangles()  # returns a tensor of shape with dimensionalities defined
+    # rects.render(tensor)
 
     # to define a space, each axis is normalized to the range 0-1. therefore all spaces are normalized, but they can be 
 
@@ -54,11 +54,11 @@ def test_rectangles(dtype):
     # this should be the api for rendering the frame to the screen
     viewport = xos.render(tensor)
 
-    xos.clipboard = tensor.printpack()
+    # xos.clipboard = tensor.printpack()
     # print(len(tensor.printpack()))
     # viewport.pause()
     # viewport = xos.render(tensor)
-    # viewport.pause()
+    viewport.pause()
 
     # tensor.printpack()
 
