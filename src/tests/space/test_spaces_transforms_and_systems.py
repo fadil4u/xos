@@ -78,8 +78,15 @@ def test_frame_transforms():
     normal_rectangles = pixels_to_normal.apply(pixel_rectangles)
     print(normal_rectangles.vertices.tostring(full=True))
 
+    # rasterize the frame from trivial pixel coordinates definitions
     frame = xos.zeros((height, width, 3), dtype=xos.uint8, device=device)
     xos.rasterizer.fill_rectangles(frame, pixel_rectangles.vertices, colors=(255, 0, 0))
+    viewport = xos.render(frame)
+    viewport.pause()
+
+    # now do so but from the normalized space
+    frame = xos.zeros((height * 2, width * 3, 3), dtype=xos.uint8, device=device)  # different size but proportional
+    xos.rasterizer.fill_rectangles(frame, normal_rectangles.vertices, colors=(255, 0, 0))
     viewport = xos.render(frame)
     viewport.pause()
 
