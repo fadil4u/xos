@@ -1,6 +1,15 @@
 import xos
 
 
+def _assert_space_properties(space, dtype):
+    # TODO: failure construction  cases like mismatching dimensionality etc.
+    assert type(space.origin) == xos.tensor
+    assert type(space.min) == xos.tensor
+    assert type(space.max) == xos.tensor
+    assert type(space.dtype) == dtype
+    assert space.dimensionality == 3
+
+
 @xos.test
 def test_frame_transforms():
     """Dimensionalities hardcoded to match CHW (channels, height, width) transformations of frames where it's sorta technically 3d, but
@@ -18,9 +27,11 @@ def test_frame_transforms():
         origin=(0, 0, 0),
         min=(0, 0, 0),
         max=(width, height, channels),
-        units=("px", "px", "px"),
+        # units=("px", "px", "px"),  # TODO: labels later
         dtype=xos.uint8,  # cells of pixels
     )
+
+    _assert_space_properties(viewport_pixel_space, xos.uint8)
 
     # normal_space = xos.space()  # TODO (origins, units, dtypes, definitions per axis, scale, units, etc.)
     normal_space = xos.space(
@@ -30,6 +41,8 @@ def test_frame_transforms():
         # units=("px", "px", "px"),
         dtype=xos.float32,
     )
+
+    _assert_space_properties(normal_space, xos.float32)
 
     # automatically generate the transformations between the spaces
     normal_to_pixels = viewport_pixel_space.into_from(normal_space)
