@@ -9,6 +9,13 @@ def _assert_space_properties(space, dtype):
     assert type(space.dtype) == dtype
     assert space.dimensionality == 3
 
+    # device checks
+    assert space.device == device
+    assert space.origin.device == device
+    assert space.min.device == device
+    assert space.max.device == device
+    assert space.dtype.device == device
+
 
 @xos.test
 def test_frame_transforms():
@@ -20,6 +27,7 @@ def test_frame_transforms():
     height = 128
     width = 256
     channels = 3
+    device = "cpu"
 
     # spoof a viewport space and pixel space transform
     # viewport_space = xos.space()  # TODO (origins, units, dtypes, definitions per axis, scale, units, etc.)
@@ -29,9 +37,10 @@ def test_frame_transforms():
         max=(width, height, channels),
         # units=("px", "px", "px"),  # TODO: labels later
         dtype=xos.uint8,  # cells of pixels
+        device=device,
     )
 
-    _assert_space_properties(viewport_pixel_space, xos.uint8)
+    _assert_space_properties(viewport_pixel_space, xos.uint8, device)
 
     # normal_space = xos.space()  # TODO (origins, units, dtypes, definitions per axis, scale, units, etc.)
     normal_space = xos.space(
@@ -40,9 +49,10 @@ def test_frame_transforms():
         max=(1.0, 1.0, 1.0),
         # units=("px", "px", "px"),
         dtype=xos.float32,
+        device=device,
     )
 
-    _assert_space_properties(normal_space, xos.float32)
+    _assert_space_properties(normal_space, xos.float32, device)
 
     # automatically generate the transformations between the spaces
     normal_to_pixels = viewport_pixel_space.into_from(normal_space)
