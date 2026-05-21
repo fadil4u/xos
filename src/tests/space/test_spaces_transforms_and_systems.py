@@ -82,5 +82,7 @@ def test_frame_transforms():
     # TODO: non-linear transformations
     # TODO: time-varying transformations
 
+    # TODO: rasterize to frame and display
+
 
 
