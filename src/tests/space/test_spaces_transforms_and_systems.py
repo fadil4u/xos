@@ -14,7 +14,7 @@ def test_frame_transforms():
 
     # spoof a viewport space and pixel space transform
     # viewport_space = xos.space()  # TODO (origins, units, dtypes, definitions per axis, scale, units, etc.)
-    viewport_space = xos.space(
+    viewport_pixel_space = xos.space(
         origin=(0, 0, 0),
         min=(0, 0, 0),
         max=(width, height, channels),
@@ -32,10 +32,29 @@ def test_frame_transforms():
     )
 
     # automatically generate the transformations between the spaces
-    normal_to_vp = transform = viewport_space.into_from(normal_space)
-    vp_to_normal = normal_space.into_from(viewport_space)
+    normal_to_pixels = viewport_pixel_space.into_from(normal_space)
+    pixels_to_normal = normal_space.into_from(viewport_pixel_space)
 
-    # test the transforms and their inverses
+    # TODO: test the transforms against their inverses
+    print("spaces:")
+    print(viewport_pixel_space)
+    print(normal_space)
+
+    print("transforms:")
+    print(normal_to_pixels)
+    print(pixels_to_normal)
+
+    pixel_rectangles = xos.shapes.rectangles(
+        # (x, y, z), (x, y, z), in this case where z is channels-span
+        ((10, 10, 0), (20, 20, 2)),  # rect0
+        ((30, 30, 0), (40, 40, 2)),  # rect1
+        ((50, 50, 0), (800, 60, 2)),  # rect2
+    # )
+
+    # normal_rectangles = xos.shapes.rectangles(
+
+    # )
+
     # TODO: other shapes besides rectangles
 
     # NOTE: all should be n-Dimensional and 100% tensorized/organized.
