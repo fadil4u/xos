@@ -1194,6 +1194,38 @@ fn frame_present_viewport(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     Ok(vm.ctx.none())
 }
 
+/// xos.frame._tick_viewport(viewport_id) -> bool — pump events once; False if the window closed.
+fn frame_tick_viewport(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
+    {
+        let _ = args;
+        return Ok(vm.ctx.new_bool(false).into());
+    }
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+    {
+        use winit::platform::pump_events::EventLoopExtPumpEvents;
+
+        let viewport_id: u64 = if !args.args.is_empty() {
+            args.args[0].clone().try_into_value::<i64>(vm)?.max(0) as u64
+        } else {
+            0
+        };
+        let still_open = STANDALONE_PREVIEW_HOST.with(|slot| -> PyResult<bool> {
+            let mut opt = slot.borrow_mut();
+            let Some(host) = opt.as_mut() else {
+                return Ok(false);
+            };
+            if !host.app.viewport_to_window.contains_key(&viewport_id) {
+                return Ok(false);
+            }
+            let timeout = Some(xos_core::time::Duration::from_millis(16));
+            let _ = host.event_loop.pump_app_events(timeout, &mut host.app);
+            Ok(host.app.viewport_to_window.contains_key(&viewport_id))
+        })?;
+        Ok(vm.ctx.new_bool(still_open).into())
+    }
+}
+
 /// xos.frame._pause_viewport(viewport_id) — block until the preview window is closed.
 fn frame_pause_viewport(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
@@ -1437,6 +1469,11 @@ fn tensor_registry_bytes(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     let module = vm.new_module("xos", vm.ctx.new_dict(), None);
 
+    // Register before nested bootstraps so ``import xos`` does not re-enter ``make_module``.
+    if let Ok(modules) = vm.sys_module.get_attr("modules", vm) {
+        let _ = modules.set_item("xos", module.as_object().to_owned(), vm);
+    }
+
     // Add functions to the module
     module
         .set_attr("hello", vm.new_function("hello", hello), vm)
@@ -1581,6 +1618,13 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
         .unwrap();
     frame_module
         .set_attr(
+            "_tick_viewport",
+            vm.new_function("_tick_viewport", frame_tick_viewport),
+            vm,
+        )
+        .unwrap();
+    frame_module
+        .set_attr(
             "_standalone_tensor_data",
             vm.new_function("_standalone_tensor_data", frame_standalone_tensor_data),
             vm,
@@ -1589,15 +1633,6 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     module.set_attr("frame", frame_module, vm).unwrap();
 
     crate::testing::install_testing(vm, module.clone());
-    crate::render::install_render(vm, module.clone());
-    crate::space::install_space(vm, module.clone());
-    module
-        .set_attr(
-            "_sync_tensor_to_standalone",
-            vm.new_function("_sync_tensor_to_standalone", sync_tensor_to_standalone),
-            vm,
-        )
-        .unwrap();
 
     crate::json_api::register_json(&module, vm);
 
@@ -1859,6 +1894,16 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     if let Ok(dtype) = dtypes_module.get_attr("bool", vm) {
         module.set_attr("bool", dtype, vm).ok();
     }
+
+    module
+        .set_attr(
+            "_sync_tensor_to_standalone",
+            vm.new_function("_sync_tensor_to_standalone", sync_tensor_to_standalone),
+            vm,
+        )
+        .unwrap();
+    crate::render::install_render(vm, module.clone());
+    crate::space::install_space(vm, module.clone());
 
     // Define the Application base class in Python
     let application_class_code = crate::engine::pyapp::APPLICATION_CLASS_CODE;

@@ -25,9 +25,22 @@ pub fn install_space(vm: &VirtualMachine, module: PyRef<PyModule>) {
         return;
     }
 
-    for name in ["space", "shapes", "Space", "Transform", "Rectangles"] {
+    for name in ["space", "shapes", "Space", "Transform", "Rectangles", "pixel_space_for_frame"] {
         if let Ok(obj) = scope.globals.get_item(name, vm) {
             let _ = module.set_attr(name, obj, vm);
         }
+    }
+
+    let Ok(rast) = module.get_attr("rasterizer", vm) else {
+        return;
+    };
+    if let Ok(wrap) = scope.globals.get_item("fill_rectangles", vm) {
+        if let Ok(native) = rast.get_attr("fill_rectangles", vm) {
+            let _ = rast.set_attr("_fill_rectangles_native", native, vm);
+        }
+        let _ = rast.set_attr("fill_rectangles", wrap, vm);
+    }
+    if let Ok(psf) = scope.globals.get_item("pixel_space_for_frame", vm) {
+        let _ = rast.set_attr("pixel_space_for_frame", psf, vm);
     }
 }

@@ -847,24 +847,146 @@ fn clear(_args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     Ok(vm.ctx.none())
 }
 
-/// xos.rasterizer.fill() - fill the entire frame buffer with a solid color
+/// Parse ``colors`` as a flat buffer plus ``(num_colors, stride)`` for broadcast / per-rect rows.
+fn parse_fill_colors(
+    colors_obj: &PyObjectRef,
+    vm: &VirtualMachine,
+) -> PyResult<(Vec<f32>, usize, usize)> {
+    if let Some(tup) = colors_obj.downcast_ref::<PyTuple>() {
+        let flat: Vec<f32> = tup
+            .as_slice()
+            .iter()
+            .map(|x| py_number_to_f64(x, vm).map(|v| v as f32))
+            .collect::<Result<_, _>>()?;
+        if flat.len() >= 3 {
+            let stride = flat.len();
+            return Ok((flat, 1, stride));
+        }
+    }
+    if let Some(list) = colors_obj.downcast_ref::<PyList>() {
+        let vec = list.borrow_vec();
+        if !vec.is_empty() && vec[0].downcast_ref::<PyTuple>().is_none() {
+            let flat: Vec<f32> = vec
+                .iter()
+                .map(|x| py_number_to_f64(x, vm).map(|v| v as f32))
+                .collect::<Result<_, _>>()?;
+            if flat.len() >= 3 && flat.len() <= 4 {
+                let stride = flat.len();
+                return Ok((flat, 1, stride));
+            }
+        }
+    }
+    let color_flat = tensor_flat_data_list(colors_obj, vm)?;
+    let color_shape = tensor_shape_tuple(colors_obj, vm).unwrap_or_default();
+    let (num_colors, color_stride) = if color_shape.len() >= 2 {
+        (color_shape[0].max(1), color_shape[1].max(3))
+    } else if color_flat.len() >= 3 {
+        (1usize, color_flat.len())
+    } else {
+        return Err(vm.new_type_error(
+            "colors must be (r,g,b), (r,g,b,a), or tensor shape (N,3)".to_string(),
+        ));
+    };
+    Ok((color_flat, num_colors, color_stride))
+}
+
+fn write_tensor_flat(tensor: &PyObjectRef, flat: &[f32], vm: &VirtualMachine) -> PyResult<()> {
+    if let Some(id) = crate::xos_module::tensor_rust_id(tensor, vm) {
+        crate::tensor_buf::write_tensor_data_by_id(id, flat);
+        return Ok(());
+    }
+    if let Some(dict) = tensor.downcast_ref::<PyDict>() {
+        let bytes: Vec<u8> = flat.iter().map(|v| v.clamp(0.0, 255.0) as u8).collect();
+        dict.set_item(
+            "_data",
+            rustpython_vm::builtins::PyByteArray::new_ref(bytes, &vm.ctx).into(),
+            vm,
+        )?;
+        return Ok(());
+    }
+    Err(vm.new_type_error("fill: expected a tensor".to_string()))
+}
+
+fn tensor_like_target(obj: &PyObjectRef, vm: &VirtualMachine) -> bool {
+    if obj.downcast_ref::<PyDict>().is_some() {
+        return true;
+    }
+    vm.get_attribute_opt(obj.clone(), "_data")
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// xos.rasterizer.fill(tensor, colors=...) — solid fill on a tensor (functional preview / tick loops).
 ///
-/// Usage: xos.rasterizer.fill(frame, color)
-/// - frame: frame object (ignored, we use the global context)
-/// - color: (r, g, b, a) tuple
+/// Also supports legacy ``fill(frame, (r,g,b,a))`` when a tick frame-buffer context is active.
 fn fill(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let args_vec = args.args;
+    if args_vec.is_empty() {
+        return Err(vm.new_type_error(
+            "fill(tensor, colors=...) or fill(frame, (r,g,b,a))".to_string(),
+        ));
+    }
+
+    let target = &args_vec[0];
+    if tensor_like_target(target, vm) {
+        let colors_obj = if args_vec.len() > 1 {
+            args_vec[1].clone()
+        } else {
+            args.kwargs.get("colors").cloned().ok_or_else(|| {
+                vm.new_type_error("fill(tensor, colors=...) requires colors".to_string())
+            })?
+        };
+        let (color_flat, _, stride) = parse_fill_colors(&colors_obj, vm)?;
+        let r = color_flat[0];
+        let g = color_flat[1];
+        let b = color_flat[2];
+        let a = if stride >= 4 {
+            color_flat[3]
+        } else {
+            255.0
+        };
+
+        let shape = tensor_shape_tuple(target, vm)?;
+        if shape.len() < 2 {
+            return Err(vm.new_type_error("fill: tensor needs (height, width, ...)".to_string()));
+        }
+        let height = shape[0].max(1);
+        let width = shape[1].max(1);
+        let channels = shape.get(2).copied().unwrap_or(3).max(1);
+        let expected = height.saturating_mul(width).saturating_mul(channels);
+        let mut flat = tensor_flat_data_list(target, vm)?;
+        if flat.len() < expected {
+            flat.resize(expected, 0.0);
+        }
+        for px in flat[..expected].chunks_mut(channels) {
+            if !px.is_empty() {
+                px[0] = r;
+            }
+            if px.len() >= 2 {
+                px[1] = g;
+            }
+            if px.len() >= 3 {
+                px[2] = b;
+            }
+            if px.len() >= 4 {
+                px[3] = a;
+            }
+        }
+        write_tensor_flat(target, &flat[..expected], vm)?;
+        return Ok(vm.ctx.none());
+    }
+
     if args_vec.len() != 2 {
         return Err(vm.new_type_error(format!(
-            "fill() takes exactly 2 arguments ({} given)",
+            "fill(frame, (r,g,b,a)) takes 2 arguments ({} given)",
             args_vec.len()
         )));
     }
 
-    let _frame_dict = &args_vec[0]; // Ignored, we use global context
+    let _frame_dict = &args_vec[0];
     let color_tuple = &args_vec[1];
 
-    // Get the frame buffer from global context
     let buffer_ptr_opt = CURRENT_FRAME_BUFFER
         .lock()
         .unwrap()
@@ -879,7 +1001,6 @@ fn fill(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         )
     })?;
 
-    // Parse color tuple (r, g, b, a)
     let color_obj = color_tuple
         .downcast_ref::<rustpython_vm::builtins::PyTuple>()
         .ok_or_else(|| vm.new_type_error("color must be a tuple".to_string()))?;
@@ -1249,49 +1370,6 @@ fn rects_filled(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
     note_frame_cpu_write();
     Ok(vm.ctx.none())
-}
-
-/// Parse ``colors`` as a flat buffer plus ``(num_colors, stride)`` for broadcast / per-rect rows.
-fn parse_fill_colors(
-    colors_obj: &PyObjectRef,
-    vm: &VirtualMachine,
-) -> PyResult<(Vec<f32>, usize, usize)> {
-    if let Some(tup) = colors_obj.downcast_ref::<PyTuple>() {
-        let flat: Vec<f32> = tup
-            .as_slice()
-            .iter()
-            .map(|x| py_number_to_f64(x, vm).map(|v| v as f32))
-            .collect::<Result<_, _>>()?;
-        if flat.len() >= 3 {
-            let stride = flat.len();
-            return Ok((flat, 1, stride));
-        }
-    }
-    if let Some(list) = colors_obj.downcast_ref::<PyList>() {
-        let vec = list.borrow_vec();
-        if !vec.is_empty() && vec[0].downcast_ref::<PyTuple>().is_none() {
-            let flat: Vec<f32> = vec
-                .iter()
-                .map(|x| py_number_to_f64(x, vm).map(|v| v as f32))
-                .collect::<Result<_, _>>()?;
-            if flat.len() >= 3 && flat.len() <= 4 {
-                let stride = flat.len();
-                return Ok((flat, 1, stride));
-            }
-        }
-    }
-    let color_flat = tensor_flat_data_list(colors_obj, vm)?;
-    let color_shape = tensor_shape_tuple(colors_obj, vm).unwrap_or_default();
-    let (num_colors, color_stride) = if color_shape.len() >= 2 {
-        (color_shape[0].max(1), color_shape[1].max(3))
-    } else if color_flat.len() >= 3 {
-        (1usize, color_flat.len())
-    } else {
-        return Err(vm.new_type_error(
-            "colors must be (r,g,b), (r,g,b,a), or tensor shape (N,3)".to_string(),
-        ));
-    };
-    Ok((color_flat, num_colors, color_stride))
 }
 
 /// xos.rasterizer.fill_rectangles(tensor, rects, colors)

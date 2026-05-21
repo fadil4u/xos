@@ -1,4 +1,5 @@
 # Loaded into xos by install_space (test files: import xos only).
+# ``xos`` is injected into globals by Rust (do not ``import xos`` here).
 
 
 def _format_coords(coords):
@@ -15,15 +16,11 @@ def _format_coords(coords):
 
 
 def _coords_tensor(values, dtype, device):
-    import xos
-
     flat = list(values)
     return xos.tensor(flat, (len(flat),), dtype=dtype, device=device)
 
 
 def space(origin=(0,), min=(0,), max=(1,), dtype=None, device="cpu", units=None):
-    import xos
-
     if dtype is None:
         dtype = xos.float32
     o = tuple(origin)
@@ -49,7 +46,12 @@ class Space:
         self.units = units
 
     def into_from(self, other):
+        """Transform from ``other`` space into this (pixel) space."""
         return Transform.from_spaces(other, self)
+
+    def to_from(self, other):
+        """Alias for ``into_from`` (map coordinates from ``other`` → this space)."""
+        return self.into_from(other)
 
     def tostring(self, full=False):
         origin = _format_coords(self.origin.astuple())
@@ -66,7 +68,7 @@ class Space:
         return self.tostring(full=False)
 
     def __repr__(self):
-        return self.__str__()
+        return self.tostring(full=False)
 
 
 class Transform:
@@ -93,24 +95,44 @@ class Transform:
             out.append(float(dmin[i]) + t * (float(dmax[i]) - float(dmin[i])))
         return tuple(out)
 
-    def apply(self, shapes):
-        if hasattr(shapes, "_map_corners"):
-            return shapes._map_corners(self._map_point, self._to)
-        raise TypeError("Transform.apply() expects shapes from xos.shapes")
+    def _apply_vertices_tensor(self, verts):
+        pairs = verts.astuple()
+        mapped = []
+        for c0, c1 in pairs:
+            m0 = self._map_point(tuple(c0))
+            m1 = self._map_point(tuple(c1))
+            mapped.append((m0, m1))
+        dim = len(pairs[0][0])
+        flat = []
+        for c0, c1 in mapped:
+            flat.extend(c0)
+            flat.extend(c1)
+        return xos.tensor(
+            flat, (len(mapped), 2, dim), dtype=verts.dtype, device=verts.device
+        )
+
+    def apply(self, target):
+        if hasattr(target, "_map_corners"):
+            return target._map_corners(self._map_point, self._to)
+        if hasattr(target, "astuple"):
+            return self._apply_vertices_tensor(target)
+        raise TypeError(
+            "Transform.apply() expects xos.shapes rectangles or a vertices tensor"
+        )
 
     def tostring(self, full=False):
         if not full:
-            return str(self)
+            return "xos.Transform(from={}, to={})".format(self._from, self._to)
         return "xos.Transform(from={}, to={})".format(
             self._from.tostring(full=True),
             self._to.tostring(full=True),
         )
 
     def __str__(self):
-        return "xos.Transform(from={}, to={})".format(self._from, self._to)
+        return self.tostring(full=False)
 
     def __repr__(self):
-        return self.__str__()
+        return self.tostring(full=False)
 
 
 class Rectangles:
@@ -133,8 +155,6 @@ class Rectangles:
 
     @property
     def vertices(self):
-        import xos
-
         n = len(self._corners)
         dim = self._dimensionality
         flat = []
@@ -147,7 +167,9 @@ class Rectangles:
 
     def tostring(self, full=False):
         if not full:
-            return str(self)
+            return "xos.shapes.Rectangles(n={}, dim={})".format(
+                len(self._corners), self._dimensionality
+            )
         parts = [
             "xos.shapes.Rectangles(n={}, dim={})".format(
                 len(self._corners), self._dimensionality
@@ -161,17 +183,13 @@ class Rectangles:
         return " | ".join(parts)
 
     def __str__(self):
-        return "xos.shapes.Rectangles(n={}, dim={})".format(
-            len(self._corners), self._dimensionality
-        )
+        return self.tostring(full=False)
 
     def __repr__(self):
-        return self.__str__()
+        return self.tostring(full=False)
 
 
 def rectangles(vertices=None, dtype=None, device="cpu"):
-    import xos
-
     if vertices is None:
         raise TypeError("rectangles(vertices=...) is required")
     corner_pairs = tuple(vertices)
@@ -199,3 +217,57 @@ class _ShapesModule:
 
 
 shapes = _ShapesModule()
+
+
+def pixel_space_for_frame(frame, dtype=None, device=None):
+    """Pixel-aligned ``xos.space`` from a frame tensor ``(height, width, ...)``."""
+    shape = tuple(frame.shape)
+    if len(shape) < 2:
+        raise ValueError("pixel_space_for_frame needs (height, width, ...)")
+    h, w = int(shape[0]), int(shape[1])
+    if dtype is None:
+        dtype = frame.dtype
+    if device is None:
+        device = frame.device
+    return xos.space(
+        origin=(0, 0),
+        min=(0, 0),
+        max=(w, h),
+        dtype=dtype,
+        device=device,
+    )
+
+
+def _vertices_from_rects(rects):
+    if hasattr(rects, "vertices"):
+        return rects.vertices
+    return rects
+
+
+def fill_rectangles(frame, rects, colors=None, space=None, viewport=None):
+    """
+    Fill axis-aligned rectangles on ``frame``.
+
+    ``colors`` — ``(r,g,b)`` or ``(r,g,b,a)`` (broadcast), or per-rect tensor.
+
+    ``space`` — when set (e.g. ``normal_space``), ``rects`` are in that coordinate
+    system and are mapped into pixel space for the current ``frame`` shape (or
+    ``viewport.size`` when ``viewport`` is given). When ``space`` is ``None``, ``rects``
+    are already in pixel coordinates matching ``frame``.
+    """
+    native = xos.rasterizer._fill_rectangles_native
+    if colors is None:
+        raise TypeError("fill_rectangles(..., colors=...) requires colors")
+    if space is None:
+        native(frame, rects, colors)
+        return
+
+    if viewport is not None:
+        pixel_space = viewport.pixel_space(dtype=frame.dtype, device=frame.device)
+    else:
+        pixel_space = pixel_space_for_frame(frame, dtype=frame.dtype, device=frame.device)
+
+    to_pixels = pixel_space.to_from(space)
+    verts = _vertices_from_rects(rects)
+    pixel_verts = to_pixels.apply(verts)
+    native(frame, pixel_verts, colors)
