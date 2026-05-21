@@ -325,21 +325,15 @@ def _format_scalar_value(v):
         return "{:.6g}".format(v)
     return repr(v)
 
-def _format_nested_values(data, indent=0):
-    """Pretty nested tuple formatting for ``tostring(full=True)``."""
-    pad = "  " * indent
+def _format_nested_values(data):
+    """Compact nested tuple formatting for ``tostring(full=True)``."""
     if isinstance(data, tuple):
         if not data:
             return "()"
         if isinstance(data[0], tuple):
-            lines = [pad + "("]
-            for row in data:
-                lines.append(pad + "  " + _format_nested_values(row, indent + 1) + ",")
-            lines.append(pad + ")")
-            return "\n".join(lines)
-        inner = ", ".join(_format_scalar_value(x) for x in data)
-        return pad + "(" + inner + ")"
-    return pad + _format_scalar_value(data)
+            return "(" + ", ".join(_format_nested_values(row) for row in data) + ")"
+        return "(" + ", ".join(_format_scalar_value(x) for x in data) + ")"
+    return _format_scalar_value(data)
 
 class Tensor:
     """xos.Tensor — dict-backed tensor (``shape``, ``dtype``, ``_data``) or flat list + optional ``shape``."""
@@ -1174,8 +1168,8 @@ class Tensor:
             return "xos.Tensor(shape={}, dtype={}, device={!r}, <opaque>)".format(
                 self.shape, self.dtype, self.device
             )
-        values = _format_nested_values(data, indent=1)
-        return "xos.Tensor(shape={}, dtype={}, device={!r}, values=\n{})".format(
+        values = _format_nested_values(data)
+        return "xos.Tensor(shape={}, dtype={}, device={!r}, values={})".format(
             self.shape, self.dtype, self.device, values
         )
 

@@ -101,7 +101,7 @@ class Transform:
     def tostring(self, full=False):
         if not full:
             return str(self)
-        return "xos.Transform(\n  from={},\n  to={}\n)".format(
+        return "xos.Transform(from={}, to={})".format(
             self._from.tostring(full=True),
             self._to.tostring(full=True),
         )
@@ -143,18 +143,17 @@ class Rectangles:
     def tostring(self, full=False):
         if not full:
             return str(self)
-        lines = [
-            "xos.shapes.Rectangles(n={}, dim={}):".format(
+        parts = [
+            "xos.shapes.Rectangles(n={}, dim={})".format(
                 len(self._corners), self._dimensionality
             )
         ]
         for i, (c0, c1) in enumerate(self._corners):
-            lines.append(
-                "  [{}]: {} .. {}".format(i, _format_coords(c0), _format_coords(c1))
+            parts.append(
+                "[{}] {}..{}".format(i, _format_coords(c0), _format_coords(c1))
             )
-        lines.append("vertices:")
-        lines.append(self.vertices.tostring(full=True))
-        return "\n".join(lines)
+        parts.append("vertices=" + self.vertices.tostring(full=True))
+        return " | ".join(parts)
 
     def __str__(self):
         return "xos.shapes.Rectangles(n={}, dim={})".format(
