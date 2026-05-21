@@ -49,11 +49,12 @@ def test_frame_transforms():
         ((10, 10, 0), (20, 20, 2)),  # rect0
         ((30, 30, 0), (40, 40, 2)),  # rect1
         ((50, 50, 0), (800, 60, 2)),  # rect2
-    # )
+    )
 
-    # normal_rectangles = xos.shapes.rectangles(
+    print(pixel_rectangles)
 
-    # )
+    normal_rectangles = pixels_to_normal.apply(pixel_rectangles)
+    print(normal_rectangles)
 
     # TODO: other shapes besides rectangles
 
