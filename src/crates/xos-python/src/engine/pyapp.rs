@@ -1066,6 +1066,10 @@ class Tensor:
         """Same as ``list()`` but with tuples at each nesting level."""
         return _nested_list_to_tuple(self.list())
 
+    def astuple(self):
+        """Nested tuples for ``shape`` (alias for ``tuple()``)."""
+        return self.tuple()
+
     def min(self, axis=None, out=None, keepdims=False, **kwargs):
         """Global minimum (numpy-style signature); reductions run in Rust. ``axis`` / ``out`` / ``keepdims`` … not implemented yet."""
         if kwargs:

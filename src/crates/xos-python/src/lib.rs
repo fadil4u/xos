@@ -36,6 +36,7 @@ mod repl;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod staged_native_python_app;
 pub mod sensors;
+pub mod space;
 pub mod system;
 pub mod tensor_buf;
 pub mod tensors;

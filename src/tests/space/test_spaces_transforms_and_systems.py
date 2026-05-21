@@ -1,20 +1,18 @@
 import xos
 
 
-def _assert_space_properties(space, dtype):
+def _assert_space_properties(space, dtype, device):
     # TODO: failure construction  cases like mismatching dimensionality etc.
-    assert type(space.origin) == xos.tensor
-    assert type(space.min) == xos.tensor
-    assert type(space.max) == xos.tensor
-    assert type(space.dtype) == dtype
+    assert type(space.origin) == xos.Tensor
+    assert type(space.min) == xos.Tensor
+    assert type(space.max) == xos.Tensor
+    assert space.dtype is dtype
     assert space.dimensionality == 3
 
-    # device checks
     assert space.device == device
     assert space.origin.device == device
     assert space.min.device == device
     assert space.max.device == device
-    assert space.dtype.device == device
 
 
 @xos.test
@@ -74,10 +72,10 @@ def test_frame_transforms():
         ((50, 50, 0), (800, 60, 2)),  # rect2
     )
 
-    print(pixel_rectangles)
+    print(pixel_rectangles.vertices)
 
     normal_rectangles = pixels_to_normal.apply(pixel_rectangles)
-    print(normal_rectangles)
+    print(normal_rectangles.vertices)
 
     # TODO: other shapes besides rectangles
 

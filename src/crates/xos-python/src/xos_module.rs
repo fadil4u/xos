@@ -1590,6 +1590,7 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
 
     crate::testing::install_testing(vm, module.clone());
     crate::render::install_render(vm, module.clone());
+    crate::space::install_space(vm, module.clone());
     module
         .set_attr(
             "_sync_tensor_to_standalone",
