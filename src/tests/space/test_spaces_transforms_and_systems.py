@@ -87,13 +87,19 @@ def test_frame_transforms():
     # now do so but from the normalized space
     viewport = xos.render(xos.zeros((height * 2, width * 3, 3), dtype=xos.uint8, device=device))
 
-    # functional "animation" loop
-    while True:
-        xos.rasterizer.fill(viewport.frame, colors=(0, 0, 0))  # black out the frame
-        xos.rasterizer.fill_rectangles(frame, normal_rectangles.vertices, colors=(255, 0, 0), space=normal_space)
-        xos.render(viewport)
-        if viewport.closed:
-            break
+    # functional "animation" loop (draw into viewport.frame, map normal_space -> pixels)
+    frame = viewport.frame
+    while not viewport.closed:
+        xos.rasterizer.fill(frame, colors=(0, 0, 0))
+        xos.rasterizer.fill_rectangles(
+            frame,
+            normal_rectangles,
+            colors=(255, 0, 0),
+            space=normal_space,
+            viewport=viewport,
+        )
+        xos.render(viewport, frame)
+        frame = viewport.frame
 
     # viewport.pause()
 

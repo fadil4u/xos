@@ -43,13 +43,17 @@ class Viewport:
 
     @property
     def frame(self):
-        """Fresh HWC tensor sized to the live preview window (updates after resize)."""
+        """HWC draw buffer for the live preview window (reused until resize)."""
         w, h = self.size
-        t = xos.zeros(
-            (h, w, self._channels),
-            dtype=self._dtype,
-            device=self._device,
-        )
+        ch = self._channels
+        want_shape = (h, w, ch)
+        if self._draw_tensor is not None:
+            try:
+                if tuple(self._draw_tensor.shape) == want_shape:
+                    return self._draw_tensor
+            except Exception:
+                pass
+        t = xos.zeros(want_shape, dtype=self._dtype, device=self._device)
         self._draw_tensor = t
         return t
 

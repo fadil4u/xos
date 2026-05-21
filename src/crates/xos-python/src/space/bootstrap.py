@@ -250,24 +250,42 @@ def fill_rectangles(frame, rects, colors=None, space=None, viewport=None):
 
     ``colors`` — ``(r,g,b)`` or ``(r,g,b,a)`` (broadcast), or per-rect tensor.
 
-    ``space`` — when set (e.g. ``normal_space``), ``rects`` are in that coordinate
-    system and are mapped into pixel space for the current ``frame`` shape (or
-    ``viewport.size`` when ``viewport`` is given). When ``space`` is ``None``, ``rects``
-    are already in pixel coordinates matching ``frame``.
+    ``rects`` — ``(N, 2, D)`` vertices tensor, ``(N, 4)`` boxes, or ``xos.shapes`` rectangles.
+
+    ``space`` — when set (e.g. ``normal_space``), builds ``pixel_space.to_from(space)`` and
+    maps ``rects`` into pixel coordinates before rasterizing.
+
+    ``viewport`` — when set, draws into ``viewport.frame`` (stable buffer) using the live
+    window size for the pixel space, then syncs to the preview window.
     """
     native = xos.rasterizer._fill_rectangles_native
     if colors is None:
         raise TypeError("fill_rectangles(..., colors=...) requires colors")
-    if space is None:
-        native(frame, rects, colors)
-        return
 
     if viewport is not None:
-        pixel_space = viewport.pixel_space(dtype=frame.dtype, device=frame.device)
+        draw_frame = viewport.frame
     else:
-        pixel_space = pixel_space_for_frame(frame, dtype=frame.dtype, device=frame.device)
+        draw_frame = frame
 
-    to_pixels = pixel_space.to_from(space)
-    verts = _vertices_from_rects(rects)
-    pixel_verts = to_pixels.apply(verts)
-    native(frame, pixel_verts, colors)
+    if space is not None:
+        if viewport is not None:
+            pixel_space = viewport.pixel_space(
+                dtype=draw_frame.dtype, device=draw_frame.device
+            )
+        else:
+            pixel_space = pixel_space_for_frame(
+                draw_frame, dtype=draw_frame.dtype, device=draw_frame.device
+            )
+        to_pixels = pixel_space.to_from(space)
+        mapped = to_pixels.apply(rects)
+        if hasattr(mapped, "vertices"):
+            rects = mapped.vertices
+        else:
+            rects = mapped
+
+    native(draw_frame, rects, colors)
+
+    if viewport is not None:
+        viewport._draw_tensor = draw_frame
+        viewport._last_tensor = draw_frame
+        xos._sync_tensor_to_standalone(draw_frame, viewport._id)
