@@ -1,7 +1,9 @@
 ///! Unified Python runtime for xos
 ///! Handles execution of Python code in both CLI and coder environments
 ///! with centralized logging and error handling
-use rustpython_vm::{builtins::PyBaseExceptionRef, AsObject, Interpreter, VirtualMachine};
+use rustpython_vm::{
+    builtins::PyBaseExceptionRef, AsObject, Interpreter, PyObjectRef, VirtualMachine,
+};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -469,7 +471,10 @@ fn collect_test_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Discover `src/tests/**/*.py`, register `@xos.test` functions, run them. Returns process exit code.
-pub fn run_test_suite(tests_dir: &std::path::Path) -> i32 {
+///
+/// When `filter_name` is set, only registered cases whose function name matches are executed
+/// (all parametrize variants for that name; every file that defines the same name).
+pub fn run_test_suite(tests_dir: &std::path::Path, filter_name: Option<&str>) -> i32 {
     let mut files = Vec::new();
     collect_test_files(tests_dir, &mut files);
     files.sort();
@@ -567,7 +572,14 @@ pub fn run_test_suite(tests_dir: &std::path::Path) -> i32 {
                 return 1;
             }
         };
-        let result = match run_all.call((), vm) {
+        let result = match filter_name {
+            Some(name) => {
+                let filter_arg: PyObjectRef = vm.ctx.new_str(name).into();
+                run_all.call((filter_arg,), vm)
+            }
+            None => run_all.call((), vm),
+        };
+        let result = match result {
             Ok(v) => v,
             Err(e) => {
                 eprintln!(

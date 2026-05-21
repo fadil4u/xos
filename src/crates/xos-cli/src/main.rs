@@ -161,6 +161,9 @@ enum Commands {
     },
     /// Run `src/tests/**/*.py` files that use `@xos.test`.
     Test {
+        /// Only run test functions with this name (e.g. `test_frame_transforms`).
+        /// If the name appears in multiple files, every matching case is run.
+        name: Option<String>,
         /// Directory to search (default: `<project>/src/tests`)
         #[arg(long)]
         path: Option<PathBuf>,
@@ -930,7 +933,7 @@ fn main() {
         }) => {
             run_path_command(code, data, cli_exe);
         }
-        Some(Commands::Test { path }) => {
+        Some(Commands::Test { name, path }) => {
             let root = match xos::find_xos_project_root() {
                 Ok(r) => r,
                 Err(e) => {
@@ -943,7 +946,7 @@ fn main() {
                 eprintln!("❌ tests directory not found: {}", tests_dir.display());
                 std::process::exit(1);
             }
-            std::process::exit(run_test_suite(&tests_dir));
+            std::process::exit(run_test_suite(&tests_dir, name.as_deref()));
         }
         Some(Commands::Py { file, wasm, rest }) => {
             if let Some(file_path) = file {

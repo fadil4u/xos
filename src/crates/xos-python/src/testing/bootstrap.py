@@ -158,16 +158,27 @@ def _format_failure(exc):
     return "\n".join(lines)
 
 
-def _run_all():
+def _run_all(filter_name=None):
     passed = 0
     failed = 0
     errors = []
 
-    if not _REGISTRY:
-        xos.print_color("&cNo tests collected&r (check @xos.test and src/tests/**/*.py)")
+    cases = list(_REGISTRY)
+    if filter_name:
+        cases = [c for c in cases if c[0] == filter_name]
+
+    if not cases:
+        if filter_name:
+            xos.print_color(
+                "&cNo tests named &f{}&c (check @xos.test and src/tests/**/*.py)".format(
+                    filter_name
+                )
+            )
+        else:
+            xos.print_color("&cNo tests collected&r (check @xos.test and src/tests/**/*.py)")
         return False
 
-    for test_id, kwargs, fn in list(_REGISTRY):
+    for test_id, kwargs, fn in cases:
         label = test_id
         if kwargs:
             parts = ["{}={!r}".format(k, kwargs[k]) for k in sorted(kwargs.keys())]
