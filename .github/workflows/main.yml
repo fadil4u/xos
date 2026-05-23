@@ -30,6 +30,7 @@ jobs:
       version_changed: ${{ steps.classify.outputs.version_changed }}
       base_changed: ${{ steps.classify.outputs.base_changed }}
       pre_changed: ${{ steps.classify.outputs.pre_changed }}
+      is_pre_release: ${{ steps.classify.outputs.is_pre_release }}
       is_full_release: ${{ steps.classify.outputs.is_full_release }}
       run_compiler: ${{ steps.classify.outputs.run_compiler }}
       wasm_artifact_name: ${{ steps.classify.outputs.wasm_artifact_name }}
@@ -138,9 +139,33 @@ jobs:
                       s.write(msg + "\\n")
               sys.exit(1)
 
+          # Illegal transition guard:
+          # If main is pre-release X.Y.Z-preN, PR must not jump to a different base
+          # (either as pre-release or stable). Finish X.Y.Z first.
+          if (
+              event_name == "pull_request"
+              and p["pre"] != ""
+              and c["base"] != p["base"]
+          ):
+              msg = (
+                  "Illegal version transition: main is prerelease "
+                  f"{previous_version}, but PR sets {current_version}.\\n"
+                  "You cannot change the base version while the current base is still in prerelease. "
+                  f"Finish {p['base']} first by releasing stable {p['base']}, then move to "
+                  f"the next line (e.g. {p['base']} -> <next>-pre0)."
+              )
+              print(msg, file=sys.stderr)
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as s:
+                      s.write("## Version policy violation\\n")
+                      s.write(msg + "\\n")
+              sys.exit(1)
+
           version_changed = current_version != previous_version
           base_changed = c["base"] != p["base"]
           pre_changed = c["pre"] != p["pre"]
+          is_pre_release = c["pre"] != ""
           is_full_release = version_changed and c["pre"] == ""
 
           run_compiler = force_compiler or pre_changed or is_full_release
@@ -152,6 +177,7 @@ jobs:
               "version_changed": str(version_changed).lower(),
               "base_changed": str(base_changed).lower(),
               "pre_changed": str(pre_changed).lower(),
+              "is_pre_release": str(is_pre_release).lower(),
               "is_full_release": str(is_full_release).lower(),
               "run_compiler": str(run_compiler).lower(),
               "wasm_artifact_name": wasm_artifact_name,
@@ -192,7 +218,7 @@ jobs:
     with:
       version: ${{ needs.classify-version.outputs.current_version }}
       wasm_artifact_name: ${{ needs.classify-version.outputs.wasm_artifact_name }}
-      push_docker: false
+      is_full_release: ${{ needs.classify-version.outputs.is_full_release == 'true' }}
     secrets: inherit
 
   full-release:
