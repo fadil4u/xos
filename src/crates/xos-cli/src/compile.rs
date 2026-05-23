@@ -330,7 +330,7 @@ pub fn find_project_root() -> PathBuf {
         Ok(p) => p,
         Err(e) => {
             eprintln!("❌ Could not find xos project root: {e}");
-            eprintln!("   Set XOS_PROJECT_ROOT to your clone, use a copy of `xos` built from source, or cd into the repo.");
+            eprintln!("   Run this from inside your xos checkout, or use a `xos` binary built from that checkout.");
             std::process::exit(1);
         }
     }
