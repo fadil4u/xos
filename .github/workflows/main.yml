@@ -16,6 +16,10 @@ permissions:
   contents: write
   packages: write
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   classify-version:
     name: Classify version change
@@ -137,22 +141,41 @@ jobs:
               print(f"  {k}: {v}")
           PY
 
+  enforce-pr-policy:
+    name: Enforce pre bump for PRs
+    runs-on: ubuntu-latest
+    needs: classify-version
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    steps:
+      - name: Require pre bump vs main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.classify-version.outputs.pre_changed }}" != "true" ]; then
+            echo "PRs into main must bump -preN in Cargo.toml."
+            echo "Current:  ${{ needs.classify-version.outputs.current_version }}"
+            echo "Against main: ${{ needs.classify-version.outputs.previous_version }}"
+            exit 1
+          fi
+
   compiler:
     name: Compiler matrix
-    needs: classify-version
-    if: needs.classify-version.outputs.run_compiler == 'true'
+    needs: [classify-version, enforce-pr-policy]
+    if: |
+      (github.event_name == 'pull_request' && needs.enforce-pr-policy.result == 'success') ||
+      (github.event_name == 'workflow_dispatch' && needs.classify-version.outputs.run_compiler == 'true')
     uses: ./.github/workflows/compiler.yml
     with:
       version: ${{ needs.classify-version.outputs.current_version }}
       wasm_artifact_name: ${{ needs.classify-version.outputs.wasm_artifact_name }}
-      push_docker: ${{ needs.classify-version.outputs.is_full_release == 'true' && github.event_name == 'push' }}
+      push_docker: false
     secrets: inherit
 
   full-release:
     name: Full release publish
     needs: [classify-version, compiler]
     if: |
-      github.event_name == 'push' &&
+      github.event_name == 'workflow_dispatch' &&
       needs.classify-version.outputs.is_full_release == 'true' &&
       needs.compiler.result == 'success'
     uses: ./.github/workflows/full_release.yml
