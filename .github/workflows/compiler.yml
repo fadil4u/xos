@@ -147,6 +147,11 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          cache-from: |
+            type=registry,ref=xlateai/xos:prerelease
+            type=registry,ref=xlateai/xos:latest
+            type=registry,ref=xlateai/xos:buildcache
+          cache-to: type=registry,ref=xlateai/xos:buildcache,mode=max
           tags: |
             xlateai/xos:${{ steps.tags.outputs.short_sha }}
             xlateai/xos:${{ inputs.version }}
