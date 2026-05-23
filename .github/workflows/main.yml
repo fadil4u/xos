@@ -1,0 +1,165 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      force_compiler:
+        description: "Force compiler checks regardless of version diff"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  classify-version:
+    name: Classify version change
+    runs-on: ubuntu-latest
+    outputs:
+      current_version: ${{ steps.classify.outputs.current_version }}
+      previous_version: ${{ steps.classify.outputs.previous_version }}
+      version_changed: ${{ steps.classify.outputs.version_changed }}
+      base_changed: ${{ steps.classify.outputs.base_changed }}
+      pre_changed: ${{ steps.classify.outputs.pre_changed }}
+      is_full_release: ${{ steps.classify.outputs.is_full_release }}
+      run_compiler: ${{ steps.classify.outputs.run_compiler }}
+      wasm_artifact_name: ${{ steps.classify.outputs.wasm_artifact_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse version components
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_REF: ${{ github.base_ref }}
+          FORCE_COMPILER: ${{ github.event.inputs.force_compiler || 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          out = Path(os.environ["GITHUB_OUTPUT"])
+          event_name = os.environ.get("EVENT_NAME", "")
+          push_before = os.environ.get("PUSH_BEFORE", "")
+          pr_base_ref = os.environ.get("PR_BASE_REF", "")
+          force_compiler = os.environ.get("FORCE_COMPILER", "false").lower() == "true"
+
+          def run(*args):
+              return subprocess.run(args, text=True, capture_output=True, check=False)
+
+          def extract_version(toml_text: str) -> str:
+              ws_match = re.search(
+                  r"^\[workspace\.package\]\n(?:(?!^\[).*\n)*?^version\s*=\s*\"([^\"]+)\"",
+                  toml_text,
+                  re.M,
+              )
+              if ws_match:
+                  return ws_match.group(1).strip()
+              root_match = re.search(r"^version\s*=\s*\"([^\"]+)\"", toml_text, re.M)
+              if root_match:
+                  return root_match.group(1).strip()
+              raise ValueError("Could not find version in Cargo.toml")
+
+          version_re = re.compile(r"^(?P<base>\d+\.\d+\.\d+)(?:-pre(?P<pre>\d+))?$")
+
+          def parse(v: str):
+              m = version_re.fullmatch(v)
+              if not m:
+                  raise ValueError(
+                      f"Unsupported version format '{v}'. Expected: X.Y.Z[-preN]"
+                  )
+              return {
+                  "base": m.group("base"),
+                  "pre": m.group("pre") or "",
+              }
+
+          current_toml = Path("Cargo.toml").read_text(encoding="utf-8")
+          current_version = extract_version(current_toml)
+
+          previous_toml = None
+          if event_name == "pull_request" and pr_base_ref:
+              run("git", "fetch", "--depth=1", "origin", pr_base_ref)
+              showed = run("git", "show", f"origin/{pr_base_ref}:Cargo.toml")
+              if showed.returncode == 0:
+                  previous_toml = showed.stdout
+          elif event_name == "push" and push_before and push_before != "0" * 40:
+              showed = run("git", "show", f"{push_before}:Cargo.toml")
+              if showed.returncode == 0:
+                  previous_toml = showed.stdout
+
+          if previous_toml is None:
+              previous_toml = current_toml
+
+          previous_version = extract_version(previous_toml)
+
+          c = parse(current_version)
+          p = parse(previous_version)
+
+          version_changed = current_version != previous_version
+          base_changed = c["base"] != p["base"]
+          pre_changed = c["pre"] != p["pre"]
+          is_full_release = version_changed and c["pre"] == ""
+
+          run_compiler = force_compiler or pre_changed or is_full_release
+          wasm_artifact_name = f"xos-wasm-zip-v{current_version}"
+
+          lines = {
+              "current_version": current_version,
+              "previous_version": previous_version,
+              "version_changed": str(version_changed).lower(),
+              "base_changed": str(base_changed).lower(),
+              "pre_changed": str(pre_changed).lower(),
+              "is_full_release": str(is_full_release).lower(),
+              "run_compiler": str(run_compiler).lower(),
+              "wasm_artifact_name": wasm_artifact_name,
+          }
+          with out.open("a", encoding="utf-8") as f:
+              for k, v in lines.items():
+                  f.write(f"{k}={v}\n")
+
+          print("Version classification:")
+          for k, v in lines.items():
+              print(f"  {k}: {v}")
+          PY
+
+  compiler:
+    name: Compiler matrix
+    needs: classify-version
+    if: needs.classify-version.outputs.run_compiler == 'true'
+    uses: ./.github/workflows/compiler.yml
+    with:
+      version: ${{ needs.classify-version.outputs.current_version }}
+      wasm_artifact_name: ${{ needs.classify-version.outputs.wasm_artifact_name }}
+      push_docker: ${{ needs.classify-version.outputs.is_full_release == 'true' && github.event_name == 'push' }}
+    secrets: inherit
+
+  full-release:
+    name: Full release publish
+    needs: [classify-version, compiler]
+    if: |
+      github.event_name == 'push' &&
+      needs.classify-version.outputs.is_full_release == 'true' &&
+      needs.compiler.result == 'success'
+    uses: ./.github/workflows/full_release.yml
+    with:
+      version: ${{ needs.classify-version.outputs.current_version }}
+      wasm_artifact_name: ${{ needs.classify-version.outputs.wasm_artifact_name }}
+    secrets: inherit

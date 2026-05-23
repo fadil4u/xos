@@ -1,0 +1,106 @@
+name: Full Release
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Full release version
+        required: true
+        type: string
+      wasm_artifact_name:
+        description: WASM artifact name to attach
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish-crates:
+    name: Publish crate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux build deps
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if cargo publish --no-verify 2>&1 | tee /tmp/cargo-publish.log; then
+            exit 0
+          fi
+          if grep -qi "already exists" /tmp/cargo-publish.log; then
+            echo "crate already published; continuing"
+            exit 0
+          fi
+          exit 1
+
+  github-release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs: publish-crates
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download wasm artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.wasm_artifact_name }}
+          path: wasm-artifact
+
+      - name: Validate wasm archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s wasm-artifact/xos-wasm.zip
+          ls -lh wasm-artifact/xos-wasm.zip
+
+      - name: Ensure tag exists on origin
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${{ inputs.version }}"
+          if git ls-remote --tags origin | grep -q "refs/tags/${tag}$"; then
+            echo "Tag ${tag} already exists on origin."
+          else
+            git tag "${tag}" "${GITHUB_SHA}"
+            git push origin "${tag}"
+          fi
+
+      - name: Ensure GitHub release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${{ inputs.version }}"
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${tag} already exists."
+          else
+            gh release create "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "${tag}" \
+              --generate-notes
+          fi
+
+      - name: Upload wasm artifact to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${{ inputs.version }}"
+          gh release upload "${tag}" wasm-artifact/xos-wasm.zip --repo "${GITHUB_REPOSITORY}" --clobber

@@ -1,0 +1,129 @@
+name: Compiler Suite
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version under test
+        required: true
+        type: string
+      wasm_artifact_name:
+        description: Uploaded wasm artifact name
+        required: true
+        type: string
+      push_docker:
+        description: Push Docker image (release-only)
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  windows:
+    name: Windows compile
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compile CLI
+        shell: pwsh
+        run: cargo build -p xos-cli --bin xos --release
+
+  macos:
+    name: macOS compile
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compile CLI
+        shell: bash
+        run: cargo build -p xos-cli --bin xos --release
+
+  wasm:
+    name: WASM compile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      - name: Build wasm archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -p xos-cli --bin xos -- compile --wasm
+          test -s target/wasm/main/xos-wasm.zip
+          ls -lh target/wasm/main/xos-wasm.zip
+
+      - name: Upload wasm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.wasm_artifact_name }}
+          path: target/wasm/main/xos-wasm.zip
+          if-no-files-found: error
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker build (no push)
+        if: inputs.push_docker == false
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --load \
+            -t xos-ci:${{ inputs.version }} \
+            -f Dockerfile .
+
+      - name: Login to Docker Hub
+        if: inputs.push_docker == true
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push release image
+        if: inputs.push_docker == true
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            xlateai/xos:v${{ inputs.version }}
+            xlateai/xos:latest
