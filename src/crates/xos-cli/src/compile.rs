@@ -11,9 +11,37 @@ const WASM_TARGET_DIR_NAME: &str = "wasm";
 const WASM_MAIN_OUTPUT_DIR_NAME: &str = "main";
 const WASM_ZIP_NAME: &str = "xos-wasm.zip";
 
+#[cfg(windows)]
+fn normalize_windows_path(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
+#[cfg(not(windows))]
+fn normalize_windows_path(path: PathBuf) -> PathBuf {
+    path
+}
+
 /// Cargo `target` directory for native host builds (isolates caches from `--ios` / `--wasm` lanes).
 pub fn standard_target_root(project_root: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        // Some Windows Application Control policies block executing Cargo-generated
+        // build-script binaries under custom target subdirectories (e.g. target/standard).
+        // Use Cargo's default target dir on Windows to keep builds policy-compatible.
+        return project_root.join("target");
+    }
+
+    #[cfg(not(windows))]
+    {
     project_root.join("target").join("standard")
+    }
 }
 
 fn profile_dir_name(release: bool) -> &'static str {
@@ -327,7 +355,7 @@ fn run_compile_and_update_cargo_bin(
 
 pub fn find_project_root() -> PathBuf {
     match xos::find_xos_project_root() {
-        Ok(p) => p,
+        Ok(p) => normalize_windows_path(p),
         Err(e) => {
             eprintln!("❌ Could not find xos project root: {e}");
             eprintln!("   Run this from inside your xos checkout, or use a `xos` binary built from that checkout.");
