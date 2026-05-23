@@ -114,6 +114,30 @@ jobs:
           c = parse(current_version)
           p = parse(previous_version)
 
+          # Illegal transition guard:
+          # If main is stable X.Y.Z, a PR must not move to X.Y.Z-preN.
+          # Proper flow is to bump base first (e.g. X.Y.(Z+1)-pre0).
+          if (
+              event_name == "pull_request"
+              and p["pre"] == ""
+              and c["pre"] != ""
+              and c["base"] == p["base"]
+          ):
+              msg = (
+                  "Illegal version transition: main is stable "
+                  f"{previous_version}, but PR sets {current_version}.\\n"
+                  "Do not create a prerelease from the same stable base. "
+                  "Bump the base version first, then add -pre0 "
+                  "(example: 0.2.3 -> 0.2.4-pre0)."
+              )
+              print(msg, file=sys.stderr)
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as s:
+                      s.write("## Version policy violation\\n")
+                      s.write(msg + "\\n")
+              sys.exit(1)
+
           version_changed = current_version != previous_version
           base_changed = c["base"] != p["base"]
           pre_changed = c["pre"] != p["pre"]
