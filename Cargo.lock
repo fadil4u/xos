@@ -11390,7 +11390,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xos"
-version = "0.3.19-pre4"
+version = "0.3.19-pre5"
 dependencies = [
  "darling 0.21.3",
  "getrandom 0.3.4",
@@ -11409,7 +11409,7 @@ dependencies = [
 
 [[package]]
 name = "xos-app"
-version = "0.3.19-pre4"
+version = "0.3.19-pre5"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -11453,7 +11453,7 @@ dependencies = [
 
 [[package]]
 name = "xos-audio"
-version = "0.3.19-pre4"
+version = "0.3.19-pre5"
 dependencies = [
  "cpal",
  "hound",
@@ -11468,7 +11468,7 @@ dependencies = [
 
 [[package]]
 name = "xos-auth"
-version = "0.3.19-pre4"
+version = "0.3.19-pre5"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -11485,7 +11485,7 @@ dependencies = [
 
 [[package]]
 name = "xos-cli"
-version = "0.3.19-pre4"
+version = "0.3.19-pre5"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -11503,7 +11503,7 @@ dependencies = [
 
 [[package]]
 name = "xos-core"
-version = "0.3.19-pre4"
+version = "0.3.19-pre5"
 dependencies = [
  "burn",
  "burn-cubecl",
@@ -11561,7 +11561,7 @@ dependencies = [
 
 [[package]]
 name = "xos-java"
-version = "0.3.19-pre4"
+version = "0.3.19-pre5"
 dependencies = [
  "jni 0.21.1",
  "xos",
@@ -11569,7 +11569,7 @@ dependencies = [
 
 [[package]]
 name = "xos-mesh"
-version = "0.3.19-pre4"
+version = "0.3.19-pre5"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -11589,7 +11589,7 @@ dependencies = [
 
 [[package]]
 name = "xos-python"
-version = "0.3.19-pre4"
+version = "0.3.19-pre5"
 dependencies = [
  "base64 0.22.1",
  "burn",
@@ -11634,7 +11634,7 @@ dependencies = [
 
 [[package]]
 name = "xos-tensor"
-version = "0.3.19-pre4"
+version = "0.3.19-pre5"
 dependencies = [
  "burn",
  "burn-backend",
@@ -11644,7 +11644,7 @@ dependencies = [
 
 [[package]]
 name = "xos-wasm"
-version = "0.3.19-pre4"
+version = "0.3.19-pre5"
 dependencies = [
  "getrandom 0.3.4",
  "getrandom 0.4.2",
