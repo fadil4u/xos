@@ -34,6 +34,21 @@ jobs:
         shell: pwsh
         run: cargo build -p xos-cli --bin xos --release
 
+      - name: Publish cache results
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-cli-${{ github.sha }}
+          path: target/release/xos.exe
+          if-no-files-found: error
+
+      - name: Add CLI to PATH
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value "$pwd\target\release"
+
+      - name: Unit Tests
+        shell: pwsh
+        run: xos test
+
   macos:
     name: macOS compile
     runs-on: macos-latest
@@ -50,6 +65,21 @@ jobs:
       - name: Compile CLI
         shell: bash
         run: cargo build -p xos-cli --bin xos --release
+
+      - name: Publish cache results
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-cli-${{ github.sha }}
+          path: target/release/xos
+          if-no-files-found: error
+
+      - name: Add CLI to PATH
+        shell: bash
+        run: echo "$PWD/target/release" >> "$GITHUB_PATH"
+
+      - name: Unit Tests
+        shell: bash
+        run: xos test
 
   wasm:
     name: WASM compile
@@ -96,6 +126,7 @@ jobs:
   docker:
     name: Docker build
     runs-on: ubuntu-latest
+    needs: [windows, macos, wasm]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -119,7 +150,28 @@ jobs:
             echo "short_sha=${short_sha}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Publish cache results
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: xos-ci-test:latest
+          cache-from: |
+            type=registry,ref=xlateai/xos:prerelease
+            type=registry,ref=xlateai/xos:latest
+            type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Unit Tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/workspace" -w /workspace xos-ci-test:latest xos test
+
       - name: Build and push commit-tag image
+        if: ${{ success() }}
         uses: docker/build-push-action@v6
         with:
           context: .

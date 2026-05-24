@@ -3,10 +3,10 @@ name: CI
 on:
   push:
     branches:
-      - main
+      - "**"
   pull_request:
     branches:
-      - main
+      - "**"
   workflow_dispatch:
     inputs:
       force_compiler:
@@ -233,7 +233,7 @@ jobs:
     if: |
       always() &&
       (github.event_name == 'pull_request' && needs.enforce-pr-policy.result == 'success') ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.classify-version.outputs.run_compiler == 'true') ||
+      (github.event_name == 'push' && needs.classify-version.outputs.run_compiler == 'true') ||
       (github.event_name == 'workflow_dispatch' && needs.classify-version.outputs.run_compiler == 'true')
     uses: ./.github/workflows/compiler.yml
     with:
