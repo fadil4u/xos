@@ -666,20 +666,48 @@ fn write_flat_to_tensor(
         crate::tensor_buf::write_tensor_data_by_id(id, flat);
     }
     let dict = resolve_tensor_dict(tensor, vm)?;
+    let is_frame_backed = dict.get_item("_xos_frame_backing", vm).is_ok()
+        || dict.get_item("_xos_viewport_id", vm).is_ok();
     if dtype == DType::UInt8 {
         let bytes: Vec<u8> = flat.iter().map(|&v| v.clamp(0.0, 255.0) as u8).collect();
+        if is_frame_backed {
+            crate::xos_module::with_frame_write_buffer(vm, Some(tensor), |buffer| {
+                let n = buffer.len().min(bytes.len());
+                buffer[..n].copy_from_slice(&bytes[..n]);
+                crate::rasterizer::note_frame_cpu_write();
+                Ok(())
+            })?;
+        }
         dict.set_item(
             "_data",
             PyByteArray::new_ref(bytes, &vm.ctx).into(),
             vm,
         )?;
     } else if dtype.is_float() {
+        if is_frame_backed {
+            let bytes: Vec<u8> = flat.iter().map(|&v| v.clamp(0.0, 255.0) as u8).collect();
+            crate::xos_module::with_frame_write_buffer(vm, Some(tensor), |buffer| {
+                let n = buffer.len().min(bytes.len());
+                buffer[..n].copy_from_slice(&bytes[..n]);
+                crate::rasterizer::note_frame_cpu_write();
+                Ok(())
+            })?;
+        }
         let py: Vec<PyObjectRef> = flat
             .iter()
             .map(|&v| vm.ctx.new_float(v as f64).into())
             .collect();
         dict.set_item("_data", vm.ctx.new_list(py).into(), vm)?;
     } else {
+        if is_frame_backed {
+            let bytes: Vec<u8> = flat.iter().map(|&v| v.clamp(0.0, 255.0) as u8).collect();
+            crate::xos_module::with_frame_write_buffer(vm, Some(tensor), |buffer| {
+                let n = buffer.len().min(bytes.len());
+                buffer[..n].copy_from_slice(&bytes[..n]);
+                crate::rasterizer::note_frame_cpu_write();
+                Ok(())
+            })?;
+        }
         let py: Vec<PyObjectRef> = flat
             .iter()
             .map(|&v| vm.ctx.new_int(v as i64).into())

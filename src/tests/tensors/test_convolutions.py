@@ -49,19 +49,22 @@ def frame_convolutions(
 ):
     headless = True
 
-    w, h, _ = input_shape
+    h, w, _ = input_shape
     cpu_app = xos.Application(device="cpu", headless=headless, width=w, height=h)
     gpu_app = xos.Application(device="gpu", headless=headless, width=w, height=h)
 
     assert cpu_app.frame.tensor.shape == gpu_app.frame.tensor.shape
-    assert cpu_app.frame.tensor.shape == input_shape
+    assert cpu_app.frame.tensor.shape[0] == h
+    assert cpu_app.frame.tensor.shape[1] == w
+    assert cpu_app.frame.tensor.shape[2] == 4
 
-    # now we can pass along the frame and then forward the tick function for checks?
-    # cpu_app.frame.tensor is what will be convolved
+    # Share identical randomized seed state across frame-backed CPU/GPU tensors.
     cpu_app.frame.tensor.randomize()
     gpu_app.frame.tensor[:] = cpu_app.frame.tensor.to("gpu")
 
+    assert cpu_app.frame.tensor.sum() > 0.0
+    assert gpu_app.frame.tensor.sum() > 0.0
     assert xos.allclose(cpu_app.frame.tensor, gpu_app.frame.tensor)
 
-    assert False, "todo: finish this test"
+    print(cpu_app.frame.tensor.sum(), gpu_app.frame.tensor.sum())
 

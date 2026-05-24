@@ -1353,7 +1353,7 @@ class Application:
 
     function_calls = False
 
-    def __init__(self, headless=None, device=None):
+    def __init__(self, headless=None, device=None, width=None, height=None):
         import builtins
         next_id = int(getattr(builtins, "__xos_next_viewport_id__", 0))
         builtins.__xos_next_viewport_id__ = next_id + 1
@@ -1377,6 +1377,10 @@ class Application:
             self.headless = bool(headless)
         if device is not None:
             self.device = device
+        if width is not None:
+            self._xos_standalone_width = int(max(1, int(width)))
+        if height is not None:
+            self._xos_standalone_height = int(max(1, int(height)))
 
         self.verbosities = Verbosities()
         class_verb = getattr(type(self), "verbosities", None)
