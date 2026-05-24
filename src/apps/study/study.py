@@ -20,7 +20,8 @@ def _boxed_text(app, text, x1, y1, x2, y2, **kwargs):
 
 
 class StudyApp(xos.Application):
-    device = "gpu"
+    # Default CPU for stability; set to "gpu" explicitly when needed.
+    device = "cpu"
     # headless = True
 
     def __init__(self):

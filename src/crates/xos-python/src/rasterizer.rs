@@ -898,11 +898,51 @@ fn write_tensor_flat(tensor: &PyObjectRef, flat: &[f32], vm: &VirtualMachine) ->
             return Ok(());
         }
         if let Some(dict) = cur.downcast_ref::<PyDict>() {
+            let bytes: Vec<u8> = flat.iter().map(|v| v.clamp(0.0, 255.0) as u8).collect();
+            if let Ok(vid_obj) = dict.get_item("_xos_viewport_id", vm) {
+                if let Ok(vid) = vid_obj.try_into_value::<i64>(vm) {
+                    if crate::xos_module::write_standalone_frame_buffer(vid.max(0) as u64, &bytes) {
+                        return Ok(());
+                    }
+                }
+            }
+            if dict.get_item("_xos_frame_backing", vm).is_ok() {
+                if crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
+                    let buf = state.frame.staging_slice_mut_for_tick();
+                    let n = buf.len().min(bytes.len());
+                    buf[..n].copy_from_slice(&bytes[..n]);
+                    state.frame.mark_cpu_staging_dirty();
+                    true
+                })
+                .unwrap_or(false)
+                {
+                    return Ok(());
+                }
+                let buffer_guard = crate::rasterizer::CURRENT_FRAME_BUFFER
+                    .lock()
+                    .map_err(|_| vm.new_runtime_error("frame buffer lock poisoned".to_string()))?;
+                let width = *crate::rasterizer::CURRENT_FRAME_WIDTH
+                    .lock()
+                    .map_err(|_| vm.new_runtime_error("frame buffer lock poisoned".to_string()))?;
+                let height = *crate::rasterizer::CURRENT_FRAME_HEIGHT
+                    .lock()
+                    .map_err(|_| vm.new_runtime_error("frame buffer lock poisoned".to_string()))?;
+                if let Some(buffer_ptr) = buffer_guard.as_ref() {
+                    let len = width.saturating_mul(height).saturating_mul(4);
+                    let buffer = unsafe { std::slice::from_raw_parts_mut(buffer_ptr.as_ptr(), len) };
+                    let n = buffer.len().min(bytes.len());
+                    buffer[..n].copy_from_slice(&bytes[..n]);
+                    *crate::rasterizer::FRAME_CPU_WRITTEN
+                        .lock()
+                        .map_err(|_| vm.new_runtime_error("frame buffer lock poisoned".to_string()))? =
+                        true;
+                    return Ok(());
+                }
+            }
             if let Ok(inner) = dict.get_item("tensor", vm) {
                 cur = inner;
                 continue;
             }
-            let bytes: Vec<u8> = flat.iter().map(|v| v.clamp(0.0, 255.0) as u8).collect();
             dict.set_item(
                 "_data",
                 rustpython_vm::builtins::PyByteArray::new_ref(bytes, &vm.ctx).into(),
