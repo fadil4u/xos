@@ -462,6 +462,13 @@ fn convolve_frame_rgb_same_cpu_inplace(
         crate::rasterizer::note_frame_cpu_write();
         Ok(())
     })?;
+    // Keep frame tensor cache coherent for subsequent Python-side reads (e.g. `.sum()`).
+    let dict = resolve_tensor_dict(image_arg, vm)?;
+    dict.set_item(
+        "_data",
+        PyByteArray::new_ref(dst, &vm.ctx).into(),
+        vm,
+    )?;
     Ok(true)
 }
 
