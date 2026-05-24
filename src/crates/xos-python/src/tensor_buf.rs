@@ -184,6 +184,10 @@ pub fn tensor_flat_bytes(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<Vec
                 cur = item;
                 continue;
             }
+            if let Ok(item) = dict.get_item("tensor", vm) {
+                cur = item;
+                continue;
+            }
             if let Ok(vid_obj) = dict.get_item("_xos_viewport_id", vm) {
                 if let Ok(vid) = vid_obj.try_into_value::<i64>(vm) {
                     if let Some(bytes) = crate::xos_module::standalone_frame_buffer_copy(
@@ -254,6 +258,10 @@ pub fn tensor_flat_data_list(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult
                 cur = item;
                 continue;
             }
+            if let Ok(item) = dict.get_item("tensor", vm) {
+                cur = item;
+                continue;
+            }
             if let Ok(vid_obj) = dict.get_item("_xos_viewport_id", vm) {
                 if let Ok(vid) = vid_obj.try_into_value::<i64>(vm) {
                     if let Some(bytes) = crate::xos_module::standalone_frame_buffer_copy(
@@ -276,7 +284,7 @@ pub fn tensor_flat_data_list(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult
 
 pub fn tensor_shape_tuple(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<Vec<usize>> {
     let mut cur = obj.clone();
-    for _ in 0..8 {
+    for _ in 0..12 {
         if let Some(dict) = cur.downcast_ref::<PyDict>() {
             if let Ok(shape_obj) = dict.get_item("shape", vm) {
                 if let Some(tup) = shape_obj.downcast_ref::<PyTuple>() {
@@ -286,7 +294,26 @@ pub fn tensor_shape_tuple(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<Ve
                         .map(|s| s.clone().try_into_value::<i32>(vm).map(|i| i as usize))
                         .collect::<Result<Vec<_>, _>>();
                 }
+                if let Some(lst) = shape_obj.downcast_ref::<PyList>() {
+                    return lst
+                        .borrow_vec()
+                        .iter()
+                        .map(|s| s.clone().try_into_value::<i32>(vm).map(|i| i as usize))
+                        .collect::<Result<Vec<_>, _>>();
+                }
             }
+            if let Ok(item) = dict.get_item("tensor", vm) {
+                cur = item;
+                continue;
+            }
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "_data") {
+            cur = attr;
+            continue;
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "tensor") {
+            cur = attr;
+            continue;
         }
         if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "shape") {
             cur = attr;
@@ -297,8 +324,14 @@ pub fn tensor_shape_tuple(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<Ve
                     .map(|s| s.clone().try_into_value::<i32>(vm).map(|i| i as usize))
                     .collect::<Result<Vec<_>, _>>();
             }
+            if let Some(lst) = cur.downcast_ref::<PyList>() {
+                return lst
+                    .borrow_vec()
+                    .iter()
+                    .map(|s| s.clone().try_into_value::<i32>(vm).map(|i| i as usize))
+                    .collect::<Result<Vec<_>, _>>();
+            }
         }
-        break;
     }
     Err(vm.new_type_error("tensor missing shape".to_string()))
 }

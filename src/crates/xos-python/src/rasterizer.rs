@@ -891,18 +891,34 @@ fn parse_fill_colors(
 }
 
 fn write_tensor_flat(tensor: &PyObjectRef, flat: &[f32], vm: &VirtualMachine) -> PyResult<()> {
-    if let Some(id) = crate::xos_module::tensor_rust_id(tensor, vm) {
-        crate::tensor_buf::write_tensor_data_by_id(id, flat);
-        return Ok(());
-    }
-    if let Some(dict) = tensor.downcast_ref::<PyDict>() {
-        let bytes: Vec<u8> = flat.iter().map(|v| v.clamp(0.0, 255.0) as u8).collect();
-        dict.set_item(
-            "_data",
-            rustpython_vm::builtins::PyByteArray::new_ref(bytes, &vm.ctx).into(),
-            vm,
-        )?;
-        return Ok(());
+    let mut cur = tensor.clone();
+    for _ in 0..12 {
+        if let Some(id) = crate::xos_module::tensor_rust_id(&cur, vm) {
+            crate::tensor_buf::write_tensor_data_by_id(id, flat);
+            return Ok(());
+        }
+        if let Some(dict) = cur.downcast_ref::<PyDict>() {
+            if let Ok(inner) = dict.get_item("tensor", vm) {
+                cur = inner;
+                continue;
+            }
+            let bytes: Vec<u8> = flat.iter().map(|v| v.clamp(0.0, 255.0) as u8).collect();
+            dict.set_item(
+                "_data",
+                rustpython_vm::builtins::PyByteArray::new_ref(bytes, &vm.ctx).into(),
+                vm,
+            )?;
+            return Ok(());
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "_data") {
+            cur = attr;
+            continue;
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "tensor") {
+            cur = attr;
+            continue;
+        }
+        break;
     }
     Err(vm.new_type_error("fill: expected a tensor".to_string()))
 }

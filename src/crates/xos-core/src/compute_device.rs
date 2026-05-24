@@ -27,11 +27,11 @@ impl ComputeDevice {
         }
     }
 
-    /// Auto: GPU (WGPU / Metal / WebGPU) on all hosts; use `Some(Cpu)` to force CPU staging paths.
+    /// Auto policy: default to CPU until GPU kernels are explicitly requested.
     pub fn resolve_auto(pref: Option<Self>) -> Self {
         match pref {
             Some(d) => d,
-            None => ComputeDevice::Gpu,
+            None => ComputeDevice::Cpu,
         }
     }
 

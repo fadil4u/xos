@@ -1385,7 +1385,7 @@ class Application:
         fd["_xos_viewport_id"] = int(self._xos_viewport_id)
         self.frame = Frame(fd)
         self.mouse = {"x": 0.0, "y": 0.0, "is_left_clicking": False, "is_right_clicking": False}
-        xos.rasterizer.fill(self.frame, (0, 0, 0, 255))
+        xos.rasterizer.fill(self.frame.tensor, (0, 0, 0, 255))
         xos.frame._end_standalone()
 
     @property

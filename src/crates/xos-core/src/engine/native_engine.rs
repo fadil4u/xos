@@ -794,18 +794,38 @@ impl ApplicationHandler for AppStateWrapper {
             };
 
             let size = window.inner_size();
-            let surface_texture = SurfaceTexture::new(size.width, size.height, &window);
             let pixels = match {
                 #[cfg(not(target_os = "ios"))]
                 {
-                    PixelsBuilder::new(size.width, size.height, surface_texture)
+                    PixelsBuilder::new(
+                        size.width,
+                        size.height,
+                        SurfaceTexture::new(size.width, size.height, &window),
+                    )
                         .enable_vsync(false)
                         .device_descriptor_from_adapter(crate::gpu_present::shared_wgpu_device_descriptor)
                         .build()
+                        .or_else(|primary_err| {
+                            eprintln!(
+                                "Primary pixels device init failed ({}); retrying with default wgpu descriptor.",
+                                primary_err
+                            );
+                            PixelsBuilder::new(
+                                size.width,
+                                size.height,
+                                SurfaceTexture::new(size.width, size.height, &window),
+                            )
+                                .enable_vsync(false)
+                                .build()
+                        })
                 }
                 #[cfg(target_os = "ios")]
                 {
-                    PixelsBuilder::new(size.width, size.height, surface_texture)
+                    PixelsBuilder::new(
+                        size.width,
+                        size.height,
+                        SurfaceTexture::new(size.width, size.height, &window),
+                    )
                         .enable_vsync(false)
                         .build()
                 }
