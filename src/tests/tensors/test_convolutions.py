@@ -2,7 +2,8 @@ import xos
 
 
 @xos.test
-def test_convolutions():
+@xos.parametrize("inplace", [True, False])
+def convolutions(inplace: bool):
     kernel_shape = (3, 3, 3)
     input_shape = (128, 128, 3)
     dtype = xos.float32
@@ -14,8 +15,8 @@ def test_convolutions():
     gpu_x = cpu_x.to("gpu")
     gpu_kernel = cpu_kernel.to("gpu")
 
-    cpu_y = xos.ops.convolve(cpu_x, cpu_kernel, inplace=False)
-    gpu_y = xos.ops.convolve(gpu_x, gpu_kernel, inplace=False)
+    cpu_y = xos.ops.convolve(cpu_x, cpu_kernel, inplace=inplace)
+    gpu_y = xos.ops.convolve(gpu_x, gpu_kernel, inplace=inplace)
 
     print(cpu_y.sum(), gpu_y.sum())
     print(cpu_y.shape, gpu_y.shape)

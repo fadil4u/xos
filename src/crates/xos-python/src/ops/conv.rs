@@ -1,4 +1,5 @@
 use xos_core::compute_device::ComputeDevice;
+use rustpython_vm::builtins::{PyByteArray, PyDict};
 use rustpython_vm::{function::FuncArgs, PyObjectRef, PyResult, VirtualMachine};
 
 use crate::device_policy;
@@ -541,6 +542,133 @@ fn convolve_tensor_rgb_same_cpu_out(
     crate::tensors::wrap_tensor_dict(dict, vm)
 }
 
+fn resolve_tensor_dict(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<rustpython_vm::PyRef<PyDict>> {
+    let mut cur = obj.clone();
+    for _ in 0..12 {
+        if let Ok(dict) = cur.clone().downcast::<PyDict>() {
+            if dict.get_item("shape", vm).is_ok()
+                || dict.get_item("_data", vm).is_ok()
+                || dict.get_item("_rust_tensor", vm).is_ok()
+            {
+                return Ok(dict);
+            }
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "_data") {
+            cur = attr;
+            continue;
+        }
+        break;
+    }
+    Err(vm.new_type_error("expected a Tensor".to_string()))
+}
+
+fn write_flat_to_tensor(
+    tensor: &PyObjectRef,
+    flat: &[f32],
+    vm: &VirtualMachine,
+) -> PyResult<()> {
+    let dtype = crate::tensors::tensor_dtype_from_ref(tensor, vm)?;
+    if let Some(id) = crate::xos_module::tensor_rust_id(tensor, vm) {
+        crate::tensor_buf::write_tensor_data_by_id(id, flat);
+    }
+    let dict = resolve_tensor_dict(tensor, vm)?;
+    if dtype == DType::UInt8 {
+        let bytes: Vec<u8> = flat.iter().map(|&v| v.clamp(0.0, 255.0) as u8).collect();
+        dict.set_item(
+            "_data",
+            PyByteArray::new_ref(bytes, &vm.ctx).into(),
+            vm,
+        )?;
+    } else if dtype.is_float() {
+        let py: Vec<PyObjectRef> = flat
+            .iter()
+            .map(|&v| vm.ctx.new_float(v as f64).into())
+            .collect();
+        dict.set_item("_data", vm.ctx.new_list(py).into(), vm)?;
+    } else {
+        let py: Vec<PyObjectRef> = flat
+            .iter()
+            .map(|&v| vm.ctx.new_int(v as i64).into())
+            .collect();
+        dict.set_item("_data", vm.ctx.new_list(py).into(), vm)?;
+    }
+    Ok(())
+}
+
+fn convolve_tensor_rgb_same_cpu_inplace(
+    image_arg: &PyObjectRef,
+    vm: &VirtualMachine,
+    kernel_hwc: &[f32],
+    kernel_size: usize,
+    stride: usize,
+) -> PyResult {
+    if stride != 1 {
+        return Err(vm.new_value_error(
+            "convolve() tensor path currently requires stride=1".to_string(),
+        ));
+    }
+
+    let shape = tensor_shape_tuple(image_arg, vm)?;
+    if shape.len() < 3 {
+        return Err(vm.new_value_error(
+            "convolve() tensor path expects shape (H, W, C)".to_string(),
+        ));
+    }
+    let h = shape[0];
+    let w = shape[1];
+    let c = shape[2];
+    if c < 3 {
+        return Err(vm.new_value_error(
+            "convolve() tensor path expects at least 3 channels".to_string(),
+        ));
+    }
+
+    let src = tensor_flat_data_list(image_arg, vm)?;
+    let expected = h.saturating_mul(w).saturating_mul(c);
+    if src.len() < expected {
+        return Err(vm.new_value_error(format!(
+            "convolve(): tensor has {} elements, shape product is {}",
+            src.len(),
+            expected
+        )));
+    }
+
+    let mut out = src.clone();
+    let pad = (kernel_size.saturating_sub(1)) / 2;
+    for y in 0..h {
+        for x in 0..w {
+            let base = (y * w + x) * c;
+            for out_ch in 0..3 {
+                let mut sum = 0.0f32;
+                for ky in 0..kernel_size {
+                    let sy = y as isize + ky as isize - pad as isize;
+                    if sy < 0 || sy >= h as isize {
+                        continue;
+                    }
+                    for kx in 0..kernel_size {
+                        let sx = x as isize + kx as isize - pad as isize;
+                        if sx < 0 || sx >= w as isize {
+                            continue;
+                        }
+                        let src_base = (sy as usize * w + sx as usize) * c;
+                        for in_ch in 0..3 {
+                            let kval = kernel_hwc[(ky * kernel_size + kx) * 3 + in_ch];
+                            sum += src[src_base + in_ch] * kval;
+                        }
+                    }
+                }
+                out[base + out_ch] = sum;
+            }
+            for ch in 3..c {
+                out[base + ch] = src[base + ch];
+            }
+        }
+    }
+
+    write_flat_to_tensor(image_arg, &out, vm)?;
+    Ok(image_arg.clone())
+}
+
 /// xos.ops.convolve(frame.tensor, kernel, inplace=True)
 ///
 /// Dispatches to Burn on the frame GPU tensor only (same path as the TV demo).
@@ -593,9 +721,7 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let (kernel, kernel_size) = parse_rgb_kernel(kernel_arg, vm)?;
     if !device_policy::is_frame_backed_tensor(image_arg, vm) {
         if inplace {
-            return Err(vm.new_value_error(
-                "convolve(inplace=True) is only supported for frame.tensor".to_string(),
-            ));
+            return convolve_tensor_rgb_same_cpu_inplace(image_arg, vm, &kernel, kernel_size, stride);
         }
         return convolve_tensor_rgb_same_cpu_out(
             image_arg,
