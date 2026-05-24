@@ -208,23 +208,22 @@ jobs:
             echo "PRs into main must bump -preN in Cargo.toml."
             echo "Current:  ${{ needs.classify-version.outputs.current_version }}"
             echo "Against main: ${{ needs.classify-version.outputs.previous_version }}"
-            cat <<'EOF'
-
-# 📝 NOTICE:
-The reason for this failure is due to how our continuous integrations testing system works in regards to our pull requests in github.
-
-In order to run our compiler tests and unit suites, you must first ensure that you update the version contained within the base "Cargo.toml" file.
-
-In there under [workspace.package] you will see a "version" definition for the above listed versions. Please make sure to appropriately update this value so that when you push your commit to the pull request, it will in turn execute the full compiler and unit test suites.
-
-Upon passing each compiler run and subsequent unit tests, each checkmark will show green ✅, and you may merge your pull request.
-
-Please make sure to understand the versioning system. There is two components: major and pre. For general cases, you will likely only even add or update the -pre version. It should look something like "-pre0" or "-pre1" incrementally bumping as a revision.
-
-In case others are merging with the same version bumps, this will naturally sort itself out when other users go to pull the downstream changes, and the github CI run will fail because the main branch was updated and you must now bump again.
-
-Thank you, and have a good day. 🚀
-EOF
+            printf '%s\n' \
+              "" \
+              "# 📝 NOTICE:" \
+              "The reason for this failure is due to how our continuous integrations testing system works in regards to our pull requests in github." \
+              "" \
+              "In order to run our compiler tests and unit suites, you must first ensure that you update the version contained within the base \"Cargo.toml\" file." \
+              "" \
+              "In there under [workspace.package] you will see a \"version\" definition for the above listed versions. Please make sure to appropriately update this value so that when you push your commit to the pull request, it will in turn execute the full compiler and unit test suites." \
+              "" \
+              "Upon passing each compiler run and subsequent unit tests, each checkmark will show green ✅, and you may merge your pull request." \
+              "" \
+              "Please make sure to understand the versioning system. There is two components: major and pre. For general cases, you will likely only even add or update the -pre version. It should look something like \"-pre0\" or \"-pre1\" incrementally bumping as a revision." \
+              "" \
+              "In case others are merging with the same version bumps, this will naturally sort itself out when other users go to pull the downstream changes, and the github CI run will fail because the main branch was updated and you must now bump again." \
+              "" \
+              "Thank you, and have a good day. 🚀"
             exit 1
           fi
 
