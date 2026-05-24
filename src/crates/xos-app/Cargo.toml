@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-xos-core = { path = "../xos-core" }
+xos-core = { path = "../xos-core", default-features = false }
 xos-python = { path = "../xos-python" }
 xos-auth = { path = "../xos-auth" }
 xos-mesh = { path = "../xos-mesh" }
@@ -45,6 +45,9 @@ ort = { version = "2.0.0-rc.12", optional = true, default-features = false, feat
 xcap = "0.9.4"
 enigo = "0.1"
 screencapturekit = { version = "1.5.4", features = ["macos_13_0"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = { version = "0.3", features = ["windef", "wingdi", "winuser"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

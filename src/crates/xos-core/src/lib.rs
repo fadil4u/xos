@@ -77,6 +77,23 @@ pub fn is_xos_project_root(path: &Path) -> bool {
         .exists()
 }
 
+#[cfg(windows)]
+fn normalize_windows_path(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
+#[cfg(not(windows))]
+fn normalize_windows_path(path: PathBuf) -> PathBuf {
+    path
+}
+
 /// If `exe` is `.../target/{release|debug}/xos(.exe)`, or
 /// `.../target/{standard|ios|wasm}/{release|debug}/xos(.exe)`, returns the repo root.
 fn project_root_from_target_executable(exe: &Path) -> Option<PathBuf> {
@@ -114,8 +131,8 @@ fn project_root_from_target_executable(exe: &Path) -> Option<PathBuf> {
         return None;
     }
     match std::fs::canonicalize(&root) {
-        Ok(c) if is_xos_project_root(&c) => Some(c),
-        Ok(_) | Err(_) => Some(root),
+        Ok(c) if is_xos_project_root(&c) => Some(normalize_windows_path(c)),
+        Ok(_) | Err(_) => Some(normalize_windows_path(root)),
     }
 }
 

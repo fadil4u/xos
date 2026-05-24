@@ -7,8 +7,8 @@ description = "CLI and compiler for xos"
 default-run = "xos"
 
 [dependencies]
-xos = { path = "../../.." }
-xos-core = { path = "../xos-core" }
+xos = { path = "../../..", default-features = false }
+xos-core = { path = "../xos-core", default-features = false }
 xos-app = { path = "../xos-app" }
 xos-python = { path = "../xos-python" }
 clap = { version = "4.4.10", features = ["derive"] }

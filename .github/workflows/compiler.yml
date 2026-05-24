@@ -1,0 +1,132 @@
+name: Compiler Suite
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version under test
+        required: true
+        type: string
+      wasm_artifact_name:
+        description: Uploaded wasm artifact name
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  windows:
+    name: Windows compile
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compile CLI
+        shell: pwsh
+        run: cargo build -p xos-cli --bin xos --release
+
+  macos:
+    name: macOS compile
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compile CLI
+        shell: bash
+        run: cargo build -p xos-cli --bin xos --release
+
+  wasm:
+    name: WASM compile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      - name: Install Linux native deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev
+
+      - name: Build wasm archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -p xos-cli --bin xos -- compile --wasm
+          test -s target/wasm/main/xos-wasm.zip
+          ls -lh target/wasm/main/xos-wasm.zip
+
+      - name: Upload wasm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.wasm_artifact_name }}
+          path: target/wasm/main/xos-wasm.zip
+          if-no-files-found: error
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute Docker tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::12}"
+          {
+            echo "short_sha=${short_sha}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push commit-tag image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          cache-from: |
+            type=registry,ref=xlateai/xos:prerelease
+            type=registry,ref=xlateai/xos:latest
+          tags: |
+            xlateai/xos:${{ steps.tags.outputs.short_sha }}
