@@ -920,6 +920,12 @@ impl ApplicationHandler for AppStateWrapper {
                 event_loop.exit();
                 return;
             }
+            #[cfg(not(target_os = "ios"))]
+            if used_default_wgpu_descriptor {
+                // Keep compute on GPU if requested, but force CPU-present fallback when
+                // the shared descriptor path failed; app.setup() may have re-enabled it.
+                engine_state.frame.set_gpu_present_enabled(false);
+            }
 
             let app =
                 std::mem::replace(&mut self.app, Box::new(crate::blank_app::BlankApp::new()));
