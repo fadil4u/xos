@@ -2,7 +2,7 @@ import xos
 
 
 class TVApp(xos.Application):
-    device = "gpu"
+    device = "cpu"  # TODO: gpu is all black screened.
 
     def __init__(self):
         super().__init__()
