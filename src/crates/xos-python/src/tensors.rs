@@ -193,8 +193,17 @@ pub fn tensor_mean(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
 pub fn tensor_sum(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let obj = first_arg_tensor(&args, vm, "_tensor_sum")?;
+    let out_dtype = if args.args.len() > 1 && !vm.is_none(&args.args[1]) {
+        DType::from_py_object(&args.args[1], vm).unwrap_or(DType::Int32)
+    } else if let Some(dtype_kwarg) = args.kwargs.get("dtype") {
+        DType::from_py_object(dtype_kwarg, vm).unwrap_or(DType::Int32)
+    } else {
+        DType::Int32
+    };
     let s = tensor_sum_scalar(obj, vm)?;
-    Ok(vm.ctx.new_float(s).into())
+    let value = out_dtype.cast_from_f32(s as f32);
+    let py_tensor = create_tensor_from_data(vec![value], vec![1], out_dtype);
+    wrap_tensor_dict(py_tensor.to_py_dict(vm, out_dtype)?, vm)
 }
 
 pub(crate) fn wrap_tensor_dict(dict: rustpython_vm::PyObjectRef, vm: &VirtualMachine) -> PyResult {
@@ -336,18 +345,40 @@ pub fn tensor_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             return crate::pack::tensor_from_pack_string(&text, vm);
         }
     }
-    let dtype = if args_vec.len() > 2 && !vm.is_none(&args_vec[2]) {
-        DType::from_py_object(&args_vec[2], vm).unwrap_or(DType::Float32)
+    let explicit_dtype = if args_vec.len() > 2 && !vm.is_none(&args_vec[2]) {
+        Some(DType::from_py_object(&args_vec[2], vm).unwrap_or(DType::Float32))
     } else if let Some(dtype_kwarg) = args.kwargs.get("dtype") {
-        DType::from_py_object(dtype_kwarg, vm).unwrap_or(DType::Float32)
+        Some(DType::from_py_object(dtype_kwarg, vm).unwrap_or(DType::Float32))
     } else {
-        DType::Float32
+        None
     };
+    let looks_like_bool = || {
+        if data_arg.clone().try_into_value::<bool>(vm).is_err() {
+            return false;
+        }
+        if let Ok(s) = data_arg.str(vm) {
+            let text = s.to_string();
+            return text == "True" || text == "False";
+        }
+        false
+    };
+    let inferred_scalar_dtype = if explicit_dtype.is_none() {
+        if looks_like_bool() {
+            Some(DType::Bool)
+        } else if data_arg.clone().try_into_value::<i64>(vm).is_ok() {
+            Some(DType::Int32)
+        } else if data_arg.clone().try_into_value::<f64>(vm).is_ok() {
+            Some(DType::Float32)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let dtype = explicit_dtype
+        .or(inferred_scalar_dtype)
+        .unwrap_or(DType::Float32);
 
-    let data_list = data_arg
-        .downcast_ref::<rustpython_vm::builtins::PyList>()
-        .ok_or_else(|| vm.new_type_error("data must be a list".to_string()))?;
-    let data_vec = data_list.borrow_vec();
     let mut flat_data = Vec::new();
     fn flatten_list(
         obj: &rustpython_vm::PyObjectRef,
@@ -367,8 +398,61 @@ pub fn tensor_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         }
         Ok(())
     }
-    for item in data_vec.iter() {
-        flatten_list(item, &mut flat_data, vm)?;
+    if let Some(data_list) = data_arg.downcast_ref::<rustpython_vm::builtins::PyList>() {
+        for item in data_list.borrow_vec().iter() {
+            flatten_list(item, &mut flat_data, vm)?;
+        }
+    } else if let Some(data_tuple) = data_arg.downcast_ref::<rustpython_vm::builtins::PyTuple>() {
+        for item in data_tuple.as_slice().iter() {
+            flatten_list(item, &mut flat_data, vm)?;
+        }
+    } else if looks_like_bool() {
+        let v = data_arg.clone().try_into_value::<bool>(vm).unwrap_or(false);
+        flat_data.push(if v { 1.0 } else { 0.0 });
+    } else if let Ok(v) = data_arg.clone().try_into_value::<i64>(vm) {
+        flat_data.push(v as f32);
+    } else if let Ok(v) = data_arg.clone().try_into_value::<f64>(vm) {
+        flat_data.push(v as f32);
+    } else {
+        return Err(vm.new_type_error(
+            "data must be a number, tuple, or list".to_string(),
+        ));
+    }
+
+    fn infer_shape(obj: &rustpython_vm::PyObjectRef) -> Option<Vec<usize>> {
+        if let Some(list) = obj.downcast_ref::<rustpython_vm::builtins::PyList>() {
+            let items = list.borrow_vec();
+            let n = items.len();
+            if n == 0 {
+                return Some(vec![0]);
+            }
+            let first = infer_shape(&items[0])?;
+            for item in items.iter().skip(1) {
+                if infer_shape(item)? != first {
+                    return None;
+                }
+            }
+            let mut shape = vec![n];
+            shape.extend(first);
+            return Some(shape);
+        }
+        if let Some(tup) = obj.downcast_ref::<rustpython_vm::builtins::PyTuple>() {
+            let items = tup.as_slice();
+            let n = items.len();
+            if n == 0 {
+                return Some(vec![0]);
+            }
+            let first = infer_shape(&items[0])?;
+            for item in items.iter().skip(1) {
+                if infer_shape(item)? != first {
+                    return None;
+                }
+            }
+            let mut shape = vec![n];
+            shape.extend(first);
+            return Some(shape);
+        }
+        Some(vec![])
     }
 
     let shape = if args_vec.len() > 1 {
@@ -390,7 +474,10 @@ pub fn tensor_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             vec![flat_data.len()]
         }
     } else {
-        vec![flat_data.len()]
+        match infer_shape(data_arg) {
+            Some(s) if !s.is_empty() => s,
+            _ => vec![flat_data.len()],
+        }
     };
     let casted_data: Vec<f32> = flat_data.iter().map(|&v| dtype.cast_from_f32(v)).collect();
     let py_tensor = create_tensor_from_data(casted_data, shape, dtype);

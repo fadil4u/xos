@@ -34,7 +34,9 @@ def test_rectangles(dtype):
     pixel_area = (tensor > 0).sum(dtype=xos.uint8)
     assert pixel_area.dtype == xos.uint8
     print(pixel_area)
-    assert pixel_area == 100
+    expected_pixel_area = sum(tuple_area_check(xy0, xy1) for xy0, xy1 in rect_coords)
+    expected_pixel_area = xos.tensor(expected_pixel_area, dtype=xos.uint8)
+    assert pixel_area == expected_pixel_area, f"{pixel_area} != {expected_pixel_area}"
     
     # compare tensor operation of calculation for the areas with the tuple for loop method
     tensor_area_vector = (rects[:, 1, 0] - rects[:, 0, 0]) * (rects[:, 1, 1] - rects[:, 0, 1])

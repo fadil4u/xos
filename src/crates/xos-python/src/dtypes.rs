@@ -190,6 +190,16 @@ class DType:
     
     def __repr__(self):
         return self.__str__()
+
+    def __eq__(self, other):
+        if hasattr(other, "name"):
+            return self.name == other.name
+        if isinstance(other, str):
+            return self.name == other
+        return False
+
+    def __hash__(self):
+        return hash(self.name)
 "#;
 
 /// Create the dtypes module with all dtype constants

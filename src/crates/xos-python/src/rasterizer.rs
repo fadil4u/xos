@@ -892,12 +892,16 @@ fn parse_fill_colors(
 
 fn write_tensor_flat(tensor: &PyObjectRef, flat: &[f32], vm: &VirtualMachine) -> PyResult<()> {
     let mut cur = tensor.clone();
+    let mut wrote_registry = false;
     for _ in 0..12 {
-        if let Some(id) = crate::xos_module::tensor_rust_id(&cur, vm) {
-            crate::tensor_buf::write_tensor_data_by_id(id, flat);
-            return Ok(());
+        if !wrote_registry {
+            if let Some(id) = crate::xos_module::tensor_rust_id(&cur, vm) {
+                crate::tensor_buf::write_tensor_data_by_id(id, flat);
+                wrote_registry = true;
+            }
         }
         if let Some(dict) = cur.downcast_ref::<PyDict>() {
+            let dtype = crate::tensors::tensor_dtype_from_ref(tensor, vm).unwrap_or(crate::dtypes::DType::Float32);
             let bytes: Vec<u8> = flat.iter().map(|v| v.clamp(0.0, 255.0) as u8).collect();
             if let Ok(vid_obj) = dict.get_item("_xos_viewport_id", vm) {
                 if let Ok(vid) = vid_obj.try_into_value::<i64>(vm) {
@@ -943,11 +947,25 @@ fn write_tensor_flat(tensor: &PyObjectRef, flat: &[f32], vm: &VirtualMachine) ->
                 cur = inner;
                 continue;
             }
-            dict.set_item(
-                "_data",
-                rustpython_vm::builtins::PyByteArray::new_ref(bytes, &vm.ctx).into(),
-                vm,
-            )?;
+            if dtype == crate::dtypes::DType::UInt8 {
+                dict.set_item(
+                    "_data",
+                    rustpython_vm::builtins::PyByteArray::new_ref(bytes, &vm.ctx).into(),
+                    vm,
+                )?;
+            } else if dtype.is_float() {
+                let py: Vec<PyObjectRef> = flat
+                    .iter()
+                    .map(|&v| vm.ctx.new_float(v as f64).into())
+                    .collect();
+                dict.set_item("_data", vm.ctx.new_list(py).into(), vm)?;
+            } else {
+                let py: Vec<PyObjectRef> = flat
+                    .iter()
+                    .map(|&v| vm.ctx.new_int(v as i64).into())
+                    .collect();
+                dict.set_item("_data", vm.ctx.new_list(py).into(), vm)?;
+            }
             return Ok(());
         }
         if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "_data") {
@@ -1617,18 +1635,7 @@ fn fill_rectangles(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         fill_pixel_rect(x1, y1, x2, y2, cr, cg, cb, ca);
     }
 
-    if let Some(id) = crate::xos_module::tensor_rust_id(tensor, vm) {
-        crate::tensor_buf::write_tensor_data_by_id(id, &flat);
-    } else if let Some(dict) = tensor.downcast_ref::<rustpython_vm::builtins::PyDict>() {
-        let bytes: Vec<u8> = flat.iter().map(|v| v.clamp(0.0, 255.0) as u8).collect();
-        dict.set_item(
-            "_data",
-            rustpython_vm::builtins::PyByteArray::new_ref(bytes, &vm.ctx).into(),
-            vm,
-        )?;
-    } else {
-        return Err(vm.new_type_error("fill_rectangles: expected a tensor".to_string()));
-    }
+    write_tensor_flat(tensor, &flat, vm)?;
 
     Ok(vm.ctx.none())
 }

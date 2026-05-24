@@ -569,6 +569,31 @@ class Tensor:
                 and all(type(x) is int for x in key)
             ):
                 return self._getitem_int_index(key)
+        if isinstance(key, tuple):
+            shape = tuple(self.shape)
+            flat = self._data["_data"]
+            if (
+                len(shape) == 3
+                and len(key) == 3
+                and isinstance(key[0], slice)
+                and isinstance(key[1], int)
+                and isinstance(key[2], int)
+            ):
+                rows = list(range(*key[0].indices(shape[0])))
+                j = int(key[1])
+                k = int(key[2])
+                if j < 0:
+                    j += shape[1]
+                if k < 0:
+                    k += shape[2]
+                if j < 0 or j >= shape[1] or k < 0 or k >= shape[2]:
+                    raise IndexError("tensor index out of range")
+                out = []
+                stride_row = shape[1] * shape[2]
+                for i in rows:
+                    base = i * stride_row + j * shape[2] + k
+                    out.append(flat[base])
+                return self._wrap_vals((len(rows),), out)
         if isinstance(key, tuple) and len(key) == 2:
             a, b = key
             shape = tuple(self.shape)
@@ -867,6 +892,16 @@ class Tensor:
         return self._cmp_broadcast(other, lambda a, b: 1.0 if a > b else 0.0)
 
     def __eq__(self, other):
+        self._ensure_flat()
+        left = self._flat_storage()
+        if left is not None and self._flat_len(left) == 1:
+            if isinstance(other, Tensor):
+                other._ensure_flat()
+                right = other._flat_storage()
+                if right is not None and other._flat_len(right) == 1:
+                    return self._flat_get(left, 0) == other._flat_get(right, 0)
+            if isinstance(other, (int, float, bool)):
+                return self._flat_get(left, 0) == float(other)
         return self._cmp_broadcast(other, lambda a, b: 1.0 if a == b else 0.0)
 
     def __invert__(self):
@@ -1162,14 +1197,14 @@ class Tensor:
             )
         if axis is not None:
             raise NotImplementedError("Tensor.sum(axis=...) is not implemented yet")
-        if dtype is not None:
-            raise NotImplementedError("Tensor.sum(dtype=...) is not implemented yet")
         if out is not None:
             raise NotImplementedError("Tensor.sum(out=...) is not implemented yet")
         if keepdims:
             raise NotImplementedError("Tensor.sum(keepdims=True) is not implemented yet")
         import xos
-        return xos._tensor_sum(self)
+        if dtype is None:
+            return xos._tensor_sum(self)
+        return xos._tensor_sum(self, dtype=dtype)
 
     def tostring(self, full=False):
         """Human-readable string; ``full=True`` prints every element."""
@@ -1194,6 +1229,19 @@ class Tensor:
     def _summary_string(self):
         if "_data" not in self._data:
             return "xos.Tensor(shape={}, dtype=u8)".format(self.shape)
+        self._ensure_flat()
+        flat = self._flat_storage()
+        if flat is not None and self._flat_len(flat) == 1:
+            v = self._flat_get(flat, 0)
+            if self.dtype == "bool":
+                scalar = "True" if int(v) != 0 else "False"
+            elif self.dtype.startswith("int") or self.dtype.startswith("uint"):
+                scalar = str(int(v))
+            else:
+                scalar = str(float(v))
+            return "xos.Tensor({}, dtype={}, device={!r})".format(
+                scalar, self.dtype, self.device
+            )
         import xos
 
         try:
