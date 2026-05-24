@@ -464,6 +464,83 @@ fn convolve_frame_rgb_same_cpu_inplace(
     Ok(true)
 }
 
+fn convolve_tensor_rgb_same_cpu_out(
+    image_arg: &PyObjectRef,
+    vm: &VirtualMachine,
+    kernel_hwc: &[f32],
+    kernel_size: usize,
+    stride: usize,
+    out_device: &str,
+) -> PyResult {
+    if stride != 1 {
+        return Err(vm.new_value_error(
+            "convolve() tensor path currently requires stride=1".to_string(),
+        ));
+    }
+
+    let shape = tensor_shape_tuple(image_arg, vm)?;
+    if shape.len() < 3 {
+        return Err(vm.new_value_error(
+            "convolve() tensor path expects shape (H, W, C)".to_string(),
+        ));
+    }
+    let h = shape[0];
+    let w = shape[1];
+    let c = shape[2];
+    if c < 3 {
+        return Err(vm.new_value_error(
+            "convolve() tensor path expects at least 3 channels".to_string(),
+        ));
+    }
+
+    let src = tensor_flat_data_list(image_arg, vm)?;
+    let expected = h.saturating_mul(w).saturating_mul(c);
+    if src.len() < expected {
+        return Err(vm.new_value_error(format!(
+            "convolve(): tensor has {} elements, shape product is {}",
+            src.len(),
+            expected
+        )));
+    }
+
+    let mut out = vec![0.0f32; expected];
+    let pad = (kernel_size.saturating_sub(1)) / 2;
+    for y in 0..h {
+        for x in 0..w {
+            let base = (y * w + x) * c;
+            for out_ch in 0..3 {
+                let mut sum = 0.0f32;
+                for ky in 0..kernel_size {
+                    let sy = y as isize + ky as isize - pad as isize;
+                    if sy < 0 || sy >= h as isize {
+                        continue;
+                    }
+                    for kx in 0..kernel_size {
+                        let sx = x as isize + kx as isize - pad as isize;
+                        if sx < 0 || sx >= w as isize {
+                            continue;
+                        }
+                        let src_base = (sy as usize * w + sx as usize) * c;
+                        for in_ch in 0..3 {
+                            let kval = kernel_hwc[(ky * kernel_size + kx) * 3 + in_ch];
+                            sum += src[src_base + in_ch] * kval;
+                        }
+                    }
+                }
+                out[base + out_ch] = sum;
+            }
+            // Preserve alpha/extra channels to match frame behavior.
+            for ch in 3..c {
+                out[base + ch] = src[base + ch];
+            }
+        }
+    }
+
+    let tensor = create_tensor_from_data(out, vec![h, w, c], DType::Float32);
+    let dict = tensor.to_py_dict_on(vm, DType::Float32, out_device)?;
+    crate::tensors::wrap_tensor_dict(dict, vm)
+}
+
 /// xos.ops.convolve(frame.tensor, kernel, inplace=True)
 ///
 /// Dispatches to Burn on the frame GPU tensor only (same path as the TV demo).
@@ -513,14 +590,23 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             ("kernel", kernel_dev.clone()),
         ],
     )?;
+    let (kernel, kernel_size) = parse_rgb_kernel(kernel_arg, vm)?;
     if !device_policy::is_frame_backed_tensor(image_arg, vm) {
-        return Err(vm.new_value_error(
-            "convolve() with KxKx3 RGB kernel requires frame.tensor; use a KxK kernel for simulation tensors"
-                .to_string(),
-        ));
+        if inplace {
+            return Err(vm.new_value_error(
+                "convolve(inplace=True) is only supported for frame.tensor".to_string(),
+            ));
+        }
+        return convolve_tensor_rgb_same_cpu_out(
+            image_arg,
+            vm,
+            &kernel,
+            kernel_size,
+            stride,
+            &frame_dev,
+        );
     }
 
-    let (kernel, kernel_size) = parse_rgb_kernel(kernel_arg, vm)?;
     let engine_dev = device_policy::require_engine_device(vm, "convolve", &frame_dev)?;
     if engine_dev != ComputeDevice::Gpu {
         if inplace {

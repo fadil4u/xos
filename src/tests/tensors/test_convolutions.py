@@ -18,6 +18,9 @@ def test_convolutions():
     gpu_y = xos.ops.convolve(gpu_x, gpu_kernel, inplace=False)
 
     print(cpu_y.sum(), gpu_y.sum())
+    print(cpu_y.shape, gpu_y.shape)
 
     assert cpu_y.shape == gpu_y.shape
     assert xos.allclose(cpu_y, gpu_y)
+
+    # TODO: same test, but inside of an xos.Application with the Frame's tensor (graphical backing)
