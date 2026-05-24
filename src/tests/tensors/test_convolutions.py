@@ -62,9 +62,31 @@ def frame_convolutions(
     cpu_app.frame.tensor.randomize()
     gpu_app.frame.tensor[:] = cpu_app.frame.tensor.to("gpu")
 
+    # check devices are correct
+    assert cpu_app.frame.tensor.device == "cpu"
+    assert gpu_app.frame.tensor.device == "gpu"
+
     assert cpu_app.frame.tensor.sum() > 0.0
     assert gpu_app.frame.tensor.sum() > 0.0
     assert xos.allclose(cpu_app.frame.tensor, gpu_app.frame.tensor)
 
     print(cpu_app.frame.tensor.sum(), gpu_app.frame.tensor.sum())
 
+    # now try the convolution and kernel initializations
+    cpu_kernel = xos.random.uniform(0.0, 1.0, shape=kernel_shape, dtype=dtype, device="cpu")
+    gpu_kernel = cpu_kernel.to("gpu")
+
+    assert cpu_kernel.sum() > 0.0
+    assert gpu_kernel.sum() > 0.0
+    assert xos.allclose(cpu_kernel, gpu_kernel)
+
+    print(cpu_kernel.sum(), gpu_kernel.sum())
+
+    # now try the convolution
+    cpu_y = xos.ops.convolve(cpu_app.frame.tensor, cpu_kernel, inplace=inplace)
+    gpu_y = xos.ops.convolve(gpu_app.frame.tensor, gpu_kernel, inplace=inplace)
+
+    print(cpu_y.sum(), gpu_y.sum())
+    print(cpu_y.shape, gpu_y.shape)
+    assert cpu_y.shape == gpu_y.shape
+    assert xos.allclose(cpu_y, gpu_y)
