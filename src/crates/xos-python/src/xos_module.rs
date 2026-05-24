@@ -1753,6 +1753,13 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
         .unwrap();
     module
         .set_attr(
+            "_tensor_sum",
+            vm.new_function("_tensor_sum", crate::tensors::tensor_sum),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr(
             "_tensor_min_max_mean",
             vm.new_function(
                 "_tensor_min_max_mean",

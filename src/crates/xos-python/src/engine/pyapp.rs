@@ -1153,6 +1153,24 @@ class Tensor:
 
         return xos._tensor_mean(self)
 
+    def sum(self, axis=None, dtype=None, out=None, keepdims=False, **kwargs):
+        """Arithmetic sum over the flat buffer (numpy-style ``axis=None`` default)."""
+        if kwargs:
+            raise TypeError(
+                "Tensor.sum() got unexpected keyword arguments: "
+                + ", ".join(sorted(kwargs.keys()))
+            )
+        if axis is not None:
+            raise NotImplementedError("Tensor.sum(axis=...) is not implemented yet")
+        if dtype is not None:
+            raise NotImplementedError("Tensor.sum(dtype=...) is not implemented yet")
+        if out is not None:
+            raise NotImplementedError("Tensor.sum(out=...) is not implemented yet")
+        if keepdims:
+            raise NotImplementedError("Tensor.sum(keepdims=True) is not implemented yet")
+        import xos
+        return xos._tensor_sum(self)
+
     def tostring(self, full=False):
         """Human-readable string; ``full=True`` prints every element."""
         if not full:

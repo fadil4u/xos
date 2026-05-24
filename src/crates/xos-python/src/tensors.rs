@@ -111,6 +111,18 @@ fn tensor_min_max_mean_triplet(obj: PyObjectRef, vm: &VirtualMachine) -> PyResul
     ))
 }
 
+fn tensor_sum_scalar(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<f64> {
+    // Use the common tensor resolver so frame-backed tensors (no persistent `_data`)
+    // and registry-backed tensors reduce correctly.
+    let flat = tensor_flat_data_list(&obj, vm)?;
+    if flat.is_empty() {
+        return Err(vm.new_value_error(
+            "zero-size array to reduction operation which has no identity".to_string(),
+        ));
+    }
+    Ok(flat.iter().map(|&v| v as f64).sum())
+}
+
 fn first_arg_tensor(args: &FuncArgs, vm: &VirtualMachine, name: &str) -> PyResult<PyObjectRef> {
     args.args
         .first()
@@ -177,6 +189,12 @@ pub fn tensor_mean(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let obj = first_arg_tensor(&args, vm, "_tensor_mean")?;
     let (_, _, av) = tensor_min_max_mean_triplet(obj, vm)?;
     Ok(vm.ctx.new_float(av).into())
+}
+
+pub fn tensor_sum(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let obj = first_arg_tensor(&args, vm, "_tensor_sum")?;
+    let s = tensor_sum_scalar(obj, vm)?;
+    Ok(vm.ctx.new_float(s).into())
 }
 
 pub(crate) fn wrap_tensor_dict(dict: rustpython_vm::PyObjectRef, vm: &VirtualMachine) -> PyResult {

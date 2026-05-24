@@ -175,6 +175,15 @@ impl AppState {
 
     /// Point `EngineState::frame` writes at the live `pixels` surface buffer (windowed native).
     fn bind_pixels_mirror(&mut self) -> bool {
+        // In GPU-compute + CPU-present fallback mode, avoid mirror binding.
+        // We want staging-owned bytes and an explicit copy path to pixels.frame_mut().
+        if self.engine_state.compute_device == ComputeDevice::Gpu
+            && !self.engine_state.frame.gpu_present_enabled()
+        {
+            self.engine_state.frame.clear_pixels_mirror_buffer();
+            return false;
+        }
+
         let expected_len = (self.size.width as usize)
             .saturating_mul(self.size.height as usize)
             .saturating_mul(4);
@@ -318,6 +327,18 @@ impl AppState {
         tick_f3_menu(&mut self.engine_state);
 
         if mirror_ok {
+            // Fallback mode: GPU compute is active but direct GPU present is disabled
+            // (e.g. adapter/descriptor mismatch). Mirror the latest staging frame into
+            // pixels' CPU frame so render() presents real content instead of black.
+            if self.engine_state.compute_device == ComputeDevice::Gpu
+                && !self.engine_state.frame.gpu_present_enabled()
+            {
+                let src = self.engine_state.frame.data().to_vec();
+                let dst = self.pixels.frame_mut();
+                if dst.len() == src.len() {
+                    dst.copy_from_slice(&src);
+                }
+            }
             self.engine_state.frame.clear_pixels_mirror_buffer();
             let _ = self.render_pixels();
         } else {
@@ -794,6 +815,8 @@ impl ApplicationHandler for AppStateWrapper {
             };
 
             let size = window.inner_size();
+            #[cfg(not(target_os = "ios"))]
+            let mut used_default_wgpu_descriptor = false;
             let pixels = match {
                 #[cfg(not(target_os = "ios"))]
                 {
@@ -806,6 +829,7 @@ impl ApplicationHandler for AppStateWrapper {
                         .device_descriptor_from_adapter(crate::gpu_present::shared_wgpu_device_descriptor)
                         .build()
                         .or_else(|primary_err| {
+                            used_default_wgpu_descriptor = true;
                             if std::env::var("XOS_LOG_WGPU_FALLBACK")
                                 .ok()
                                 .as_deref()
@@ -847,6 +871,10 @@ impl ApplicationHandler for AppStateWrapper {
             let burn_device = crate::gpu_present::burn_device_from_pixels(&pixels);
             #[cfg(target_os = "ios")]
             let burn_device = xos_tensor::XosDevice::default();
+            #[cfg(not(target_os = "ios"))]
+            let gpu_present_enabled = !used_default_wgpu_descriptor;
+            #[cfg(target_os = "ios")]
+            let gpu_present_enabled = true;
             let safe_region = SafeRegionBoundingRectangle::full_screen();
             let mut engine_state = EngineState {
                 frame: FrameState::new_with_device(
@@ -854,7 +882,7 @@ impl ApplicationHandler for AppStateWrapper {
                     size.height,
                     safe_region,
                     burn_device,
-                    true,
+                    gpu_present_enabled,
                 ),
                 compute_device: ComputeDevice::resolve_auto(None),
                 mouse: MouseState {

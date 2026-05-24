@@ -480,7 +480,9 @@ fn uniform_fill(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     }
 
     crate::xos_module::with_frame_write_buffer(vm, Some(tensor_hint), |buffer| {
-        fill_buffer_uniform_random(buffer, low, high, vm)?;
+        // Frame buffers are RGBA display surfaces; keep alpha opaque so random fills
+        // (e.g. TV static) don't appear black due to accidental transparency.
+        fill_buffer_uniform_random_rgba_opaque(buffer, low, high, vm)?;
         let _ = crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
             state.frame.mark_cpu_staging_dirty();
         });
@@ -555,6 +557,19 @@ fn fill_buffer_uniform_random(
         });
         Ok(())
     }
+}
+
+fn fill_buffer_uniform_random_rgba_opaque(
+    buffer: &mut [u8],
+    low: f64,
+    high: f64,
+    vm: &VirtualMachine,
+) -> PyResult<()> {
+    fill_buffer_uniform_random(buffer, low, high, vm)?;
+    for px in buffer.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    Ok(())
 }
 
 /// xos.random.randint(a, b) -> int in the inclusive range [a, b]

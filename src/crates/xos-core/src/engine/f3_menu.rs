@@ -778,6 +778,14 @@ pub fn tick_f3_menu(state: &mut EngineState) {
     let width = shape[1] as f32;
     let height = shape[0] as f32;
 
+    // Windows currently uses CPU F3 composition for stability; for GPU apps,
+    // refresh staging from GPU first so overlays are composited over the
+    // latest frame (avoids "frozen/static" visuals under F3).
+    #[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+    if state.compute_device == ComputeDevice::Gpu {
+        state.frame.publish_gpu_to_staging();
+    }
+
     // Windows safety: keep F3 on CPU composition for now.
     // GPU F3 overlay can trigger device-driver crashes on some stacks.
     #[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
