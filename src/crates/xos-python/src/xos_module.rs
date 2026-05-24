@@ -1721,6 +1721,9 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
         .set_attr("clip", tensors_module.get_attr("clip", vm).unwrap(), vm)
         .unwrap();
     module
+        .set_attr("allclose", tensors_module.get_attr("allclose", vm).unwrap(), vm)
+        .unwrap();
+    module
         .set_attr(
             "_tensor_min",
             vm.new_function("_tensor_min", crate::tensors::tensor_min),

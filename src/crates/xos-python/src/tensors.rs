@@ -263,6 +263,66 @@ fn clip_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     wrap_tensor_dict(py_tensor.to_py_dict(vm, dtype)?, vm)
 }
 
+fn allclose_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    if args.args.len() < 2 {
+        return Err(vm.new_type_error(
+            "allclose(a, b, rtol=1e-5, atol=1e-8, equal_nan=False) requires a and b".to_string(),
+        ));
+    }
+    let a = &args.args[0];
+    let b = &args.args[1];
+    let rtol = args
+        .kwargs
+        .get("rtol")
+        .map(|v| py_number_to_f64(v, vm))
+        .transpose()?
+        .unwrap_or(1e-5);
+    let atol = args
+        .kwargs
+        .get("atol")
+        .map(|v| py_number_to_f64(v, vm))
+        .transpose()?
+        .unwrap_or(1e-8);
+    let equal_nan = args
+        .kwargs
+        .get("equal_nan")
+        .and_then(|v| v.clone().try_into_value::<bool>(vm).ok())
+        .unwrap_or(false);
+
+    let a_shape = tensor_shape_tuple(a, vm)?;
+    let b_shape = tensor_shape_tuple(b, vm)?;
+    if a_shape != b_shape {
+        return Ok(vm.ctx.new_bool(false).into());
+    }
+
+    let a_flat = tensor_flat_data_list(a, vm)?;
+    let b_flat = tensor_flat_data_list(b, vm)?;
+    if a_flat.len() != b_flat.len() {
+        return Ok(vm.ctx.new_bool(false).into());
+    }
+
+    let rtol = rtol.abs();
+    let atol = atol.abs();
+    for (av, bv) in a_flat.iter().zip(b_flat.iter()) {
+        let a64 = *av as f64;
+        let b64 = *bv as f64;
+        if a64 == b64 {
+            continue;
+        }
+        if a64.is_nan() || b64.is_nan() {
+            if equal_nan && a64.is_nan() && b64.is_nan() {
+                continue;
+            }
+            return Ok(vm.ctx.new_bool(false).into());
+        }
+        let diff = (a64 - b64).abs();
+        if diff > (atol + rtol * b64.abs()) {
+            return Ok(vm.ctx.new_bool(false).into());
+        }
+    }
+    Ok(vm.ctx.new_bool(true).into())
+}
+
 pub fn tensor_fn(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let device = crate::device_policy::tensor_device_for_constructor(&args, vm)?;
     let args_vec = args.args;
@@ -672,5 +732,8 @@ pub fn register_tensors_functions(module: &PyRef<PyModule>, vm: &VirtualMachine)
         .unwrap();
     module
         .set_attr("clip", vm.new_function("clip", clip_fn), vm)
+        .unwrap();
+    module
+        .set_attr("allclose", vm.new_function("allclose", allclose_fn), vm)
         .unwrap();
 }
