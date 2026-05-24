@@ -14,7 +14,7 @@ def test_convolutions():
     gpu_x = cpu_x.to("gpu")
     gpu_kernel = cpu_kernel.to("gpu")
 
-    cpu_y = xos.ops.convolve(cpu_x, gpu_kernel, inplace=False)
+    cpu_y = xos.ops.convolve(cpu_x, cpu_kernel, inplace=False)
     gpu_y = xos.ops.convolve(gpu_x, gpu_kernel, inplace=False)
 
     print(cpu_y.sum(), gpu_y.sum())
