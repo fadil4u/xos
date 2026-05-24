@@ -91,7 +91,6 @@ def frame_convolutions(
     assert cpu_y.shape == gpu_y.shape
     assert xos.allclose(cpu_y, gpu_y)
 
-    while True:
-        cpu_app.tick()
-        # xos.sleep(0.01)
+    # while True:
+        # cpu_app.tick()
     # gpu_app.tick()

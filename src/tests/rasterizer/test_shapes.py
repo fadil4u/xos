@@ -1,16 +1,17 @@
 import xos
 
-@xos.test
-def blank_test():
-    # just a blank passing test. a freebie!
-    pass
+def tuple_area_check(xy0: tuple, xy1: tuple):
+    """given the shape of a rectangle, return the area of the rectangle."""
+    width = abs(xy1[0] - xy0[0])
+    height = abs(xy1[1] - xy0[1])
+    return width * height
 
 @xos.test
 @xos.parametrize("dtype", [xos.uint8, xos.float32])
 def test_rectangles(dtype):
     tensor = xos.zeros((180, 180, 3), dtype=dtype)
 
-    rects = xos.tensor([
+    rect_coords = [
         [(10, 10), (20, 20)],
         [(30, 30), (40, 40)],
         [(50, 50), (60, 60)],
@@ -19,7 +20,8 @@ def test_rectangles(dtype):
         [(110, 110), (120, 120)],
         [(130, 130), (140, 140)],
         [(150, 150), (160, 160)],
-    ])
+    ]
+    rects = xos.tensor(rect_coords)
 
     # TODO: test all configuration of squeeze shapes/tuple initializations and whatnot
     colors = xos.tensor([
@@ -28,41 +30,25 @@ def test_rectangles(dtype):
 
     xos.rasterizer.fill_rectangles(tensor, rects, colors)  # old api
 
-
-
-    # xos.shapes.rectangles(tensor, rects, colors)
-
-    # xos.space  # containing definitions for spaces, transformations, and coordinate systems.
-
-    # rects = xos.shapes.rectangles()  # returns a tensor of shape with dimensionalities defined
-    # rects = xos.shapes.hyperrectangles()  # returns a tensor of shape with dimensionalities defined
-    # rects.render(tensor)
-
-    # to define a space, each axis is normalized to the range 0-1. therefore all spaces are normalized, but they can be 
-
-    # rectangles can be positioned anywhere in the frame, as long as 
+    # check to see if the area matches the summation of the raster
+    pixel_area = (tensor > 0).sum(dtype=xos.uint8)
+    assert pixel_area.dtype == xos.uint8
+    print(pixel_area)
+    assert pixel_area == 100
+    
+    # compare tensor operation of calculation for the areas with the tuple for loop method
+    tensor_area_vector = (rects[:, 1, 0] - rects[:, 0, 0]) * (rects[:, 1, 1] - rects[:, 0, 1])
+    tuple_tensor_area_vector = xos.tensor([tuple_area_check(rect_coords[i][0], rect_coords[i][1]) for i in range(len(rect_coords))])
+    assert xos.all(tensor_area_vector == tuple_tensor_area_vector)
 
     # the space that is defined can be used to transform the rectangles into the desired space.
     # for example, if we have a 0-1 normalized coordinate system for the vh and vw of the viewport
     # or if we have a 0-1 normalized coordinate system for a subspace within the viewport, relative to the vh and vw itself but having things like
     # mobile responsiveness or whatever, allowing us to define these shapes and systems and move them between spaces easily.
 
-
-
-
-
     # this should be the api for rendering the frame to the screen
-    viewport = xos.render(tensor)
-
-    # xos.clipboard = tensor.printpack()
-    # print(len(tensor.printpack()))
-    # viewport.pause()
     # viewport = xos.render(tensor)
-    viewport.pause()
-
-    # tensor.printpack()
-
-    # viewport.render(tensor)  # this could also be called for subsequent updates to this frame, especially with pause=False for a live loop animation  TODO: testing for that
+    # viewport.pause()
 
     # TODO: hard-code what the raster should look like after verifying
 
