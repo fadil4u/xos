@@ -4,7 +4,7 @@ use crate::dtypes::DType;
 pub use crate::tensor_buf::{
     create_tensor_from_data, py_number_to_f64, tensor_flat_data_list, tensor_shape_tuple, Tensor,
 };
-use rustpython_vm::builtins::{PyByteArray, PyBytes, PyDict, PyList, PyModule};
+use rustpython_vm::builtins::{PyByteArray, PyBytes, PyDict, PyList, PyModule, PyTuple};
 use rustpython_vm::{function::FuncArgs, PyObjectRef, PyRef, PyResult, VirtualMachine};
 
 /// One pass over uint8 RGBA / tensor bytes—min, max, arithmetic mean (as f64).
@@ -123,6 +123,110 @@ fn tensor_sum_scalar(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<f64> {
     Ok(flat.iter().map(|&v| v as f64).sum())
 }
 
+fn parse_sum_axes(
+    shape_len: usize,
+    axis_obj: Option<&PyObjectRef>,
+    vm: &VirtualMachine,
+) -> PyResult<Option<Vec<usize>>> {
+    let Some(obj) = axis_obj else {
+        return Ok(None);
+    };
+    if vm.is_none(obj) {
+        return Ok(None);
+    }
+    let mut raw_axes: Vec<i64> = Vec::new();
+    if let Ok(a) = obj.clone().try_into_value::<i64>(vm) {
+        raw_axes.push(a);
+    } else if let Some(tup) = obj.downcast_ref::<PyTuple>() {
+        for item in tup.as_slice().iter() {
+            raw_axes.push(item.clone().try_into_value::<i64>(vm)?);
+        }
+    } else if let Some(lst) = obj.downcast_ref::<PyList>() {
+        for item in lst.borrow_vec().iter() {
+            raw_axes.push(item.clone().try_into_value::<i64>(vm)?);
+        }
+    } else {
+        return Err(vm.new_type_error(
+            "Tensor.sum(axis=...) expects an int, tuple, list, or None".to_string(),
+        ));
+    }
+    if raw_axes.is_empty() {
+        return Err(vm.new_value_error("axis cannot be empty".to_string()));
+    }
+    let ndim = shape_len as i64;
+    let mut axes = Vec::with_capacity(raw_axes.len());
+    for a in raw_axes {
+        let ax = if a < 0 { a + ndim } else { a };
+        if ax < 0 || ax >= ndim {
+            return Err(vm.new_index_error(format!(
+                "axis {} is out of bounds for tensor of dimension {}",
+                a, shape_len
+            )));
+        }
+        axes.push(ax as usize);
+    }
+    axes.sort_unstable();
+    axes.dedup();
+    Ok(Some(axes))
+}
+
+fn reduce_sum_axes(flat: &[f32], shape: &[usize], axes: &[usize]) -> (Vec<f32>, Vec<usize>) {
+    let ndim = shape.len();
+    let mut reduce_mask = vec![false; ndim];
+    for &ax in axes {
+        reduce_mask[ax] = true;
+    }
+
+    let mut out_shape: Vec<usize> = shape
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &d)| if reduce_mask[i] { None } else { Some(d) })
+        .collect();
+    if out_shape.is_empty() {
+        out_shape.push(1);
+    }
+
+    let mut in_strides = vec![1usize; ndim];
+    for i in (0..ndim.saturating_sub(1)).rev() {
+        in_strides[i] = in_strides[i + 1].saturating_mul(shape[i + 1]);
+    }
+
+    let out_ndim = out_shape.len();
+    let mut out_strides = vec![1usize; out_ndim];
+    for i in (0..out_ndim.saturating_sub(1)).rev() {
+        out_strides[i] = out_strides[i + 1].saturating_mul(out_shape[i + 1]);
+    }
+
+    let mut out_acc = vec![0.0f64; out_shape.iter().product()];
+    for (lin, &v) in flat.iter().enumerate() {
+        let mut rem = lin;
+        let mut out_lin = 0usize;
+        let mut out_axis = 0usize;
+        for i in 0..ndim {
+            let coord = if in_strides[i] > 0 {
+                rem / in_strides[i]
+            } else {
+                0
+            };
+            rem = if in_strides[i] > 0 {
+                rem % in_strides[i]
+            } else {
+                0
+            };
+            if !reduce_mask[i] {
+                out_lin = out_lin.saturating_add(coord.saturating_mul(out_strides[out_axis]));
+                out_axis += 1;
+            }
+        }
+        out_acc[out_lin] += v as f64;
+    }
+
+    (
+        out_acc.into_iter().map(|x| x as f32).collect(),
+        out_shape,
+    )
+}
+
 fn first_arg_tensor(args: &FuncArgs, vm: &VirtualMachine, name: &str) -> PyResult<PyObjectRef> {
     args.args
         .first()
@@ -193,16 +297,39 @@ pub fn tensor_mean(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
 pub fn tensor_sum(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let obj = first_arg_tensor(&args, vm, "_tensor_sum")?;
-    let out_dtype = if args.args.len() > 1 && !vm.is_none(&args.args[1]) {
-        DType::from_py_object(&args.args[1], vm).unwrap_or(DType::Int32)
-    } else if let Some(dtype_kwarg) = args.kwargs.get("dtype") {
+    let out_dtype = if let Some(dtype_kwarg) = args.kwargs.get("dtype") {
         DType::from_py_object(dtype_kwarg, vm).unwrap_or(DType::Int32)
+    } else if args.args.len() > 1 && !vm.is_none(&args.args[1]) {
+        DType::from_py_object(&args.args[1], vm).unwrap_or(DType::Int32)
     } else {
         DType::Int32
     };
-    let s = tensor_sum_scalar(obj, vm)?;
-    let value = out_dtype.cast_from_f32(s as f32);
-    let py_tensor = create_tensor_from_data(vec![value], vec![1], out_dtype);
+
+    let axis_obj = args.kwargs.get("axis");
+    let shape = tensor_shape_tuple(&obj, vm)?;
+    let axes = parse_sum_axes(shape.len(), axis_obj, vm)?;
+
+    let (out_flat, out_shape) = if let Some(axes) = axes {
+        let flat = tensor_flat_data_list(&obj, vm)?;
+        let expected: usize = shape.iter().product();
+        if flat.len() < expected {
+            return Err(vm.new_value_error(format!(
+                "_tensor_sum: tensor has {} elements, shape product is {}",
+                flat.len(),
+                expected
+            )));
+        }
+        reduce_sum_axes(&flat[..expected], &shape, &axes)
+    } else {
+        let s = tensor_sum_scalar(obj, vm)? as f32;
+        (vec![s], vec![1])
+    };
+
+    let casted: Vec<f32> = out_flat
+        .into_iter()
+        .map(|v| out_dtype.cast_from_f32(v))
+        .collect();
+    let py_tensor = create_tensor_from_data(casted, out_shape, out_dtype);
     wrap_tensor_dict(py_tensor.to_py_dict(vm, out_dtype)?, vm)
 }
 

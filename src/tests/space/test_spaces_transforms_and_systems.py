@@ -81,25 +81,25 @@ def test_frame_transforms():
     # rasterize the frame from trivial pixel coordinates definitions
     frame = xos.zeros((height, width, 3), dtype=xos.uint8, device=device)
     xos.rasterizer.fill_rectangles(frame, pixel_rectangles.vertices, colors=(255, 0, 0))
-    viewport = xos.render(frame)
-    viewport.pause()
+    # viewport = xos.render(frame)
+    # viewport.pause()
 
     # now do so but from the normalized space
-    viewport = xos.render(xos.zeros((height * 2, width * 3, 3), dtype=xos.uint8, device=device))
+    # viewport = xos.render(xos.zeros((height * 2, width * 3, 3), dtype=xos.uint8, device=device))
 
     # functional "animation" loop (draw into viewport.frame, map normal_space -> pixels)
-    frame = viewport.frame
-    while not viewport.closed:
-        xos.rasterizer.fill(frame, colors=(0, 0, 0))
-        xos.rasterizer.fill_rectangles(
-            frame,
-            normal_rectangles,
-            colors=(255, 0, 0),
-            space=normal_space,
-            viewport=viewport,
-        )
-        xos.render(viewport, frame)
-        frame = viewport.frame
+    # frame = viewport.frame
+    # while not viewport.closed:
+    #     xos.rasterizer.fill(frame, colors=(0, 0, 0))
+    #     xos.rasterizer.fill_rectangles(
+    #         frame,
+    #         normal_rectangles,
+    #         colors=(255, 0, 0),
+    #         space=normal_space,
+    #         viewport=viewport,
+    #     )
+    #     xos.render(viewport, frame)
+    #     frame = viewport.frame
 
     # viewport.pause()
 

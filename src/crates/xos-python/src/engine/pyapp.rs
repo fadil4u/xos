@@ -1195,16 +1195,14 @@ class Tensor:
                 "Tensor.sum() got unexpected keyword arguments: "
                 + ", ".join(sorted(kwargs.keys()))
             )
-        if axis is not None:
-            raise NotImplementedError("Tensor.sum(axis=...) is not implemented yet")
         if out is not None:
             raise NotImplementedError("Tensor.sum(out=...) is not implemented yet")
         if keepdims:
             raise NotImplementedError("Tensor.sum(keepdims=True) is not implemented yet")
         import xos
-        if dtype is None:
+        if axis is None and dtype is None:
             return xos._tensor_sum(self)
-        return xos._tensor_sum(self, dtype=dtype)
+        return xos._tensor_sum(self, axis=axis, dtype=dtype)
 
     def tostring(self, full=False):
         """Human-readable string; ``full=True`` prints every element."""

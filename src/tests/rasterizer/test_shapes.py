@@ -30,18 +30,27 @@ def test_rectangles(dtype):
 
     xos.rasterizer.fill_rectangles(tensor, rects, colors)  # old api
 
+    expected_area_values = [tuple_area_check(xy0, xy1) for xy0, xy1 in rect_coords]
+    expected_area_vector = xos.tensor(expected_area_values, dtype=xos.int32)
+    expected_pixel_area = xos.tensor(sum(expected_area_values), dtype=xos.int32)
+
     # check to see if the area matches the summation of the raster
-    pixel_area = (tensor > 0).sum(dtype=xos.uint8)
-    assert pixel_area.dtype == xos.uint8
-    print(pixel_area)
-    expected_pixel_area = sum(tuple_area_check(xy0, xy1) for xy0, xy1 in rect_coords)
-    expected_pixel_area = xos.tensor(expected_pixel_area, dtype=xos.uint8)
-    assert pixel_area == expected_pixel_area, f"{pixel_area} != {expected_pixel_area}"
+    pixel_area = (tensor > 0).sum(dtype=xos.int32)
+    assert pixel_area.dtype == xos.int32
+    assert pixel_area == expected_pixel_area
     
     # compare tensor operation of calculation for the areas with the tuple for loop method
     tensor_area_vector = (rects[:, 1, 0] - rects[:, 0, 0]) * (rects[:, 1, 1] - rects[:, 0, 1])
-    tuple_tensor_area_vector = xos.tensor([tuple_area_check(rect_coords[i][0], rect_coords[i][1]) for i in range(len(rect_coords))])
-    assert xos.all(tensor_area_vector == tuple_tensor_area_vector)
+    assert xos.all(tensor_area_vector == expected_area_vector)
+
+    # axis reduction: keep one summed value per rectangle (shape: N)
+    area_vector_from_axis_sum = tensor_area_vector[:, None].sum(axis=1, dtype=xos.int32)
+    assert area_vector_from_axis_sum.shape == expected_area_vector.shape
+    assert xos.all(area_vector_from_axis_sum == expected_area_vector)
+
+    # final full reduction over the vector
+    area_sum_from_vector = area_vector_from_axis_sum.sum(dtype=xos.int32)
+    assert area_sum_from_vector == expected_pixel_area
 
     # the space that is defined can be used to transform the rectangles into the desired space.
     # for example, if we have a 0-1 normalized coordinate system for the vh and vw of the viewport
