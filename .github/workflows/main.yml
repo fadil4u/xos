@@ -1,0 +1,309 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      force_compiler:
+        description: "Force compiler checks regardless of version diff"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  classify-version:
+    name: Classify version change
+    runs-on: ubuntu-latest
+    outputs:
+      current_version: ${{ steps.classify.outputs.current_version }}
+      previous_version: ${{ steps.classify.outputs.previous_version }}
+      version_changed: ${{ steps.classify.outputs.version_changed }}
+      base_changed: ${{ steps.classify.outputs.base_changed }}
+      pre_changed: ${{ steps.classify.outputs.pre_changed }}
+      is_pre_release: ${{ steps.classify.outputs.is_pre_release }}
+      is_full_release: ${{ steps.classify.outputs.is_full_release }}
+      run_compiler: ${{ steps.classify.outputs.run_compiler }}
+      wasm_artifact_name: ${{ steps.classify.outputs.wasm_artifact_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse version components
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_REF: ${{ github.base_ref }}
+          FORCE_COMPILER: ${{ github.event.inputs.force_compiler || 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          out = Path(os.environ["GITHUB_OUTPUT"])
+          event_name = os.environ.get("EVENT_NAME", "")
+          push_before = os.environ.get("PUSH_BEFORE", "")
+          pr_base_ref = os.environ.get("PR_BASE_REF", "")
+          force_compiler = os.environ.get("FORCE_COMPILER", "false").lower() == "true"
+
+          def run(*args):
+              return subprocess.run(args, text=True, capture_output=True, check=False)
+
+          def extract_version(toml_text: str) -> str:
+              ws_match = re.search(
+                  r"^\[workspace\.package\]\n(?:(?!^\[).*\n)*?^version\s*=\s*\"([^\"]+)\"",
+                  toml_text,
+                  re.M,
+              )
+              if ws_match:
+                  return ws_match.group(1).strip()
+              root_match = re.search(r"^version\s*=\s*\"([^\"]+)\"", toml_text, re.M)
+              if root_match:
+                  return root_match.group(1).strip()
+              raise ValueError("Could not find version in Cargo.toml")
+
+          version_re = re.compile(r"^(?P<base>\d+\.\d+\.\d+)(?:-pre(?P<pre>\d+))?$")
+
+          def parse(v: str):
+              m = version_re.fullmatch(v)
+              if not m:
+                  raise ValueError(
+                      f"Unsupported version format '{v}'. Expected: X.Y.Z[-preN]"
+                  )
+              return {
+                  "base": m.group("base"),
+                  "pre": m.group("pre") or "",
+              }
+
+          current_toml = Path("Cargo.toml").read_text(encoding="utf-8")
+          current_version = extract_version(current_toml)
+
+          previous_toml = None
+          if event_name == "pull_request" and pr_base_ref:
+              run("git", "fetch", "--depth=1", "origin", pr_base_ref)
+              showed = run("git", "show", f"origin/{pr_base_ref}:Cargo.toml")
+              if showed.returncode == 0:
+                  previous_toml = showed.stdout
+          elif event_name == "push" and push_before and push_before != "0" * 40:
+              showed = run("git", "show", f"{push_before}:Cargo.toml")
+              if showed.returncode == 0:
+                  previous_toml = showed.stdout
+
+          if previous_toml is None:
+              previous_toml = current_toml
+
+          previous_version = extract_version(previous_toml)
+
+          c = parse(current_version)
+          p = parse(previous_version)
+
+          # Illegal transition guard:
+          # If main is stable X.Y.Z, a PR must not move to X.Y.Z-preN.
+          # Proper flow is to bump base first (e.g. X.Y.(Z+1)-pre0).
+          if (
+              event_name == "pull_request"
+              and p["pre"] == ""
+              and c["pre"] != ""
+              and c["base"] == p["base"]
+          ):
+              msg = (
+                  "Illegal version transition: main is stable "
+                  f"{previous_version}, but PR sets {current_version}.\\n"
+                  "Do not create a prerelease from the same stable base. "
+                  "Bump the base version first, then add -pre0 "
+                  "(example: 0.2.3 -> 0.2.4-pre0)."
+              )
+              print(msg, file=sys.stderr)
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as s:
+                      s.write("## Version policy violation\\n")
+                      s.write(msg + "\\n")
+              sys.exit(1)
+
+          # Illegal transition guard:
+          # If main is pre-release X.Y.Z-preN, PR must not jump to a different base
+          # (either as pre-release or stable). Finish X.Y.Z first.
+          if (
+              event_name == "pull_request"
+              and p["pre"] != ""
+              and c["base"] != p["base"]
+          ):
+              msg = (
+                  "Illegal version transition: main is prerelease "
+                  f"{previous_version}, but PR sets {current_version}.\\n"
+                  "You cannot change the base version while the current base is still in prerelease. "
+                  f"Finish {p['base']} first by releasing stable {p['base']}, then move to "
+                  f"the next line (e.g. {p['base']} -> <next>-pre0)."
+              )
+              print(msg, file=sys.stderr)
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as s:
+                      s.write("## Version policy violation\\n")
+                      s.write(msg + "\\n")
+              sys.exit(1)
+
+          version_changed = current_version != previous_version
+          base_changed = c["base"] != p["base"]
+          pre_changed = c["pre"] != p["pre"]
+          is_pre_release = c["pre"] != ""
+          is_full_release = version_changed and c["pre"] == ""
+
+          run_compiler = force_compiler or pre_changed or is_full_release
+          wasm_artifact_name = f"xos-wasm-zip-v{current_version}"
+
+          lines = {
+              "current_version": current_version,
+              "previous_version": previous_version,
+              "version_changed": str(version_changed).lower(),
+              "base_changed": str(base_changed).lower(),
+              "pre_changed": str(pre_changed).lower(),
+              "is_pre_release": str(is_pre_release).lower(),
+              "is_full_release": str(is_full_release).lower(),
+              "run_compiler": str(run_compiler).lower(),
+              "wasm_artifact_name": wasm_artifact_name,
+          }
+          with out.open("a", encoding="utf-8") as f:
+              for k, v in lines.items():
+                  f.write(f"{k}={v}\n")
+
+          print("Version classification:")
+          for k, v in lines.items():
+              print(f"  {k}: {v}")
+          PY
+
+  enforce-pr-policy:
+    name: Enforce pre bump for PRs
+    runs-on: ubuntu-latest
+    needs: classify-version
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    steps:
+      - name: Require pre bump vs main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.classify-version.outputs.pre_changed }}" != "true" ]; then
+            echo "PRs into main must bump -preN in Cargo.toml."
+            echo "Current:  ${{ needs.classify-version.outputs.current_version }}"
+            echo "Against main: ${{ needs.classify-version.outputs.previous_version }}"
+            exit 1
+          fi
+
+  compiler:
+    name: Compiler matrix
+    needs: [classify-version, enforce-pr-policy]
+    if: |
+      always() &&
+      (github.event_name == 'pull_request' && needs.enforce-pr-policy.result == 'success') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.classify-version.outputs.run_compiler == 'true') ||
+      (github.event_name == 'workflow_dispatch' && needs.classify-version.outputs.run_compiler == 'true')
+    uses: ./.github/workflows/compiler.yml
+    with:
+      version: ${{ needs.classify-version.outputs.current_version }}
+      wasm_artifact_name: ${{ needs.classify-version.outputs.wasm_artifact_name }}
+    secrets: inherit
+
+  docker-finalize:
+    name: Docker finalize publish
+    needs: [classify-version, compiler]
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.classify-version.outputs.version_changed == 'true' &&
+      needs.compiler.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::12}"
+          channel_tag="prerelease"
+          if [ "${{ needs.classify-version.outputs.is_pre_release }}" != "true" ]; then
+            channel_tag="latest"
+          fi
+          {
+            echo "short_sha=${short_sha}"
+            echo "channel_tag=${channel_tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ensure commit image exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_ref="xlateai/xos:${{ steps.tags.outputs.short_sha }}"
+          docker buildx imagetools inspect "${source_ref}" >/dev/null
+
+      - name: Protect stable version tag from overwrite
+        if: needs.classify-version.outputs.is_pre_release != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version_tag="xlateai/xos:${{ needs.classify-version.outputs.current_version }}"
+          if docker manifest inspect "${version_tag}" >/dev/null 2>&1; then
+            echo "Stable tag already exists: ${version_tag}"
+            echo "Refusing to overwrite existing stable version image."
+            exit 1
+          fi
+
+      - name: Rebuild and push official tags (cache-warmed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          cache-from: |
+            type=registry,ref=xlateai/xos:${{ steps.tags.outputs.short_sha }}
+            type=registry,ref=xlateai/xos:prerelease
+            type=registry,ref=xlateai/xos:latest
+          tags: |
+            xlateai/xos:${{ steps.tags.outputs.short_sha }}
+            xlateai/xos:${{ needs.classify-version.outputs.current_version }}
+            xlateai/xos:${{ steps.tags.outputs.channel_tag }}
+
+  full-release:
+    name: Full release publish
+    needs: [classify-version, compiler, docker-finalize]
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.classify-version.outputs.is_full_release == 'true' &&
+      needs.compiler.result == 'success' &&
+      needs.docker-finalize.result == 'success'
+    uses: ./.github/workflows/full_release.yml
+    with:
+      version: ${{ needs.classify-version.outputs.current_version }}
+      wasm_artifact_name: ${{ needs.classify-version.outputs.wasm_artifact_name }}
+    secrets: inherit

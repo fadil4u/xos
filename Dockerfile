@@ -26,7 +26,7 @@ COPY src/crates/xos-core/patches/gpu-allocator src/crates/xos-core/patches/gpu-a
 COPY src/crates/xos-core/patches/sentencepiece-sys src/crates/xos-core/patches/sentencepiece-sys
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
-RUN cargo install --path . --locked --root /usr/local --bin xos --bin xpy --bin xrs
+RUN cargo install --path src/crates/xos-cli --locked --root /usr/local --bin xos --bin xpy --bin xrs
 
 FROM rust:1.94-bookworm AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \

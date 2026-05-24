@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Python, cross-platform (+ios📱) with built-in viewports, audio drivers, ai/ml/sci compute operations, graphics, text rasterization, and more- tensorized and accelerator ready. Let's see what you can build!"
 
 [dependencies]
-xos-core = { path = "src/crates/xos-core" }
+xos-core = { path = "src/crates/xos-core", default-features = false }
 xos-app = { path = "src/crates/xos-app" }
 xos-python = { path = "src/crates/xos-python" }
 xos-auth = { path = "src/crates/xos-auth" }
@@ -53,7 +53,7 @@ resolver = "2"
 
 # Bump release version here only — all workspace crates inherit via `*.workspace = true`.
 [workspace.package]
-version = "0.3.19-pre4"
+version = "0.3.19-pre5"
 edition = "2021"
 license = "MIT"
 authors = ["Dyllan McCreary <dyllan@xlate.ai>"]
