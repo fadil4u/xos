@@ -1,6 +1,9 @@
 name: CI
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
     branches:
       - main
@@ -212,22 +215,93 @@ jobs:
     name: Compiler matrix
     needs: [classify-version, enforce-pr-policy]
     if: |
+      always() &&
       (github.event_name == 'pull_request' && needs.enforce-pr-policy.result == 'success') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.classify-version.outputs.run_compiler == 'true') ||
       (github.event_name == 'workflow_dispatch' && needs.classify-version.outputs.run_compiler == 'true')
     uses: ./.github/workflows/compiler.yml
     with:
       version: ${{ needs.classify-version.outputs.current_version }}
       wasm_artifact_name: ${{ needs.classify-version.outputs.wasm_artifact_name }}
-      is_full_release: ${{ needs.classify-version.outputs.is_full_release == 'true' }}
     secrets: inherit
+
+  docker-finalize:
+    name: Docker finalize publish
+    needs: [classify-version, compiler]
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.classify-version.outputs.version_changed == 'true' &&
+      needs.compiler.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::12}"
+          channel_tag="prerelease"
+          if [ "${{ needs.classify-version.outputs.is_pre_release }}" != "true" ]; then
+            channel_tag="latest"
+          fi
+          {
+            echo "short_sha=${short_sha}"
+            echo "channel_tag=${channel_tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ensure commit image exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_ref="xlateai/xos:${{ steps.tags.outputs.short_sha }}"
+          docker buildx imagetools inspect "${source_ref}" >/dev/null
+
+      - name: Protect stable version tag from overwrite
+        if: needs.classify-version.outputs.is_pre_release != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version_tag="xlateai/xos:${{ needs.classify-version.outputs.current_version }}"
+          if docker manifest inspect "${version_tag}" >/dev/null 2>&1; then
+            echo "Stable tag already exists: ${version_tag}"
+            echo "Refusing to overwrite existing stable version image."
+            exit 1
+          fi
+
+      - name: Rebuild and push official tags (cache-warmed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          cache-from: |
+            type=registry,ref=xlateai/xos:${{ steps.tags.outputs.short_sha }}
+            type=registry,ref=xlateai/xos:prerelease
+            type=registry,ref=xlateai/xos:latest
+          tags: |
+            xlateai/xos:${{ steps.tags.outputs.short_sha }}
+            xlateai/xos:${{ needs.classify-version.outputs.current_version }}
+            xlateai/xos:${{ steps.tags.outputs.channel_tag }}
 
   full-release:
     name: Full release publish
-    needs: [classify-version, compiler]
+    needs: [classify-version, compiler, docker-finalize]
     if: |
-      github.event_name == 'workflow_dispatch' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
       needs.classify-version.outputs.is_full_release == 'true' &&
-      needs.compiler.result == 'success'
+      needs.compiler.result == 'success' &&
+      needs.docker-finalize.result == 'success'
     uses: ./.github/workflows/full_release.yml
     with:
       version: ${{ needs.classify-version.outputs.current_version }}

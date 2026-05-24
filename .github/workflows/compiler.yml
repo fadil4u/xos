@@ -11,11 +11,6 @@ on:
         description: Uploaded wasm artifact name
         required: true
         type: string
-      is_full_release:
-        description: Whether this build is a full release
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -120,28 +115,11 @@ jobs:
         run: |
           set -euo pipefail
           short_sha="${GITHUB_SHA::12}"
-          channel_tag="prerelease"
-          if [ "${{ inputs.is_full_release }}" = "true" ]; then
-            channel_tag="latest"
-          fi
           {
             echo "short_sha=${short_sha}"
-            echo "channel_tag=${channel_tag}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Protect stable version tag from overwrite
-        if: inputs.is_full_release == true
-        shell: bash
-        run: |
-          set -euo pipefail
-          version_tag="xlateai/xos:${{ inputs.version }}"
-          if docker manifest inspect "${version_tag}" >/dev/null 2>&1; then
-            echo "Stable tag already exists: ${version_tag}"
-            echo "Refusing to overwrite existing stable version image."
-            exit 1
-          fi
-
-      - name: Build and push Docker image
+      - name: Build and push commit-tag image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -150,9 +128,5 @@ jobs:
           cache-from: |
             type=registry,ref=xlateai/xos:prerelease
             type=registry,ref=xlateai/xos:latest
-            type=registry,ref=xlateai/xos:buildcache
-          cache-to: type=registry,ref=xlateai/xos:buildcache,mode=max
           tags: |
             xlateai/xos:${{ steps.tags.outputs.short_sha }}
-            xlateai/xos:${{ inputs.version }}
-            xlateai/xos:${{ steps.tags.outputs.channel_tag }}
