@@ -1,14 +1,21 @@
 import xos
 
 
+@xos.test
 def test_convolutions():
     kernel_shape = (3, 3, 3)
+    input_shape = (128, 128, 3)
     dtype = xos.float32
-    cpu_x = xos.random.uniform(0.0, 1.0, shape=kernel_shape, dtype=dtype, device="cpu")
-    gpu_x = xos.random.uniform(0.0, 1.0, shape=kernel_shape, dtype=dtype, device="gpu")
+    
+    cpu_x = xos.random.uniform(0.0, 1.0, shape=input_shape, dtype=dtype, device="cpu")
+    cpu_kernel = xos.random.uniform(0.0, 1.0, shape=kernel_shape, dtype=dtype, device="cpu")
+    
+    # cloning should implicitly already happen when you do this
+    gpu_x = cpu_x.to("gpu")
+    gpu_kernel = cpu_kernel.to("gpu")
 
-    cpu_y = xos.ops.convolve(cpu_x, gpu_x, inplace=False)
-    gpu_y = xos.ops.convolve(gpu_x, gpu_x, inplace=False)
+    cpu_y = xos.ops.convolve(cpu_x, gpu_kernel, inplace=False)
+    gpu_y = xos.ops.convolve(gpu_x, gpu_kernel, inplace=False)
 
     print(cpu_y.sum(), gpu_y.sum())
 
