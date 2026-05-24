@@ -4,7 +4,7 @@ import xos
 @xos.test
 @xos.parametrize("value", [0, 7, 3.5, True, False])
 def test_scalar_strings(value):
-    tensor = xos.tensor(value)
+    tensor = xos.tensor(value, device="cpu")
 
     if isinstance(value, bool):
         expected_dtype = "bool"
