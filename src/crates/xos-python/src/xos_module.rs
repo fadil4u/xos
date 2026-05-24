@@ -27,6 +27,8 @@ static STANDALONE_FRAME_DIMS: LazyLock<Mutex<HashMap<u64, (usize, usize)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static STANDALONE_FRAME_DRAWN: LazyLock<Mutex<HashMap<u64, bool>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static STANDALONE_TICK_LAST_END: LazyLock<Mutex<HashMap<u64, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(crate) fn mark_standalone_frame_drawn(viewport_id: u64) {
     if let Ok(mut drawn) = STANDALONE_FRAME_DRAWN.lock() {
@@ -802,6 +804,65 @@ fn xos_sleep(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     Ok(vm.ctx.none())
 }
 
+/// xos._standalone_tick_pace(viewport_id, max_fps)
+/// Enforce standalone app.tick() pacing in Rust (higher precision than Python-side sleep loops).
+fn standalone_tick_pace(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let viewport_id: i64 = args
+        .args
+        .first()
+        .ok_or_else(|| vm.new_type_error("_standalone_tick_pace(viewport_id, max_fps)".to_string()))?
+        .clone()
+        .try_into_value(vm)?;
+    let max_fps: f64 = args
+        .args
+        .get(1)
+        .ok_or_else(|| vm.new_type_error("_standalone_tick_pace(viewport_id, max_fps)".to_string()))?
+        .clone()
+        .try_into_value(vm)?;
+
+    const MIN_MAX_FPS: f64 = 0.1;
+    const GLOBAL_MAX_FPS: f64 = 5000.0;
+    if !max_fps.is_finite() || max_fps < MIN_MAX_FPS || max_fps > GLOBAL_MAX_FPS {
+        return Err(vm.new_value_error(format!(
+            "max_fps must be between {MIN_MAX_FPS} and {GLOBAL_MAX_FPS}, got {max_fps}"
+        )));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let id = viewport_id.max(0) as u64;
+        let now = std::time::Instant::now();
+        let previous = {
+            let mut last = STANDALONE_TICK_LAST_END
+                .lock()
+                .map_err(|_| vm.new_runtime_error("standalone pacing lock poisoned".to_string()))?;
+            last.insert(id, now)
+        };
+        if let Some(prev) = previous {
+            let target = xos_core::time::Duration::from_secs_f64(1.0 / max_fps);
+            let elapsed = now.saturating_duration_since(prev);
+            if elapsed < target {
+                let wait = target - elapsed;
+                // Sleep coarse part, then spin a tiny tail for sub-ms targets (e.g. 2k FPS).
+                let spin_tail = xos_core::time::Duration::from_micros(200);
+                if wait > spin_tail {
+                    std::thread::sleep(wait - spin_tail);
+                }
+                let deadline = std::time::Instant::now() + spin_tail.min(wait);
+                while std::time::Instant::now() < deadline {
+                    std::hint::spin_loop();
+                }
+                let mut last = STANDALONE_TICK_LAST_END
+                    .lock()
+                    .map_err(|_| vm.new_runtime_error("standalone pacing lock poisoned".to_string()))?;
+                last.insert(id, std::time::Instant::now());
+            }
+        }
+    }
+
+    Ok(vm.ctx.none())
+}
+
 fn xos_time_time(_args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     Ok(vm.ctx.new_float(xos_core::time::unix_seconds_f64()).into())
 }
@@ -1499,6 +1560,13 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
         .unwrap();
     module
         .set_attr("sleep", vm.new_function("sleep", xos_sleep), vm)
+        .unwrap();
+    module
+        .set_attr(
+            "_standalone_tick_pace",
+            vm.new_function("_standalone_tick_pace", standalone_tick_pace),
+            vm,
+        )
         .unwrap();
     let time_module = vm.new_module("xos.time", vm.ctx.new_dict(), None);
     time_module

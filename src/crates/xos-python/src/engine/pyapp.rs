@@ -1332,6 +1332,8 @@ class Verbosities:
   """Debug flags for xos apps (see ``Application.verbosities``)."""
   function_calls = False
 
+DEFAULT_MAX_FPS = 2048.0
+
 
 class Application:
     """Base class for xos applications. Extend this class and implement __init__() and tick().
@@ -1353,7 +1355,7 @@ class Application:
 
     function_calls = False
 
-    def __init__(self, headless=None, device=None, width=None, height=None):
+    def __init__(self, headless=None, device=None, width=None, height=None, max_fps=None):
         import builtins
         next_id = int(getattr(builtins, "__xos_next_viewport_id__", 0))
         builtins.__xos_next_viewport_id__ = next_id + 1
@@ -1381,6 +1383,8 @@ class Application:
             self._xos_standalone_width = int(max(1, int(width)))
         if height is not None:
             self._xos_standalone_height = int(max(1, int(height)))
+        raw_max_fps = max_fps if max_fps is not None else getattr(self, "max_fps", DEFAULT_MAX_FPS)
+        self.max_fps = float(raw_max_fps)
 
         self.verbosities = Verbosities()
         class_verb = getattr(type(self), "verbosities", None)
@@ -1531,6 +1535,11 @@ class Application:
                     xos.frame._present_standalone(int(getattr(self, "_xos_viewport_id", 0)))
                 xos.frame._end_standalone()
                 self._xos_ticks_completed = int(getattr(self, "_xos_ticks_completed", 0)) + 1
+                # Enforced in Rust for higher precision and lower Python overhead.
+                xos._standalone_tick_pace(
+                    int(getattr(self, "_xos_viewport_id", 0)),
+                    float(getattr(self, "max_fps", DEFAULT_MAX_FPS)),
+                )
     
     def get_width(self):
         """Get the current frame width"""

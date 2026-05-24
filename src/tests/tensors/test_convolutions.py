@@ -93,5 +93,5 @@ def frame_convolutions(
 
     while True:
         cpu_app.tick()
-        xos.sleep(0.01)
+        # xos.sleep(0.01)
     # gpu_app.tick()
