@@ -136,6 +136,27 @@ fn try_get_tensor_data_by_id(id: u64) -> Option<Vec<f32>> {
     Some(guard.clone())
 }
 
+fn try_get_active_frame_buffer_copy() -> Option<Vec<u8>> {
+    if let Some(bytes) = crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
+        #[cfg(not(target_arch = "wasm32"))]
+        state.frame.publish_gpu_to_staging();
+        let buf = state.frame.staging_slice_mut_for_tick();
+        Some(buf.to_vec())
+    })
+    .flatten()
+    {
+        return Some(bytes);
+    }
+
+    let buffer_guard = crate::rasterizer::CURRENT_FRAME_BUFFER.lock().ok()?;
+    let width = *crate::rasterizer::CURRENT_FRAME_WIDTH.lock().ok()?;
+    let height = *crate::rasterizer::CURRENT_FRAME_HEIGHT.lock().ok()?;
+    let buffer_ptr = buffer_guard.as_ref()?;
+    let len = width.saturating_mul(height).saturating_mul(4);
+    let buffer = unsafe { std::slice::from_raw_parts(buffer_ptr.as_ptr(), len) };
+    Some(buffer.to_vec())
+}
+
 /// Update registry storage for a tensor id (used by ``uniform_fill`` on simulation buffers).
 pub fn write_tensor_data_by_id(id: u64, flat: &[f32]) -> bool {
     let reg = match TENSOR_REGISTRY.lock() {
@@ -176,6 +197,13 @@ pub fn tensor_flat_bytes(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<Vec
             return Ok(ba.borrow_buf().to_vec());
         }
         if let Some(dict) = cur.downcast_ref::<PyDict>() {
+            let frame_backed = dict.get_item("_xos_frame_backing", vm).is_ok()
+                || dict.get_item("_xos_viewport_id", vm).is_ok();
+            if frame_backed {
+                if let Some(bytes) = try_get_active_frame_buffer_copy() {
+                    return Ok(bytes);
+                }
+            }
             if let Ok(item) = dict.get_item("_data", vm) {
                 cur = item;
                 continue;
@@ -243,6 +271,8 @@ pub fn tensor_flat_data_list(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult
                 .collect::<Result<Vec<f32>, _>>();
         }
         if let Some(dict) = cur.downcast_ref::<PyDict>() {
+            let frame_backed = dict.get_item("_xos_frame_backing", vm).is_ok()
+                || dict.get_item("_xos_viewport_id", vm).is_ok();
             if let Ok(id_obj) = dict.get_item("_rust_tensor", vm) {
                 if let Ok(id) = id_obj.try_into_value::<i64>(vm) {
                     if let Some(v) = try_get_tensor_data_by_id(id.max(0) as u64) {
@@ -254,9 +284,18 @@ pub fn tensor_flat_data_list(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult
                 cur = item;
                 continue;
             }
-            if let Ok(item) = dict.get_item("data", vm) {
-                cur = item;
-                continue;
+            if frame_backed {
+                if let Some(bytes) = try_get_active_frame_buffer_copy() {
+                    return Ok(bytes.into_iter().map(|b| b as f32).collect());
+                }
+            }
+            // Frame-backed tensors intentionally avoid generic `data` list paths:
+            // those lists can be stale metadata and force expensive full-frame copies.
+            if !frame_backed {
+                if let Ok(item) = dict.get_item("data", vm) {
+                    cur = item;
+                    continue;
+                }
             }
             if let Ok(item) = dict.get_item("tensor", vm) {
                 cur = item;

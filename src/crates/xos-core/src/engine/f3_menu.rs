@@ -703,8 +703,10 @@ pub fn tick_f3_menu(state: &mut EngineState) {
     let width = shape[1] as f32;
     let height = shape[0] as f32;
 
-    #[cfg(not(target_arch = "wasm32"))]
-    if state.compute_device == ComputeDevice::Gpu {
+    // Windows safety: keep F3 on CPU composition for now.
+    // GPU F3 overlay can trigger device-driver crashes on some stacks.
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
+    if state.compute_device == ComputeDevice::Gpu && state.frame.gpu_present_enabled() {
         draw_f3_panel_native(state, &geom, knob_w, overlay_alpha, view_rect, width, height);
         return;
     }

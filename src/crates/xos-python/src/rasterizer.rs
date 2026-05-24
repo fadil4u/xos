@@ -973,6 +973,31 @@ fn tensor_like_target(obj: &PyObjectRef, vm: &VirtualMachine) -> bool {
         .is_some()
 }
 
+fn tensor_has_marker(obj: &PyObjectRef, marker: &str, vm: &VirtualMachine) -> bool {
+    let mut cur = obj.clone();
+    for _ in 0..12 {
+        if let Some(dict) = cur.downcast_ref::<PyDict>() {
+            if dict.get_item(marker, vm).is_ok() {
+                return true;
+            }
+            if let Ok(inner) = dict.get_item("tensor", vm) {
+                cur = inner;
+                continue;
+            }
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "_data") {
+            cur = attr;
+            continue;
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "tensor") {
+            cur = attr;
+            continue;
+        }
+        break;
+    }
+    false
+}
+
 /// xos.rasterizer.fill(tensor, colors=...) — solid fill on a tensor (functional preview / tick loops).
 ///
 /// Also supports legacy ``fill(frame, (r,g,b,a))`` when a tick frame-buffer context is active.
@@ -1002,6 +1027,22 @@ fn fill(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         } else {
             255.0
         };
+        let r8 = r.clamp(0.0, 255.0) as u8;
+        let g8 = g.clamp(0.0, 255.0) as u8;
+        let b8 = b.clamp(0.0, 255.0) as u8;
+        let a8 = a.clamp(0.0, 255.0) as u8;
+
+        // Fast path for frame-backed and standalone viewport tensors:
+        // fill the active RGBA framebuffer directly (no Python flat-list roundtrip).
+        let is_frame_or_viewport = crate::device_policy::is_frame_backed_tensor(target, vm)
+            || tensor_has_marker(target, "_xos_viewport_id", vm);
+        if is_frame_or_viewport {
+            crate::xos_module::with_frame_write_buffer(vm, Some(target), |buffer| {
+                fill_buffer_solid_rgba(buffer, r8, g8, b8, a8);
+                Ok(())
+            })?;
+            return Ok(vm.ctx.none());
+        }
 
         let shape = tensor_shape_tuple(target, vm)?;
         if shape.len() < 2 {
