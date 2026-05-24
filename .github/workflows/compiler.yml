@@ -124,7 +124,7 @@ jobs:
           if-no-files-found: error
 
   docker:
-    name: Docker build
+    name: Docker compile
     runs-on: ubuntu-latest
     needs: [windows, macos, wasm]
     steps:
@@ -150,7 +150,7 @@ jobs:
             echo "short_sha=${short_sha}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Publish cache results
+      - name: Compile
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -168,7 +168,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD:/workspace" -w /workspace xos-ci-test:latest xos test
+          docker run --rm --entrypoint xos -v "$PWD:/workspace" -w /workspace xos-ci-test:latest test
 
       - name: Build and push commit-tag image
         if: ${{ success() }}
