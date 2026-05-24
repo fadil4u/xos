@@ -4,7 +4,8 @@ use rustpython_vm::{function::FuncArgs, PyObjectRef, PyResult, VirtualMachine};
 use crate::device_policy;
 use crate::dtypes::DType;
 use crate::tensor_buf::{
-    create_tensor_from_data, py_number_to_f64, tensor_flat_data_list, tensor_shape_tuple,
+    create_tensor_from_data, py_number_to_f64, tensor_flat_bytes, tensor_flat_data_list,
+    tensor_shape_tuple,
     wrap_registry_tensor,
 };
 
@@ -387,6 +388,82 @@ fn parse_rgb_kernel(
     Ok((kernel, kernel_size))
 }
 
+fn convolve_frame_rgb_same_cpu_inplace(
+    image_arg: &PyObjectRef,
+    vm: &VirtualMachine,
+    kernel_hwc: &[f32],
+    kernel_size: usize,
+    stride: usize,
+) -> PyResult<bool> {
+    if stride != 1 {
+        return Err(vm.new_value_error(
+            "convolve() CPU path currently requires stride=1".to_string(),
+        ));
+    }
+
+    let shape = tensor_shape_tuple(image_arg, vm)?;
+    if shape.len() < 3 {
+        return Err(vm.new_value_error(
+            "convolve() CPU path expects frame.tensor shape (H, W, C)".to_string(),
+        ));
+    }
+    let h = shape[0];
+    let w = shape[1];
+    let c = shape[2];
+    if c < 3 {
+        return Err(vm.new_value_error(
+            "convolve() CPU path expects at least 3 channels".to_string(),
+        ));
+    }
+
+    let expected = h.saturating_mul(w).saturating_mul(c);
+    let src = tensor_flat_bytes(image_arg, vm)?;
+    if src.len() < expected {
+        return Err(vm.new_value_error(format!(
+            "convolve(): tensor has {} elements, shape product is {}",
+            src.len(),
+            expected
+        )));
+    }
+    let mut dst = src.clone();
+    let pad = (kernel_size.saturating_sub(1)) / 2;
+
+    for y in 0..h {
+        for x in 0..w {
+            let base = (y * w + x) * c;
+            for out_ch in 0..3 {
+                let mut sum = 0.0f32;
+                for ky in 0..kernel_size {
+                    let sy = y as isize + ky as isize - pad as isize;
+                    if sy < 0 || sy >= h as isize {
+                        continue;
+                    }
+                    for kx in 0..kernel_size {
+                        let sx = x as isize + kx as isize - pad as isize;
+                        if sx < 0 || sx >= w as isize {
+                            continue;
+                        }
+                        let src_base = (sy as usize * w + sx as usize) * c;
+                        for in_ch in 0..3 {
+                            let kval = kernel_hwc[(ky * kernel_size + kx) * 3 + in_ch];
+                            sum += src[src_base + in_ch] as f32 * kval;
+                        }
+                    }
+                }
+                dst[base + out_ch] = sum.clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    crate::xos_module::with_frame_write_buffer(vm, Some(image_arg), |buffer| {
+        let n = buffer.len().min(dst.len());
+        buffer[..n].copy_from_slice(&dst[..n]);
+        crate::rasterizer::note_frame_cpu_write();
+        Ok(())
+    })?;
+    Ok(true)
+}
+
 /// xos.ops.convolve(frame.tensor, kernel, inplace=True)
 ///
 /// Dispatches to Burn on the frame GPU tensor only (same path as the TV demo).
@@ -436,12 +513,6 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             ("kernel", kernel_dev.clone()),
         ],
     )?;
-    let engine_dev = device_policy::require_engine_device(vm, "convolve", &frame_dev)?;
-    if engine_dev != ComputeDevice::Gpu {
-        return Err(vm.new_runtime_error(
-            "convolve() requires a GPU engine (Burn path)".to_string(),
-        ));
-    }
     if !device_policy::is_frame_backed_tensor(image_arg, vm) {
         return Err(vm.new_value_error(
             "convolve() with KxKx3 RGB kernel requires frame.tensor; use a KxK kernel for simulation tensors"
@@ -450,6 +521,18 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     }
 
     let (kernel, kernel_size) = parse_rgb_kernel(kernel_arg, vm)?;
+    let engine_dev = device_policy::require_engine_device(vm, "convolve", &frame_dev)?;
+    if engine_dev != ComputeDevice::Gpu {
+        if inplace {
+            if convolve_frame_rgb_same_cpu_inplace(image_arg, vm, &kernel, kernel_size, stride)? {
+                return direct_fill_sentinel(vm);
+            }
+        }
+        return Err(vm.new_runtime_error(
+            "convolve() CPU path currently supports only inplace=True on frame.tensor".to_string(),
+        ));
+    }
+
     let kernel_nchw = kernel_hwc_to_nchw(&kernel, kernel_size);
     let stride_pair = [stride, stride];
 

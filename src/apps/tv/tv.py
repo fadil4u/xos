@@ -2,6 +2,8 @@ import xos
 
 
 class TVApp(xos.Application):
+    # device = "gpu"
+
     def __init__(self):
         super().__init__()
 

@@ -806,10 +806,16 @@ impl ApplicationHandler for AppStateWrapper {
                         .device_descriptor_from_adapter(crate::gpu_present::shared_wgpu_device_descriptor)
                         .build()
                         .or_else(|primary_err| {
-                            eprintln!(
-                                "Primary pixels device init failed ({}); retrying with default wgpu descriptor.",
-                                primary_err
-                            );
+                            if std::env::var("XOS_LOG_WGPU_FALLBACK")
+                                .ok()
+                                .as_deref()
+                                == Some("1")
+                            {
+                                eprintln!(
+                                    "Primary pixels device init failed ({}); retrying with default wgpu descriptor.",
+                                    primary_err
+                                );
+                            }
                             PixelsBuilder::new(
                                 size.width,
                                 size.height,
