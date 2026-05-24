@@ -1573,6 +1573,13 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
         .unwrap();
     module
         .set_attr(
+            "default_device",
+            vm.ctx.new_str(crate::device::default_tensor_device()),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr(
             "_standalone_tick_pace",
             vm.new_function("_standalone_tick_pace", standalone_tick_pace),
             vm,

@@ -159,5 +159,5 @@ pub fn tensor_device_for_constructor(args: &FuncArgs, vm: &VirtualMachine) -> Py
     if let Some(dev) = args.kwargs.get("device") {
         return normalize_tensor_device_label(dev, vm);
     }
-    Ok(effective_compute_device(vm)?.as_str().to_string())
+    Ok(crate::device::default_tensor_device().to_string())
 }

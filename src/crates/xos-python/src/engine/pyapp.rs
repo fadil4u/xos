@@ -967,6 +967,11 @@ class Tensor:
     def device(self):
         return self._data.get('device', 'cpu')
 
+    @property
+    def default_device(self):
+        import xos
+        return getattr(xos, "default_device", "cpu")
+
     def printpack(self, compress=False):
         """Return a single-line pack string (optionally deflate-compressed). Does not print."""
         import xos
