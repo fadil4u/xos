@@ -24,6 +24,7 @@ const FRAME_ZOOM_WHEEL_RATE: f32 = 0.085;
 const F3_INTERACTION_FADE_DECAY: f32 = 3.2;
 const FONT_OPTION_BASE_SIZE: f32 = 19.0;
 const FONT_HEADER_BASE_SIZE: f32 = 17.0;
+const RUNTIME_INFO_BASE_SIZE: f32 = 15.0;
 #[cfg(target_os = "ios")]
 const IOS_MESH_TOGGLE_LABEL_BASE_SIZE: f32 = 16.0;
 
@@ -57,6 +58,7 @@ pub struct F3Menu {
     pub visible: bool,
     fps_rasterizer: TextRasterizer,
     scale_rasterizer: TextRasterizer,
+    runtime_info_rasterizer: TextRasterizer,
     font_header_rasterizer: TextRasterizer,
     font_option_rasterizers: Vec<TextRasterizer>,
     font_option_families: Vec<FontFamily>,
@@ -96,6 +98,8 @@ impl F3Menu {
         fps_rasterizer.set_text("— FPS".to_string());
         let mut scale_rasterizer = TextRasterizer::new(font.clone(), BASE_FONT);
         scale_rasterizer.set_text("Scale: 100%".to_string());
+        let mut runtime_info_rasterizer = TextRasterizer::new(font.clone(), RUNTIME_INFO_BASE_SIZE);
+        runtime_info_rasterizer.set_text("Device: cpu | Context: cpu-staging | Platform: native".to_string());
         let mut font_header_rasterizer = TextRasterizer::new(font, FONT_HEADER_BASE_SIZE);
         font_header_rasterizer.set_text("Default font".to_string());
         let mut font_option_rasterizers = Vec::with_capacity(font_option_families.len());
@@ -118,6 +122,7 @@ impl F3Menu {
             visible: false,
             fps_rasterizer,
             scale_rasterizer,
+            runtime_info_rasterizer,
             font_header_rasterizer,
             font_option_rasterizers,
             font_option_families,
@@ -181,6 +186,7 @@ struct PanelGeom {
     toggle_top: f32,
     #[cfg(target_os = "ios")]
     toggle_bottom: f32,
+    runtime_info_top: f32,
     font_option_count: usize,
     button_left: f32,
     button_right: f32,
@@ -218,6 +224,7 @@ fn panel_geom(
     let font_option_gap = (4.0 * us).max(2.0);
     #[cfg(target_os = "ios")]
     let toggle_h = (28.0 * us).max(18.0);
+    let runtime_info_h = (22.0 * us).max(14.0);
     let font_options_h = if font_option_count == 0 {
         0.0
     } else {
@@ -238,6 +245,7 @@ fn panel_geom(
     let toggle_extra = line_gap + toggle_h;
     #[cfg(not(target_os = "ios"))]
     let toggle_extra = 0.0_f32;
+    let runtime_info_extra = line_gap + runtime_info_h;
     let panel_h = pad
         + line_h
         + line_gap
@@ -247,6 +255,7 @@ fn panel_geom(
         + font_extra
         + minimap_extra
         + toggle_extra
+        + runtime_info_extra
         + pad;
     let panel_left = w - panel_w - pad;
     let panel_top = safe_top + pad;
@@ -285,6 +294,22 @@ fn panel_geom(
     };
     #[cfg(target_os = "ios")]
     let toggle_bottom = toggle_top + toggle_h;
+    let runtime_info_top = if cfg!(target_os = "ios") {
+        #[cfg(target_os = "ios")]
+        {
+            toggle_bottom + line_gap
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            slider_bottom + line_gap
+        }
+    } else if show_minimap {
+        minimap_bottom + line_gap
+    } else if font_option_count > 0 {
+        font_options_top + font_options_h + line_gap
+    } else {
+        slider_bottom + line_gap
+    };
     PanelGeom {
         panel_left,
         panel_top,
@@ -306,6 +331,7 @@ fn panel_geom(
         toggle_top,
         #[cfg(target_os = "ios")]
         toggle_bottom,
+        runtime_info_top,
         font_option_count,
         button_left,
         button_right,
@@ -376,6 +402,10 @@ fn sync_f3_default_font(menu: &mut F3Menu) {
     let mut scale = TextRasterizer::new(active_font.clone(), menu.scale_rasterizer.font_size);
     scale.set_text(menu.scale_rasterizer.text.clone());
     menu.scale_rasterizer = scale;
+    let mut runtime_info =
+        TextRasterizer::new(active_font.clone(), menu.runtime_info_rasterizer.font_size);
+    runtime_info.set_text(menu.runtime_info_rasterizer.text.clone());
+    menu.runtime_info_rasterizer = runtime_info;
     let mut header = TextRasterizer::new(active_font, menu.font_header_rasterizer.font_size);
     header.set_text(menu.font_header_rasterizer.text.clone());
     menu.font_header_rasterizer = header;
@@ -416,6 +446,32 @@ fn tick_scale_zoom_smoothing(state: &mut EngineState) {
     state.f3_menu.scale_zoom_velocity = 0.0;
     state.f3_menu.scale_zoom_value = next;
     state.ui_scale_percent = next.round() as u16;
+}
+
+#[inline]
+fn runtime_platform_label() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        return "windows";
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return "macos";
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return "linux";
+    }
+    #[cfg(target_os = "ios")]
+    {
+        return "ios";
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        return "wasm";
+    }
+    #[allow(unreachable_code)]
+    "unknown"
 }
 
 /// Handle Ctrl/Cmd + wheel zoom on the F3 scale.
@@ -493,6 +549,8 @@ fn measure_f3_panel(state: &mut EngineState) -> Option<(PanelGeom, f32)> {
     } else {
         (1.0 / state.delta_time_seconds.max(1e-5)).round().max(0.0) as u32
     };
+    let runtime_device = state.compute_device.as_str();
+    let runtime_platform = runtime_platform_label();
 
     {
         let menu = &mut state.f3_menu;
@@ -505,6 +563,14 @@ fn measure_f3_panel(state: &mut EngineState) -> Option<(PanelGeom, f32)> {
         menu.scale_rasterizer
             .set_text(format!("Scale: {}%", state.ui_scale_percent));
         menu.scale_rasterizer.tick(width, height);
+        menu.runtime_info_rasterizer
+            .set_font_size(RUNTIME_INFO_BASE_SIZE * ui_scale);
+        menu.runtime_info_rasterizer.set_text(format!(
+            "Device: {} | Platform: {}",
+            runtime_device,
+            runtime_platform
+        ));
+        menu.runtime_info_rasterizer.tick(width, height);
 
         menu.font_header_rasterizer
             .set_font_size(FONT_HEADER_BASE_SIZE * ui_scale);
@@ -546,8 +612,17 @@ fn measure_f3_panel(state: &mut EngineState) -> Option<(PanelGeom, f32)> {
     let button_size = (22.0 * ui_scale).max(12.0);
     let button_gap = (6.0 * ui_scale).max(3.0);
     let slider_w = (200.0 * ui_scale).max(120.0);
+    let runtime_w: f32 = state
+        .f3_menu
+        .runtime_info_rasterizer
+        .characters
+        .iter()
+        .map(|c| c.metrics.advance_width)
+        .sum();
     // Keep panel width stable so FPS/scale text width changes don't make the slider jitter horizontally.
-    let content_w = slider_w.max(button_size * 2.0 + button_gap + 240.0 * ui_scale);
+    let content_w = slider_w
+        .max(button_size * 2.0 + button_gap + 240.0 * ui_scale)
+        .max(runtime_w + 18.0 * ui_scale);
     let (_, _, vw, vh) = frame_view_rect_norm(state);
     let show_minimap = vw < 0.999 || vh < 0.999;
     let geom = panel_geom(
@@ -1486,6 +1561,16 @@ fn draw_f3_panel_native(
         scratch,
         pw,
         ph,
+        &state.f3_menu.runtime_info_rasterizer,
+        geom.slider_left - pl_f,
+        geom.runtime_info_top - pt_f,
+        (190, 210, 245),
+        overlay_alpha,
+    );
+    blend_text_into_scratch(
+        scratch,
+        pw,
+        ph,
         &state.f3_menu.font_header_rasterizer,
         geom.slider_left - pl_f,
         geom.font_header_top - pt_f,
@@ -1566,6 +1651,16 @@ fn draw_f3_text_layer_cpu(
             (255, 255, 255),
             overlay_alpha,
         );
+    blend_text_cpu(
+        buffer,
+        wf,
+        hf,
+        &menu.runtime_info_rasterizer,
+        geom.slider_left,
+        geom.runtime_info_top,
+        (190, 210, 245),
+        overlay_alpha,
+    );
     blend_text_cpu(
         buffer,
         wf,
