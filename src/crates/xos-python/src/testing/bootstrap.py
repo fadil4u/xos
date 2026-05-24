@@ -19,6 +19,16 @@ def parametrize(*args, **kwargs):
     values = args[1]
 
     def decorator(fn):
+        params = getattr(fn, "_xos_parametrizations", None)
+        if params is None:
+            # Backward-compat: migrate legacy single-param metadata if present.
+            legacy = getattr(fn, "_xos_parametrize", None)
+            params = []
+            if legacy:
+                params.append(legacy)
+            fn._xos_parametrizations = params
+        fn._xos_parametrizations.append((name, list(values)))
+        # Keep legacy field set so older readers still see the last param.
         fn._xos_parametrize = (name, list(values))
         return fn
 
@@ -26,11 +36,21 @@ def parametrize(*args, **kwargs):
 
 
 def _collect_cases(fn):
-    if getattr(fn, "_xos_parametrize", None):
-        name, values = fn._xos_parametrize
-        out = []
-        for v in values:
-            out.append((fn.__name__, {name: v}, fn))
+    params = getattr(fn, "_xos_parametrizations", None)
+    if not params:
+        legacy = getattr(fn, "_xos_parametrize", None)
+        if legacy:
+            params = [legacy]
+    if params:
+        out = [(fn.__name__, {}, fn)]
+        for name, values in params:
+            next_out = []
+            for test_id, kwargs, f in out:
+                for v in values:
+                    kw = dict(kwargs)
+                    kw[name] = v
+                    next_out.append((test_id, kw, f))
+            out = next_out
         return out
     return [(fn.__name__, {}, fn)]
 
