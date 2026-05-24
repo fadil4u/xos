@@ -737,11 +737,20 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     if engine_dev != ComputeDevice::Gpu {
         if inplace {
             if convolve_frame_rgb_same_cpu_inplace(image_arg, vm, &kernel, kernel_size, stride)? {
-                return direct_fill_sentinel(vm);
+                return Ok(image_arg.clone());
             }
+        } else {
+            return convolve_tensor_rgb_same_cpu_out(
+                image_arg,
+                vm,
+                &kernel,
+                kernel_size,
+                stride,
+                &frame_dev,
+            );
         }
         return Err(vm.new_runtime_error(
-            "convolve() CPU path currently supports only inplace=True on frame.tensor".to_string(),
+            "convolve() CPU frame path unavailable (internal error)".to_string(),
         ));
     }
 
@@ -750,7 +759,7 @@ pub fn convolve(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
     if inplace {
         if try_convolve_on_frame_gpu(&kernel_nchw, kernel_size, stride_pair) {
-            return direct_fill_sentinel(vm);
+            return Ok(image_arg.clone());
         }
     } else if try_convolve_on_frame_gpu_out(kernel_nchw, kernel_size, stride_pair) {
         return wrap_gpu_conv_output_tensor(vm, engine_dev);

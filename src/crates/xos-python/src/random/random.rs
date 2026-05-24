@@ -161,6 +161,7 @@ fn parse_f64(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<f64> {
 /// If shape is provided as a tuple, returns an array of random values
 /// dtype can be specified (default: inferred from context - float32 for kernels, uint8 for images)
 fn uniform(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let target_device = device_policy::tensor_device_for_constructor(&args, vm)?;
     let args_vec = args.args;
 
     // Parse low parameter (default: 0.0) - accept int or float
@@ -286,9 +287,7 @@ fn uniform(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         let py_tensor = Tensor::new(random_data, shape.clone());
         let dict = py_tensor.to_py_dict(vm, DType::Float32)?;
         if let Ok(d) = dict.clone().downcast::<rustpython_vm::builtins::PyDict>() {
-            if let Ok(dev) = device_policy::effective_compute_device(vm) {
-                device_policy::tag_tensor_device(&d, dev.as_str(), vm);
-            }
+            device_policy::tag_tensor_device(&d, &target_device, vm);
         }
 
         // Wrap in _TensorWrapper for nice display and compatibility
@@ -332,6 +331,9 @@ fn uniform(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
         let py_tensor = Tensor::new(random_data, shape.clone());
         let dict = py_tensor.to_py_dict(vm, DType::UInt8)?;
+        if let Ok(d) = dict.clone().downcast::<rustpython_vm::builtins::PyDict>() {
+            device_policy::tag_tensor_device(&d, &target_device, vm);
+        }
 
         // Wrap in _TensorWrapper for nice display and compatibility
         if let Ok(wrapper_class) = vm.builtins.get_attr("Tensor", vm) {
