@@ -843,12 +843,22 @@ fn standalone_tick_pace(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             let elapsed = now.saturating_duration_since(prev);
             if elapsed < target {
                 let wait = target - elapsed;
-                // Sleep coarse part, then spin a tiny tail for sub-ms targets (e.g. 2k FPS).
-                let spin_tail = xos_core::time::Duration::from_micros(200);
-                if wait > spin_tail {
-                    std::thread::sleep(wait - spin_tail);
+                // For high-FPS targets, avoid Windows sleep granularity and busy-spin only.
+                // For lower FPS, sleep most of the interval then spin the final tail.
+                let high_fps_cutoff = xos_core::time::Duration::from_millis(2);
+                let spin_tail = xos_core::time::Duration::from_micros(300);
+                let spin_for = if wait > high_fps_cutoff {
+                    spin_tail.min(wait)
+                } else {
+                    wait
+                };
+                if wait > high_fps_cutoff {
+                    let coarse_sleep = wait.saturating_sub(spin_tail);
+                    if !coarse_sleep.is_zero() {
+                        std::thread::sleep(coarse_sleep);
+                    }
                 }
-                let deadline = std::time::Instant::now() + spin_tail.min(wait);
+                let deadline = std::time::Instant::now() + spin_for;
                 while std::time::Instant::now() < deadline {
                     std::hint::spin_loop();
                 }
