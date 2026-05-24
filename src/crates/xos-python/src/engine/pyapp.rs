@@ -1541,8 +1541,16 @@ class Application:
         return self.frame.get_height()
     
     def tick(self):
-        """Called every frame. Override this method."""
-        raise NotImplementedError("Subclasses must implement tick()")
+        """Called every frame.
+
+        Base `Application` supports functional-style usage (`app = xos.Application(...); app.tick()`)
+        by running the full pre/post pipeline even without a subclass override.
+        """
+        self._xos_pre_tick()
+        try:
+            return None
+        finally:
+            self._xos_post_tick()
 
     def pre_tick(self):
         """Called before each tick() in both run() and standalone tick() modes."""

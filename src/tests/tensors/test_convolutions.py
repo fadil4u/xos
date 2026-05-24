@@ -47,11 +47,11 @@ def frame_convolutions(
     input_shape: tuple,
     dtype,
 ):
-    headless = True
+    headless = False
 
     h, w, _ = input_shape
-    cpu_app = xos.Application(device="cpu", headless=headless, width=w, height=h)
-    gpu_app = xos.Application(device="gpu", headless=headless, width=w, height=h)
+    cpu_app = xos.Application(device="cpu", headless=headless, width=w, height=h, max_fps=2048)
+    gpu_app = xos.Application(device="gpu", headless=headless, width=w, height=h, max_fps=2048)
 
     assert cpu_app.frame.tensor.shape == gpu_app.frame.tensor.shape
     assert cpu_app.frame.tensor.shape[0] == h
@@ -90,3 +90,8 @@ def frame_convolutions(
     print(cpu_y.shape, gpu_y.shape)
     assert cpu_y.shape == gpu_y.shape
     assert xos.allclose(cpu_y, gpu_y)
+
+    while True:
+        cpu_app.tick()
+        xos.sleep(0.01)
+    # gpu_app.tick()
