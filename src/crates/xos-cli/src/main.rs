@@ -400,6 +400,63 @@ fn resolve_python_file_path(file: &Path) -> Option<PathBuf> {
     }
 }
 
+fn require_and_set_coder_directory_for_code_alias(original_args: &mut Vec<String>) {
+    if original_args.len() < 2 || !original_args[1].eq_ignore_ascii_case("code") {
+        return;
+    }
+
+    let mut tail: Vec<String> = original_args[2..].to_vec();
+    let positional_indices: Vec<usize> = tail
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| (!arg.starts_with('-')).then_some(idx))
+        .collect();
+
+    if positional_indices.is_empty() {
+        eprintln!("❌ `xos code` requires a target directory.");
+        eprintln!("   Usage: xos code <target-directory> [--wasm|--web|--react-native|--ios]");
+        std::process::exit(1);
+    }
+    if positional_indices.len() > 1 {
+        let args = positional_indices
+            .iter()
+            .map(|idx| tail[*idx].as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("❌ `xos code` takes exactly one target directory, got: {args}");
+        std::process::exit(1);
+    }
+
+    let dir_idx = positional_indices[0];
+    let dir_arg = tail.remove(dir_idx);
+    let dir_path = PathBuf::from(&dir_arg);
+    let absolute_path = if dir_path.is_absolute() {
+        dir_path
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(dir_path),
+            Err(e) => {
+                eprintln!("❌ failed to resolve current directory: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
+    let resolved = absolute_path
+        .canonicalize()
+        .unwrap_or_else(|_| absolute_path.clone());
+    if !resolved.exists() || !resolved.is_dir() {
+        eprintln!(
+            "❌ `xos code` target directory does not exist or is not a directory: {}",
+            resolved.display()
+        );
+        std::process::exit(1);
+    }
+
+    std::env::set_var("XOS_CODER_DIR", &resolved);
+    original_args.truncate(2);
+    original_args.extend(tail);
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 struct RelayNode {
     session_id: String,
@@ -839,8 +896,9 @@ fn main() {
         }
     }
 
-    // `xos code` → `xos rs-app coder` (same flags as `xos rs-app coder`, e.g. `--wasm`, `--ios`).
+    // `xos code <dir>` → `xos rs-app coder` (same flags as `xos rs-app coder`, e.g. `--wasm`, `--ios`).
     if original_args.len() >= 2 && original_args[1].eq_ignore_ascii_case("code") {
+        require_and_set_coder_directory_for_code_alias(&mut original_args);
         original_args[1] = "rs-app".to_string();
         original_args.insert(2, "coder".to_string());
     }

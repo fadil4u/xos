@@ -6,10 +6,11 @@
 //! **client thread** only (same as other rendering/input). That allows non-[`Send`] apps such as
 //! [`CoderApp`] (RustPython is not `Send`).
 
-use jni::objects::JClass;
+use jni::objects::{JClass, JString};
 use jni::sys::{jfloat, jint, jlong, jobject, jstring};
 use jni::JNIEnv;
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::sync::Once;
 use xos::apps::coder::CoderApp;
 use xos::engine::{
@@ -86,6 +87,53 @@ pub extern "system" fn Java_ai_xlate_xos_XosNative_ping(env: JNIEnv, _class: JCl
         Ok(s) => s.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_ai_xlate_xos_XosNative_setCoderScriptsDirectory(
+    mut env: JNIEnv,
+    _class: JClass,
+    absolute_directory: JString,
+) {
+    let Ok(path_java) = env.get_string(&absolute_directory) else {
+        throw(
+            &mut env,
+            "java/lang/IllegalArgumentException",
+            "directory path must be a non-null string",
+        );
+        return;
+    };
+
+    let raw = path_java.to_string_lossy().trim().to_string();
+    if raw.is_empty() {
+        throw(
+            &mut env,
+            "java/lang/IllegalArgumentException",
+            "directory path must not be empty",
+        );
+        return;
+    }
+
+    let dir = PathBuf::from(raw);
+    if !dir.is_absolute() {
+        throw(
+            &mut env,
+            "java/lang/IllegalArgumentException",
+            "directory path must be absolute",
+        );
+        return;
+    }
+    if !dir.exists() || !dir.is_dir() {
+        throw(
+            &mut env,
+            "java/lang/IllegalArgumentException",
+            "directory path must exist and be a directory",
+        );
+        return;
+    }
+
+    let resolved = dir.canonicalize().unwrap_or(dir);
+    std::env::set_var("XOS_CODER_DIR", resolved);
 }
 
 #[no_mangle]

@@ -99,4 +99,10 @@ public final class XosNative {
      * F3 toggles the global FPS overlay (same as desktop/winit). Not sent as a Unicode character.
      */
     public static native void onF3();
+
+    /**
+     * Sets the coder scripts directory used by the native Coder app. Must be an absolute directory path.
+     * Call before {@link #init} when embedding xos in another host (e.g. Minekov).
+     */
+    public static native void setCoderScriptsDirectory(String absoluteDirectoryPath);
 }

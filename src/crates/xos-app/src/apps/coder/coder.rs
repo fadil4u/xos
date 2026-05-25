@@ -11,10 +11,13 @@ use xos_core::rasterizer::text::fonts;
 use rustpython_vm::{Interpreter, AsObject};
 use include_dir::{include_dir, Dir};
 use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 // Embed the entire example-scripts/ directory at compile time
 static PYTHON_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../../example-scripts");
+const CODER_SCRIPTS_DIR_ENV_VAR: &str = "XOS_CODER_DIR";
 
 /// Task bar depth, chrome buttons, and related spacing/fonts vs prior baseline.
 const CODER_CHROME_SCALE: f32 = 1.3;
@@ -57,6 +60,106 @@ struct PythonFile {
     content: String,
     #[allow(dead_code)]
     path: String,
+}
+
+fn collect_py_files_from_embedded(dir: &Dir, base_path: &str, files: &mut Vec<PythonFile>) {
+    for file in dir.files() {
+        if let Some(filename) = file.path().file_name() {
+            if filename.to_string_lossy().ends_with(".py") {
+                let relative_path = if base_path.is_empty() {
+                    filename.to_string_lossy().to_string()
+                } else {
+                    format!("{}/{}", base_path, filename.to_string_lossy())
+                };
+
+                if let Ok(content) = std::str::from_utf8(file.contents()) {
+                    files.push(PythonFile {
+                        name: relative_path.clone(),
+                        content: content.to_string(),
+                        path: relative_path,
+                    });
+                }
+            }
+        }
+    }
+
+    for subdir in dir.dirs() {
+        if let Some(dirname) = subdir.path().file_name() {
+            let new_base = if base_path.is_empty() {
+                dirname.to_string_lossy().to_string()
+            } else {
+                format!("{}/{}", base_path, dirname.to_string_lossy())
+            };
+            collect_py_files_from_embedded(subdir, &new_base, files);
+        }
+    }
+}
+
+fn load_embedded_python_files() -> Vec<PythonFile> {
+    let mut python_files = Vec::new();
+    collect_py_files_from_embedded(&PYTHON_DIR, "", &mut python_files);
+    python_files
+}
+
+fn collect_py_files_from_disk(
+    dir: &Path,
+    root: &Path,
+    files: &mut Vec<PythonFile>,
+) -> Result<(), String> {
+    let mut entries = fs::read_dir(dir)
+        .map_err(|e| format!("failed to read {}: {e}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase());
+
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_py_files_from_disk(&path, root, files)?;
+            continue;
+        }
+        let is_python = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("py"))
+            .unwrap_or(false);
+        if !is_python {
+            continue;
+        }
+
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|e| format!("failed to relativize {}: {e}", path.display()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        files.push(PythonFile {
+            name: relative.clone(),
+            content,
+            path: relative,
+        });
+    }
+    Ok(())
+}
+
+fn load_python_files_from_disk(root: &Path) -> Result<Vec<PythonFile>, String> {
+    if !root.exists() {
+        return Err(format!(
+            "coder scripts directory does not exist: {}",
+            root.display()
+        ));
+    }
+    if !root.is_dir() {
+        return Err(format!(
+            "coder scripts path is not a directory: {}",
+            root.display()
+        ));
+    }
+
+    let mut python_files = Vec::new();
+    collect_py_files_from_disk(root, root, &mut python_files)?;
+    Ok(python_files)
 }
 
 pub struct CoderApp {
@@ -464,46 +567,25 @@ impl CoderApp {
     pub fn new() -> Self {
         // Enable coder logging to capture all Rust/Swift logs
         super::logging::enable_coder_logging();
-        
-        // Discover all Python files from the embedded directory
-        let mut python_files = Vec::new();
-        
-        fn collect_py_files(dir: &Dir, base_path: &str, files: &mut Vec<PythonFile>) {
-            // Collect all .py files in this directory
-            for file in dir.files() {
-                if let Some(filename) = file.path().file_name() {
-                    if filename.to_string_lossy().ends_with(".py") {
-                        let relative_path = if base_path.is_empty() {
-                            filename.to_string_lossy().to_string()
-                        } else {
-                            format!("{}/{}", base_path, filename.to_string_lossy())
-                        };
-                        
-                        if let Ok(content) = std::str::from_utf8(file.contents()) {
-                            files.push(PythonFile {
-                                name: relative_path.clone(),
-                                content: content.to_string(),
-                                path: relative_path,
-                            });
-                        }
+        let mut python_files = if cfg!(target_os = "ios") {
+            load_embedded_python_files()
+        } else if let Ok(raw_dir) = std::env::var(CODER_SCRIPTS_DIR_ENV_VAR) {
+            let trimmed = raw_dir.trim();
+            if trimmed.is_empty() {
+                load_embedded_python_files()
+            } else {
+                match load_python_files_from_disk(Path::new(trimmed)) {
+                    Ok(files) => files,
+                    Err(err) => {
+                        eprintln!("⚠️ {err}");
+                        eprintln!("⚠️ falling back to embedded example scripts");
+                        load_embedded_python_files()
                     }
                 }
             }
-            
-            // Recursively collect from subdirectories
-            for subdir in dir.dirs() {
-                if let Some(dirname) = subdir.path().file_name() {
-                    let new_base = if base_path.is_empty() {
-                        dirname.to_string_lossy().to_string()
-                    } else {
-                        format!("{}/{}", base_path, dirname.to_string_lossy())
-                    };
-                    collect_py_files(subdir, &new_base, files);
-                }
-            }
-        }
-        
-        collect_py_files(&PYTHON_DIR, "", &mut python_files);
+        } else {
+            load_embedded_python_files()
+        };
         
         // Keep stable deterministic ordering by normalized folder/name.
         python_files.sort_by(|a, b| {
