@@ -10,6 +10,7 @@ use jni::objects::JClass;
 use jni::sys::{jfloat, jint, jlong, jobject, jstring};
 use jni::JNIEnv;
 use std::cell::RefCell;
+use std::sync::Once;
 use xos::apps::coder::CoderApp;
 use xos::engine::{
     apply_frame_view_zoom,
@@ -21,6 +22,8 @@ use xos::engine::{
 thread_local! {
     static HOST: RefCell<Option<Host>> = RefCell::new(None);
 }
+
+static INIT_HOOKS_ONCE: Once = Once::new();
 
 struct Host {
     engine: EngineState,
@@ -73,6 +76,10 @@ fn throw(env: &mut JNIEnv, class: &str, msg: &str) {
     let _ = env.throw_new(class, msg);
 }
 
+fn ensure_xos_hooks() {
+    INIT_HOOKS_ONCE.call_once(xos::init_hooks);
+}
+
 #[no_mangle]
 pub extern "system" fn Java_ai_xlate_xos_XosNative_ping(env: JNIEnv, _class: JClass) -> jstring {
     match env.new_string("Hello from xos-java!") {
@@ -97,72 +104,83 @@ pub extern "system" fn Java_ai_xlate_xos_XosNative_init(
         return;
     }
 
-    HOST.with(|cell| {
-        let mut guard = cell.borrow_mut();
+    let init_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ensure_xos_hooks();
+        HOST.with(|cell| {
+            let mut guard = cell.borrow_mut();
 
-        // Already initialized (e.g. Java called init again before resize): same as resize, do not re-run setup.
-        if let Some(host) = guard.as_mut() {
-            host.engine.resize_frame(width as u32, height as u32);
-            resize_minecraft_upload(&mut host.minecraft_upload, width as u32, height as u32);
-            let _ = host
-                .app
-                .on_screen_size_change(&mut host.engine, width as u32, height as u32);
-            return;
-        }
+            // Already initialized (e.g. Java called init again before resize): same as resize, do not re-run setup.
+            if let Some(host) = guard.as_mut() {
+                host.engine.resize_frame(width as u32, height as u32);
+                resize_minecraft_upload(&mut host.minecraft_upload, width as u32, height as u32);
+                let _ = host
+                    .app
+                    .on_screen_size_change(&mut host.engine, width as u32, height as u32);
+                return;
+            }
 
-        let safe_region = SafeRegionBoundingRectangle::full_screen();
-        let mut engine = EngineState {
-            frame: FrameState::new(width as u32, height as u32, safe_region),
-            compute_device: xos::compute_device::ComputeDevice::resolve_auto(None),
-            mouse: MouseState {
-                x: 0.0,
-                y: 0.0,
-                dx: 0.0,
-                dy: 0.0,
-                is_left_clicking: false,
-                is_right_clicking: false,
-                style: CursorStyleSetter::new(),
-            },
-            keyboard: KeyboardState {
-                onscreen: xos::ui::onscreen_keyboard::OnScreenKeyboard::new(),
-                modifiers: xos::engine::KeyboardModifiers::default(),
-            },
-            f3_menu: F3Menu::new(),
-            ui_scale_percent: 100,
-            delta_time_seconds: 1.0 / 60.0,
-            paused: false,
-            pending_step_ticks: 0,
-            paused_frame_snapshot_pending: false,
-            frame_view_zoom: 1.0,
-            frame_view_zoom_target: 1.0,
-            frame_view_zoom_velocity: 0.0,
-            frame_view_center_x: 0.5,
-            frame_view_center_y: 0.5,
-            f3_fps_label_override: None,
-            embed_last_plain_click_screen: None,
-            embed_synthetic_click_screen: None,
-        };
+            let safe_region = SafeRegionBoundingRectangle::full_screen();
+            let mut engine = EngineState {
+                frame: FrameState::new(width as u32, height as u32, safe_region),
+                compute_device: xos::compute_device::ComputeDevice::resolve_auto(None),
+                mouse: MouseState {
+                    x: 0.0,
+                    y: 0.0,
+                    dx: 0.0,
+                    dy: 0.0,
+                    is_left_clicking: false,
+                    is_right_clicking: false,
+                    style: CursorStyleSetter::new(),
+                },
+                keyboard: KeyboardState {
+                    onscreen: xos::ui::onscreen_keyboard::OnScreenKeyboard::new(),
+                    modifiers: xos::engine::KeyboardModifiers::default(),
+                },
+                f3_menu: F3Menu::new(),
+                ui_scale_percent: 100,
+                delta_time_seconds: 1.0 / 60.0,
+                paused: false,
+                pending_step_ticks: 0,
+                paused_frame_snapshot_pending: false,
+                frame_view_zoom: 1.0,
+                frame_view_zoom_target: 1.0,
+                frame_view_zoom_velocity: 0.0,
+                frame_view_center_x: 0.5,
+                frame_view_center_y: 0.5,
+                f3_fps_label_override: None,
+                embed_last_plain_click_screen: None,
+                embed_synthetic_click_screen: None,
+            };
 
-        let mut app: Box<dyn Application> = Box::new(CoderApp::new());
-        if let Err(e) = app.setup(&mut engine) {
-            throw(
-                &mut env,
-                "java/lang/RuntimeException",
-                &format!("xos Application::setup failed: {e}"),
-            );
-            return;
-        }
+            let mut app: Box<dyn Application> = Box::new(CoderApp::new());
+            if let Err(e) = app.setup(&mut engine) {
+                throw(
+                    &mut env,
+                    "java/lang/RuntimeException",
+                    &format!("xos Application::setup failed: {e}"),
+                );
+                return;
+            }
 
-        let mu = vec![0; (width as usize) * (height as usize) * 4];
-        *guard = Some(Host {
-            engine,
-            app,
-            last_tick_instant: None,
-            tick_count: 0,
-            minecraft_upload: mu,
-            minecraft_viewport_alpha: 153,
+            let mu = vec![0; (width as usize) * (height as usize) * 4];
+            *guard = Some(Host {
+                engine,
+                app,
+                last_tick_instant: None,
+                tick_count: 0,
+                minecraft_upload: mu,
+                minecraft_viewport_alpha: 153,
+            });
         });
-    });
+    }));
+
+    if init_result.is_err() {
+        throw(
+            &mut env,
+            "java/lang/RuntimeException",
+            "xos-java init panicked; check native logs",
+        );
+    }
 }
 
 #[no_mangle]
@@ -174,80 +192,90 @@ pub extern "system" fn Java_ai_xlate_xos_XosNative_shutdown(_env: JNIEnv, _class
 
 #[no_mangle]
 pub extern "system" fn Java_ai_xlate_xos_XosNative_tick(mut env: JNIEnv, _class: JClass) {
-    HOST.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        let Some(host) = guard.as_mut() else {
-            throw(
-                &mut env,
-                "java/lang/IllegalStateException",
-                "xos-java not initialized; call init first",
-            );
-            return;
-        };
+    let tick_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        HOST.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let Some(host) = guard.as_mut() else {
+                throw(
+                    &mut env,
+                    "java/lang/IllegalStateException",
+                    "xos-java not initialized; call init first",
+                );
+                return;
+            };
 
-        host.tick_count = host.tick_count.wrapping_add(1);
-        if host.engine.paused {
-            if host.engine.pending_step_ticks > 0 {
-                host.engine.pending_step_ticks = host.engine.pending_step_ticks.saturating_sub(1);
+            host.tick_count = host.tick_count.wrapping_add(1);
+            if host.engine.paused {
+                if host.engine.pending_step_ticks > 0 {
+                    host.engine.pending_step_ticks = host.engine.pending_step_ticks.saturating_sub(1);
+                    tick_frame_delta(&mut host.engine, &mut host.last_tick_instant);
+                    host.app.tick(&mut host.engine);
+                } else {
+                    host.last_tick_instant = Some(std::time::Instant::now());
+                }
+            } else {
                 tick_frame_delta(&mut host.engine, &mut host.last_tick_instant);
                 host.app.tick(&mut host.engine);
-            } else {
-                host.last_tick_instant = Some(std::time::Instant::now());
             }
-        } else {
-            tick_frame_delta(&mut host.engine, &mut host.last_tick_instant);
-            host.app.tick(&mut host.engine);
-        }
 
-        tick_frame_view_zoom(&mut host.engine);
-        apply_frame_view_zoom(&mut host.engine);
+            tick_frame_view_zoom(&mut host.engine);
+            apply_frame_view_zoom(&mut host.engine);
 
-        // Same order as `native_engine`: draw the on-screen keyboard on top after the app tick.
-        {
+            // Same order as `native_engine`: draw the on-screen keyboard on top after the app tick.
+            {
+                let shape = host.engine.frame.shape();
+                let height = shape[0] as u32;
+                let width = shape[1] as u32;
+                let mouse_x = host.engine.mouse.x;
+                let mouse_y = host.engine.mouse.y;
+                let mouse_dx = host.engine.mouse.dx;
+                let mouse_dy = host.engine.mouse.dy;
+                let mouse_left = host.engine.mouse.is_left_clicking;
+                let mouse_right = host.engine.mouse.is_right_clicking;
+                let safe_region = host.engine.frame.safe_region_boundaries.clone();
+                let (buffer, keyboard) = {
+                    let buffer_ptr = host.engine.frame.buffer_mut() as *mut [u8];
+                    let keyboard_ptr: *mut xos::ui::onscreen_keyboard::OnScreenKeyboard =
+                        &mut host.engine.keyboard.onscreen;
+                    (unsafe { &mut *buffer_ptr }, unsafe { &mut *keyboard_ptr })
+                };
+                keyboard.tick(
+                    buffer,
+                    width,
+                    height,
+                    mouse_x,
+                    mouse_y,
+                    mouse_dx,
+                    mouse_dy,
+                    mouse_left,
+                    mouse_right,
+                    &safe_region,
+                );
+            }
+
+            tick_f3_menu(&mut host.engine);
+
             let shape = host.engine.frame.shape();
-            let height = shape[0] as u32;
-            let width = shape[1] as u32;
-            let mouse_x = host.engine.mouse.x;
-            let mouse_y = host.engine.mouse.y;
-            let mouse_dx = host.engine.mouse.dx;
-            let mouse_dy = host.engine.mouse.dy;
-            let mouse_left = host.engine.mouse.is_left_clicking;
-            let mouse_right = host.engine.mouse.is_right_clicking;
-            let safe_region = host.engine.frame.safe_region_boundaries.clone();
-            let (buffer, keyboard) = {
-                let buffer_ptr = host.engine.frame.buffer_mut() as *mut [u8];
-                let keyboard_ptr: *mut xos::ui::onscreen_keyboard::OnScreenKeyboard =
-                    &mut host.engine.keyboard.onscreen;
-                (unsafe { &mut *buffer_ptr }, unsafe { &mut *keyboard_ptr })
-            };
-            keyboard.tick(
-                buffer,
-                width,
-                height,
-                mouse_x,
-                mouse_y,
-                mouse_dx,
-                mouse_dy,
-                mouse_left,
-                mouse_right,
-                &safe_region,
+            let w = shape[1];
+            let h = shape[0];
+            let src = host.engine.frame_buffer_mut();
+            pack_rgba_to_minecraft_native_image(
+                &src[..],
+                &mut host.minecraft_upload,
+                w,
+                h,
+                host.minecraft_viewport_alpha,
             );
-        }
+        });
+    }));
 
-        tick_f3_menu(&mut host.engine);
-
-        let shape = host.engine.frame.shape();
-        let w = shape[1];
-        let h = shape[0];
-        let src = host.engine.frame_buffer_mut();
-        pack_rgba_to_minecraft_native_image(
-            &src[..],
-            &mut host.minecraft_upload,
-            w,
-            h,
-            host.minecraft_viewport_alpha,
+    if tick_result.is_err() {
+        throw(
+            &mut env,
+            "java/lang/RuntimeException",
+            "xos-java tick panicked; check native logs",
         );
-    });
+    }
 }
 
 #[no_mangle]
