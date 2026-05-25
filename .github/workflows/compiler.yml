@@ -178,7 +178,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm --entrypoint xos -v "$PWD:/workspace" -w /workspace xos-ci-test:latest test
+          docker run --rm -v "$PWD:/workspace" -w /workspace xos-ci-test:latest test
 
       - name: Build and push commit-tag image
         if: ${{ success() }}
