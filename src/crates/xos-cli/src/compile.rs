@@ -1,4 +1,4 @@
-//! CLI compile helpers: `xos compile` (release by default), `xos compile --no-release`, `--ios`, `--wasm`.
+//! CLI compile helpers: `xos compile` (release by default), `xos compile --no-release`, `--ios`, `--wasm`, `--java`.
 
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
@@ -44,12 +44,42 @@ pub fn standard_target_root(project_root: &Path) -> PathBuf {
     }
 }
 
+/// Cargo `target` directory for Java/JNI builds (`xos-java` crate).
+pub fn java_target_root(project_root: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        // Keep Windows on Cargo's default target dir for best App Control compatibility.
+        return project_root.join("target");
+    }
+
+    #[cfg(not(windows))]
+    {
+        project_root.join("target").join("java")
+    }
+}
+
 fn profile_dir_name(release: bool) -> &'static str {
     if release {
         "release"
     } else {
         "debug"
     }
+}
+
+fn java_library_filename() -> &'static str {
+    if cfg!(windows) {
+        "xos_java.dll"
+    } else if cfg!(target_os = "macos") {
+        "libxos_java.dylib"
+    } else {
+        "libxos_java.so"
+    }
+}
+
+fn java_library_artifact_path(project_root: &Path, release: bool) -> PathBuf {
+    java_target_root(project_root)
+        .join(profile_dir_name(release))
+        .join(java_library_filename())
 }
 
 /// Built `xos` binary under `target/standard/{debug|release}/`.
@@ -831,6 +861,76 @@ pub fn compile_ios_rust(clean: bool, release: bool) -> bool {
     }
 
     println!("✅ Rust library compiled successfully.");
+    true
+}
+
+/// Build JNI dynamic library (`xos-java` crate) for Java host integrations.
+pub fn compile_java(clean: bool, release: bool) -> bool {
+    let profile_label = profile_dir_name(release);
+    println!("☕ Compiling Rust JNI library for Java ({profile_label})...");
+
+    let project_root = find_project_root();
+    let java_target_dir = java_target_root(&project_root);
+    if clean {
+        println!("🧹 cargo clean --target-dir {} ...", java_target_dir.display());
+        let clean_status = Command::new("cargo")
+            .current_dir(&project_root)
+            .args(["clean", "--target-dir"])
+            .arg(&java_target_dir)
+            .status();
+        match clean_status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                eprintln!("❌ Java clean failed ({s}).");
+                return false;
+            }
+            Err(e) => {
+                eprintln!("❌ failed to run cargo clean for Java target dir: {e}");
+                return false;
+            }
+        }
+    }
+
+    let mut compile_cmd = Command::new("cargo");
+    compile_cmd.current_dir(&project_root);
+    compile_cmd.env("CARGO_TARGET_DIR", &java_target_dir);
+    #[cfg(windows)]
+    {
+        // `xos-java` links through `ct2rs`; on Windows this lane often needs static CRT linkage.
+        // Keep this scoped to `xos compile --java` so standard CLI compilation behavior stays unchanged.
+        let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+        if !rustflags.contains("target-feature=+crt-static") {
+            if !rustflags.trim().is_empty() {
+                rustflags.push(' ');
+            }
+            rustflags.push_str("-C target-feature=+crt-static");
+        }
+        compile_cmd.env("RUSTFLAGS", rustflags);
+    }
+    compile_cmd.arg("build");
+    if release {
+        compile_cmd.arg("--release");
+    }
+    compile_cmd.args(["-p", "xos-java"]);
+    compile_cmd.stdout(Stdio::inherit());
+    compile_cmd.stderr(Stdio::inherit());
+
+    let status = match compile_cmd.status() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("❌ failed to run cargo build for xos-java: {e}");
+            return false;
+        }
+    };
+    if !status.success() {
+        eprintln!("❌ Java/JNI compile failed. Exiting.");
+        return false;
+    }
+
+    println!(
+        "✅ Java/JNI library built: {}",
+        java_library_artifact_path(&project_root, release).display()
+    );
     true
 }
 

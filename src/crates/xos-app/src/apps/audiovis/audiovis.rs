@@ -199,7 +199,11 @@ impl AudiovisApp {
 #[cfg(not(target_os = "linux"))]
 impl Application for AudiovisApp {
     fn setup(&mut self, _state: &mut EngineState) -> Result<(), String> {
-        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            not(target_os = "ios"),
+            feature = "native_file_dialog"
+        ))]
         {
             let source_items = [
                 "Play audio file",
@@ -289,6 +293,18 @@ impl Application for AudiovisApp {
                 }
                 _ => return Err("Invalid audio source selection.".to_string()),
             }
+        }
+
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            not(target_os = "ios"),
+            not(feature = "native_file_dialog")
+        ))]
+        {
+            return Err(
+                "File picker unavailable: xos-app was built without `native_file_dialog` feature."
+                    .to_string(),
+            );
         }
 
         // Open the selector after the capture/playback source is ready

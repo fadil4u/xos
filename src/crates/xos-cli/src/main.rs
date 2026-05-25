@@ -149,6 +149,9 @@ enum Commands {
         /// Compile Rust library for iOS (`xos compile --ios`; same with `xos build --ios`)
         #[arg(long)]
         ios: bool,
+        /// Compile Java/JNI dynamic library (`xos-java`) for host integrations (`xos compile --java`)
+        #[arg(long)]
+        java: bool,
         /// Build WebAssembly output into `target/wasm/main/` and create `xos-wasm.zip`.
         #[arg(long)]
         wasm: bool,
@@ -899,12 +902,14 @@ fn main() {
     match cli.command {
         Some(Commands::Compile {
             ios,
+            java,
             wasm,
             clean,
             no_release,
         }) => {
-            if ios && wasm {
-                eprintln!("❌ use either --ios or --wasm, not both");
+            let lane_count = (ios as u8) + (wasm as u8) + (java as u8);
+            if lane_count > 1 {
+                eprintln!("❌ use only one lane flag at a time: --ios, --wasm, or --java");
                 std::process::exit(1);
             }
             if let Err(e) = daemon::stop_daemon() {
@@ -913,6 +918,8 @@ fn main() {
             let release = !no_release;
             let compile_ok = if ios {
                 compile::compile_ios_rust(clean, release)
+            } else if java {
+                compile::compile_java(clean, release)
             } else if wasm {
                 compile::compile_wasm(clean)
             } else {
