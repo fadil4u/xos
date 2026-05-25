@@ -29,6 +29,9 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          shared-key: xos-windows-cli
 
       - name: Compile CLI
         shell: pwsh
@@ -61,6 +64,9 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          shared-key: xos-macos-cli
 
       - name: Compile CLI
         shell: bash
@@ -95,6 +101,9 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          shared-key: xos-linux-wasm
 
       - name: Setup wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
@@ -155,14 +164,15 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          pull: true
           push: false
           load: true
           tags: xos-ci-test:latest
           cache-from: |
             type=registry,ref=xlateai/xos:prerelease
             type=registry,ref=xlateai/xos:latest
-            type=gha
-          cache-to: type=gha,mode=max
+            type=gha,scope=xos-docker
+          cache-to: type=gha,scope=xos-docker,mode=max
 
       - name: Unit Tests
         shell: bash
@@ -180,5 +190,6 @@ jobs:
           cache-from: |
             type=registry,ref=xlateai/xos:prerelease
             type=registry,ref=xlateai/xos:latest
+            type=gha,scope=xos-docker
           tags: |
             xlateai/xos:${{ steps.tags.outputs.short_sha }}
