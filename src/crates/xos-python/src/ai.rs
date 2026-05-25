@@ -5,14 +5,15 @@ use std::path::PathBuf;
 use burn::tensor::DType;
 #[cfg(all(not(target_arch = "wasm32"), feature = "whisper_burn"))]
 use burn_store::{BurnpackStore, ModuleStore};
-use rustpython_vm::{
-    builtins::PyModule, function::FuncArgs, PyObjectRef, PyRef, PyResult, VirtualMachine,
-};
-
+use rustpython_vm::{builtins::PyModule, function::FuncArgs, PyRef, PyResult, VirtualMachine};
+#[cfg(not(target_arch = "wasm32"))]
+use rustpython_vm::PyObjectRef;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::tensor_buf::tensor_flat_data_list;
 
 /// Mono `f32` samples — same contract as in-tree `whisper_burn::transcribe`: one contiguous buffer,
 /// values typically in ~`[-1, 1]`, `sample_rate` Hz (Whisper expects 16 kHz).
+#[cfg(not(target_arch = "wasm32"))]
 fn waveform_vec_from_py(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<Vec<f32>> {
     match tensor_flat_data_list(obj, vm) {
         Ok(v) if !v.is_empty() => Ok(v),
@@ -58,6 +59,7 @@ fn parse_usize_flag(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_string_arg(
     obj: Option<&PyObjectRef>,
     default: &str,

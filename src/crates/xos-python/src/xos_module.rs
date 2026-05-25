@@ -1,5 +1,9 @@
-use rustpython_vm::{builtins::PyModule, function::FuncArgs, PyRef, PyResult, VirtualMachine};
-use std::collections::HashMap;
+use rustpython_vm::{
+    builtins::{PyDict, PyModule},
+    function::FuncArgs,
+    AsObject, PyObjectRef, PyRef, PyResult, VirtualMachine,
+};
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::{LazyLock, Mutex};
 
@@ -14,26 +18,217 @@ use winit::{
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{Key, NamedKey},
-    platform::pump_events::{EventLoopExtPumpEvents, PumpStatus},
     window::{CursorIcon, Window, WindowAttributes, WindowId},
 };
 
 static STANDALONE_FRAME_BUFFERS: LazyLock<Mutex<HashMap<u64, Vec<u8>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static STANDALONE_FRAME_DIMS: LazyLock<Mutex<HashMap<u64, (usize, usize)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static STANDALONE_FRAME_DRAWN: LazyLock<Mutex<HashMap<u64, bool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static STANDALONE_TICK_LAST_END: LazyLock<Mutex<HashMap<u64, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn mark_standalone_frame_drawn(viewport_id: u64) {
+    if let Ok(mut drawn) = STANDALONE_FRAME_DRAWN.lock() {
+        drawn.insert(viewport_id, true);
+    }
+}
+
+pub(crate) fn standalone_frame_was_drawn(viewport_id: u64) -> bool {
+    STANDALONE_FRAME_DRAWN
+        .lock()
+        .ok()
+        .and_then(|d| d.get(&viewport_id).copied())
+        .unwrap_or(false)
+}
+
+pub(crate) fn standalone_frame_dims(viewport_id: u64) -> Option<(usize, usize)> {
+    STANDALONE_FRAME_DIMS
+        .lock()
+        .ok()
+        .and_then(|dims| dims.get(&viewport_id).copied())
+}
+
+/// Stretch-blit RGBA bytes into a destination framebuffer.
+pub(crate) fn blit_rgba_init_to_buffer(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dest: &mut [u8],
+    dest_w: usize,
+    dest_h: usize,
+) -> bool {
+    let required = dest_w.saturating_mul(dest_h).saturating_mul(4);
+    if dest.len() != required || src.len() != src_w.saturating_mul(src_h).saturating_mul(4) {
+        return false;
+    }
+    if src_w == dest_w && src_h == dest_h {
+        dest.copy_from_slice(src);
+    } else {
+        crate::rasterizer::blit_rgba_stretch(src, src_w, src_h, dest, dest_w, dest_h);
+    }
+    true
+}
 
 pub(crate) fn standalone_frame_buffer_copy(viewport_id: u64) -> Option<Vec<u8>> {
-    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
-    {
-        let _ = viewport_id;
-        None
+    STANDALONE_FRAME_BUFFERS
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&viewport_id).cloned())
+}
+
+pub(crate) fn write_standalone_frame_buffer(viewport_id: u64, bytes: &[u8]) -> bool {
+    let mut buffers = match STANDALONE_FRAME_BUFFERS.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let Some(buf) = buffers.get_mut(&viewport_id) else {
+        return false;
+    };
+    let n = buf.len().min(bytes.len());
+    buf[..n].copy_from_slice(&bytes[..n]);
+    mark_standalone_frame_drawn(viewport_id);
+    true
+}
+
+/// Stretch-blit a standalone init framebuffer into the engine framebuffer (e.g. after `__init__`).
+pub(crate) fn apply_standalone_init_to_engine_buffer(
+    viewport_id: u64,
+    dest: &mut [u8],
+    dest_w: usize,
+    dest_h: usize,
+) -> bool {
+    let required = dest_w.saturating_mul(dest_h).saturating_mul(4);
+    if dest.len() != required {
+        return false;
     }
-    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+    let (src_w, src_h) = match STANDALONE_FRAME_DIMS
+        .lock()
+        .ok()
+        .and_then(|dims| dims.get(&viewport_id).copied())
     {
-        STANDALONE_FRAME_BUFFERS
+        Some(dims) => dims,
+        None => return false,
+    };
+    let src = match STANDALONE_FRAME_BUFFERS
+        .lock()
+        .ok()
+        .and_then(|buffers| buffers.get(&viewport_id).cloned())
+    {
+        Some(buf) => buf,
+        None => return false,
+    };
+    blit_rgba_init_to_buffer(&src, src_w, src_h, dest, dest_w, dest_h)
+}
+
+pub(crate) fn snapshot_standalone_init_frame(viewport_id: u64) -> Option<(Vec<u8>, usize, usize)> {
+    let (src_w, src_h) = standalone_frame_dims(viewport_id)?;
+    let src = standalone_frame_buffer_copy(viewport_id)?;
+    if src.len() != src_w.saturating_mul(src_h).saturating_mul(4) {
+        return None;
+    }
+    Some((src, src_w, src_h))
+}
+
+pub(crate) fn python_app_viewport_id(
+    vm: &VirtualMachine,
+    app_instance: &rustpython_vm::PyObjectRef,
+) -> Option<u64> {
+    let vid_obj = vm
+        .get_attribute_opt(app_instance.clone(), "_xos_viewport_id")
+        .ok()??;
+    vid_obj
+        .clone()
+        .try_into_value::<i64>(vm)
+        .ok()
+        .map(|v| v.max(0) as u64)
+}
+
+fn extract_tensor_viewport_id(
+    obj: &rustpython_vm::PyObjectRef,
+    vm: &VirtualMachine,
+) -> Option<u64> {
+    use rustpython_vm::builtins::PyDict;
+    let mut cur = obj.clone();
+    for _ in 0..12 {
+        if let Some(dict) = cur.downcast_ref::<PyDict>() {
+            if let Ok(vid_obj) = dict.get_item("_xos_viewport_id", vm) {
+                if let Ok(vid) = vid_obj.try_into_value::<i64>(vm) {
+                    return Some(vid.max(0) as u64);
+                }
+            }
+        }
+        // Unwrap xos.Tensor / xos.Frame wrappers (`_data` holds the backing dict).
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "_data") {
+            cur = attr;
+            continue;
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "tensor") {
+            cur = attr;
+            continue;
+        }
+        break;
+    }
+    None
+}
+
+fn builtin_app_viewport_id(vm: &VirtualMachine) -> Option<u64> {
+    let app = vm
+        .get_attribute_opt(vm.builtins.as_object().to_owned(), "__xos_app_instance__")
+        .ok()
+        .flatten()?;
+    python_app_viewport_id(vm, &app)
+}
+
+/// Run `f` on the active tick framebuffer, or on a standalone init buffer when called from `__init__`.
+pub(crate) fn with_frame_write_buffer<R>(
+    vm: &VirtualMachine,
+    tensor_hint: Option<&rustpython_vm::PyObjectRef>,
+    f: impl FnOnce(&mut [u8]) -> PyResult<R>,
+) -> PyResult<R> {
+    {
+        let buffer_guard = crate::rasterizer::CURRENT_FRAME_BUFFER
             .lock()
-            .ok()
-            .and_then(|m| m.get(&viewport_id).cloned())
+            .map_err(|_| vm.new_runtime_error("frame buffer context lock poisoned".to_string()))?;
+        let width = *crate::rasterizer::CURRENT_FRAME_WIDTH
+            .lock()
+            .map_err(|_| vm.new_runtime_error("frame buffer context lock poisoned".to_string()))?;
+        let height = *crate::rasterizer::CURRENT_FRAME_HEIGHT
+            .lock()
+            .map_err(|_| vm.new_runtime_error("frame buffer context lock poisoned".to_string()))?;
+        if let Some(buffer_ptr) = buffer_guard.as_ref() {
+            let buffer_len = width.saturating_mul(height).saturating_mul(4);
+            let ptr = buffer_ptr.as_ptr();
+            let buffer = unsafe { std::slice::from_raw_parts_mut(ptr, buffer_len) };
+            return f(buffer);
+        }
     }
+
+    let viewport_id = tensor_hint
+        .and_then(|t| extract_tensor_viewport_id(t, vm))
+        .or_else(|| builtin_app_viewport_id(vm))
+        .ok_or_else(|| {
+            vm.new_runtime_error(
+                "No frame buffer context set. uniform_fill must be called during tick() \
+or from Application.__init__() after super().__init__().".to_string(),
+            )
+        })?;
+
+    let mut buffers = STANDALONE_FRAME_BUFFERS.lock().map_err(|_| {
+        vm.new_runtime_error("standalone frame buffer lock poisoned".to_string())
+    })?;
+    let buf = buffers.get_mut(&viewport_id).ok_or_else(|| {
+        vm.new_runtime_error(
+            "No standalone init framebuffer for this app. Call super().__init__() first.".to_string(),
+        )
+    })?;
+    let out = f(buf.as_mut_slice());
+    if out.is_ok() {
+        mark_standalone_frame_drawn(viewport_id);
+    }
+    out
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
@@ -65,6 +260,8 @@ struct StandalonePreviewApp {
     command_held: HashMap<u64, bool>,
     shift_held: HashMap<u64, bool>,
     frame_pan_dragging: HashMap<u64, bool>,
+    /// Viewports currently inside `frame._pause_viewport` (close button ends wait only).
+    pause_blocking: HashSet<u64>,
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
@@ -82,7 +279,25 @@ impl StandalonePreviewApp {
             command_held: HashMap::new(),
             shift_held: HashMap::new(),
             frame_pan_dragging: HashMap::new(),
+            pause_blocking: HashSet::new(),
         }
+    }
+
+    /// Tear down one preview window and its viewport state (does not exit the process).
+    fn close_viewport(&mut self, viewport_id: u64) {
+        if let Some(window_id) = self.viewport_to_window.remove(&viewport_id) {
+            self.states.remove(&window_id);
+        }
+        self.f3_engine_state.remove(&viewport_id);
+        self.pending_frames.remove(&viewport_id);
+        self.source_frames.remove(&viewport_id);
+        self.paused_base_frames.remove(&viewport_id);
+        self.pending_window_creates.remove(&viewport_id);
+        self.last_tick_instant.remove(&viewport_id);
+        self.command_held.remove(&viewport_id);
+        self.shift_held.remove(&viewport_id);
+        self.frame_pan_dragging.remove(&viewport_id);
+        self.pause_blocking.remove(&viewport_id);
     }
 
     fn viewport_paused(&self, viewport_id: u64) -> bool {
@@ -143,6 +358,7 @@ impl StandalonePreviewApp {
                         size.height.max(1),
                         safe_region,
                     ),
+                    compute_device: xos_core::compute_device::ComputeDevice::Cpu,
                     mouse: xos_core::engine::MouseState {
                         x: 0.0,
                         y: 0.0,
@@ -161,6 +377,7 @@ impl StandalonePreviewApp {
                     delta_time_seconds: 1.0 / 60.0,
                     paused: false,
                     pending_step_ticks: 0,
+                    paused_frame_snapshot_pending: false,
                     frame_view_zoom: 1.0,
                     frame_view_zoom_target: 1.0,
                     frame_view_zoom_velocity: 0.0,
@@ -316,11 +533,8 @@ impl ApplicationHandler for StandalonePreviewApp {
         };
         match event {
             WindowEvent::CloseRequested => {
-                // Standalone preview is typically driven by user script loops
-                // (e.g. `while ...: app.tick()`). Closing any preview window should
-                // terminate the script immediately and close all windows together.
-                let _ = viewport_id;
-                std::process::exit(0);
+                // Close only this preview window; `pause()` and test runners continue.
+                self.close_viewport(viewport_id);
             }
             WindowEvent::Resized(new_size) => {
                 let Some(state) = self.states.get_mut(&_window_id) else {
@@ -518,9 +732,6 @@ impl ApplicationHandler for StandalonePreviewApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.ensure_windows_created(event_loop);
-        if self.states.is_empty() {
-            event_loop.exit();
-        }
     }
 }
 
@@ -564,6 +775,14 @@ fn get_mouse(_args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 /// xos.print() - alias to builtin print (no longer needed, kept for compatibility)
 /// We'll set this to builtins.print in make_module instead
 
+/// xos.clear() - clear the terminal screen (ANSI erase + home cursor).
+fn xos_clear(_args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b[2J\x1b[H");
+    let _ = out.flush();
+    Ok(vm.ctx.none())
+}
+
 /// xos.sleep() - sleep for a number of seconds
 /// NOTE: This blocks the main thread, so it's not recommended for use in the coder app
 /// For periodic updates, use a viewport app with tick() instead
@@ -582,6 +801,75 @@ fn xos_sleep(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             ));
         }
     }
+    Ok(vm.ctx.none())
+}
+
+/// xos._standalone_tick_pace(viewport_id, max_fps)
+/// Enforce standalone app.tick() pacing in Rust (higher precision than Python-side sleep loops).
+fn standalone_tick_pace(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let viewport_id: i64 = args
+        .args
+        .first()
+        .ok_or_else(|| vm.new_type_error("_standalone_tick_pace(viewport_id, max_fps)".to_string()))?
+        .clone()
+        .try_into_value(vm)?;
+    let max_fps: f64 = args
+        .args
+        .get(1)
+        .ok_or_else(|| vm.new_type_error("_standalone_tick_pace(viewport_id, max_fps)".to_string()))?
+        .clone()
+        .try_into_value(vm)?;
+
+    const MIN_MAX_FPS: f64 = 0.1;
+    const GLOBAL_MAX_FPS: f64 = 5000.0;
+    if !max_fps.is_finite() || max_fps < MIN_MAX_FPS || max_fps > GLOBAL_MAX_FPS {
+        return Err(vm.new_value_error(format!(
+            "max_fps must be between {MIN_MAX_FPS} and {GLOBAL_MAX_FPS}, got {max_fps}"
+        )));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let id = viewport_id.max(0) as u64;
+        let now = std::time::Instant::now();
+        let previous = {
+            let mut last = STANDALONE_TICK_LAST_END
+                .lock()
+                .map_err(|_| vm.new_runtime_error("standalone pacing lock poisoned".to_string()))?;
+            last.insert(id, now)
+        };
+        if let Some(prev) = previous {
+            let target = xos_core::time::Duration::from_secs_f64(1.0 / max_fps);
+            let elapsed = now.saturating_duration_since(prev);
+            if elapsed < target {
+                let wait = target - elapsed;
+                // For high-FPS targets, avoid Windows sleep granularity and busy-spin only.
+                // For lower FPS, sleep most of the interval then spin the final tail.
+                let high_fps_cutoff = xos_core::time::Duration::from_millis(2);
+                let spin_tail = xos_core::time::Duration::from_micros(300);
+                let spin_for = if wait > high_fps_cutoff {
+                    spin_tail.min(wait)
+                } else {
+                    wait
+                };
+                if wait > high_fps_cutoff {
+                    let coarse_sleep = wait.saturating_sub(spin_tail);
+                    if !coarse_sleep.is_zero() {
+                        std::thread::sleep(coarse_sleep);
+                    }
+                }
+                let deadline = std::time::Instant::now() + spin_for;
+                while std::time::Instant::now() < deadline {
+                    std::hint::spin_loop();
+                }
+                let mut last = STANDALONE_TICK_LAST_END
+                    .lock()
+                    .map_err(|_| vm.new_runtime_error("standalone pacing lock poisoned".to_string()))?;
+                last.insert(id, std::time::Instant::now());
+            }
+        }
+    }
+
     Ok(vm.ctx.none())
 }
 
@@ -777,6 +1065,29 @@ fn frame_clear(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         )
     })?;
 
+    if let Some(engine) = crate::engine::py_engine_tls::engine_compute_device() {
+        if engine == xos_core::compute_device::ComputeDevice::Gpu {
+            if crate::engine::py_engine_tls::with_engine_state_mut(|state| {
+                xos_core::burn_raster::fill_solid_gpu(
+                    &mut state.frame,
+                    (
+                        r.clamp(0, 255) as u8,
+                        g.clamp(0, 255) as u8,
+                        b.clamp(0, 255) as u8,
+                        a.clamp(0, 255) as u8,
+                    ),
+                );
+                true
+            })
+            .is_some()
+            {
+                return Ok(vm.ctx.none());
+            }
+        } else {
+            // CPU app: fall through to staging fill below.
+        }
+    }
+
     let buffer_len = width * height * 4;
     let buffer = unsafe { std::slice::from_raw_parts_mut(buffer_ptr, buffer_len) };
     crate::rasterizer::fill_buffer_solid_rgba(
@@ -788,6 +1099,240 @@ fn frame_clear(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     );
 
     Ok(vm.ctx.none())
+}
+
+pub(crate) fn tensor_rust_id(obj: &PyObjectRef, vm: &VirtualMachine) -> Option<u64> {
+    let mut cur = obj.clone();
+    for _ in 0..8 {
+        if let Some(dict) = cur.downcast_ref::<PyDict>() {
+            if let Ok(id_obj) = dict.get_item("_rust_tensor", vm) {
+                if let Ok(id) = id_obj.try_into_value::<i64>(vm) {
+                    return Some(id.max(0) as u64);
+                }
+            }
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur, "_data") {
+            cur = attr;
+            continue;
+        }
+        break;
+    }
+    None
+}
+
+fn hwc_flat_to_rgba(flat: &[f32], height: usize, width: usize, channels: usize) -> Vec<u8> {
+    let mut rgba = vec![0u8; height.saturating_mul(width).saturating_mul(4)];
+    let ch = channels.max(1);
+    for y in 0..height {
+        for x in 0..width {
+            let src = (y * width + x) * ch;
+            let dst = (y * width + x) * 4;
+            if src + ch <= flat.len() && dst + 3 < rgba.len() {
+                rgba[dst] = flat[src].clamp(0.0, 255.0) as u8;
+                if ch > 1 {
+                    rgba[dst + 1] = flat[src + 1].clamp(0.0, 255.0) as u8;
+                }
+                if ch > 2 {
+                    rgba[dst + 2] = flat[src + 2].clamp(0.0, 255.0) as u8;
+                }
+                rgba[dst + 3] = if ch >= 4 {
+                    flat[src + 3].clamp(0.0, 255.0) as u8
+                } else {
+                    255
+                };
+            }
+        }
+    }
+    rgba
+}
+
+fn ensure_standalone_buffer(viewport_id: u64, width: usize, height: usize, vm: &VirtualMachine) -> PyResult {
+    let mut buffers = STANDALONE_FRAME_BUFFERS.lock().map_err(|_| {
+        vm.new_runtime_error("standalone frame buffer lock poisoned".to_string())
+    })?;
+    let buf = buffers.entry(viewport_id).or_default();
+    let required = width.saturating_mul(height).saturating_mul(4);
+    if buf.len() != required {
+        buf.resize(required, 0);
+    }
+    crate::rasterizer::set_frame_buffer_context(buf.as_mut_slice(), width, height);
+    STANDALONE_FRAME_DIMS
+        .lock()
+        .map_err(|_| vm.new_runtime_error("standalone frame dims lock poisoned".to_string()))?
+        .insert(viewport_id, (width, height));
+    Ok(vm.ctx.none())
+}
+
+/// xos._sync_tensor_to_standalone(tensor, viewport_id)
+fn sync_tensor_to_standalone(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let args_vec = args.args;
+    if args_vec.len() < 2 {
+        return Err(vm.new_type_error(
+            "_sync_tensor_to_standalone(tensor, viewport_id)".to_string(),
+        ));
+    }
+    let tensor = &args_vec[0];
+    let viewport_id: u64 = args_vec[1].clone().try_into_value::<i64>(vm)?.max(0) as u64;
+    let shape = crate::tensor_buf::tensor_shape_tuple(tensor, vm)?;
+    if shape.len() < 2 {
+        return Err(vm.new_type_error("tensor needs (height, width, ...)".to_string()));
+    }
+    let height = shape[0].max(1);
+    let width = shape[1].max(1);
+    let channels = shape.get(2).copied().unwrap_or(4).max(1);
+    ensure_standalone_buffer(viewport_id, width, height, vm)?;
+    let flat = crate::tensor_buf::tensor_flat_data_list(tensor, vm)?;
+    let rgba = hwc_flat_to_rgba(&flat, height, width, channels);
+    write_standalone_frame_buffer(viewport_id, &rgba);
+    Ok(vm.ctx.none())
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+fn standalone_present_viewport_inner(viewport_id: u64, vm: &VirtualMachine) -> PyResult<()> {
+    use winit::event_loop::EventLoop;
+    use winit::platform::pump_events::EventLoopExtPumpEvents;
+
+    let width = *crate::rasterizer::CURRENT_FRAME_WIDTH
+        .lock()
+        .unwrap() as u32;
+    let height = *crate::rasterizer::CURRENT_FRAME_HEIGHT
+        .lock()
+        .unwrap() as u32;
+    let frame = STANDALONE_FRAME_BUFFERS
+        .lock()
+        .map_err(|_| vm.new_runtime_error("standalone frame buffer lock poisoned".to_string()))?
+        .get(&viewport_id)
+        .cloned()
+        .unwrap_or_default();
+
+    STANDALONE_PREVIEW_HOST.with(|slot| {
+        let mut opt = slot.borrow_mut();
+        if opt.is_none() {
+            let event_loop = EventLoop::new().map_err(|e| {
+                vm.new_runtime_error(format!("failed to create preview event loop: {e}"))
+            })?;
+            *opt = Some(StandalonePreviewHost {
+                event_loop,
+                app: StandalonePreviewApp::new(),
+            });
+        }
+        if let Some(host) = opt.as_mut() {
+            host.app.pending_frames.insert(
+                viewport_id,
+                StandalonePendingFrame {
+                    width: width.max(1),
+                    height: height.max(1),
+                    rgba: frame,
+                },
+            );
+            if let Some(pf) = host.app.pending_frames.get(&viewport_id) {
+                host.app.source_frames.insert(
+                    viewport_id,
+                    StandalonePendingFrame {
+                        width: pf.width,
+                        height: pf.height,
+                        rgba: pf.rgba.clone(),
+                    },
+                );
+            }
+            if !host.app.viewport_to_window.contains_key(&viewport_id) {
+                host.app.pending_window_creates.insert(
+                    viewport_id,
+                    (width.max(1), height.max(1)),
+                );
+            }
+            host.app.render_viewport(viewport_id);
+            let timeout = Some(xos_core::time::Duration::ZERO);
+            let _ = host.event_loop.pump_app_events(timeout, &mut host.app);
+        }
+        Ok(())
+    })
+}
+
+#[cfg(any(target_arch = "wasm32", target_os = "ios"))]
+fn standalone_present_viewport_inner(_viewport_id: u64, _vm: &VirtualMachine) -> PyResult<()> {
+    Ok(())
+}
+
+/// xos.frame._present_viewport(viewport_id) — show / refresh without blocking.
+fn frame_present_viewport(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let viewport_id: u64 = if !args.args.is_empty() {
+        args.args[0].clone().try_into_value::<i64>(vm)?.max(0) as u64
+    } else {
+        0
+    };
+    standalone_present_viewport_inner(viewport_id, vm)?;
+    Ok(vm.ctx.none())
+}
+
+/// xos.frame._tick_viewport(viewport_id) -> bool — pump events once; False if the window closed.
+fn frame_tick_viewport(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
+    {
+        let _ = args;
+        return Ok(vm.ctx.new_bool(false).into());
+    }
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+    {
+        use winit::platform::pump_events::EventLoopExtPumpEvents;
+
+        let viewport_id: u64 = if !args.args.is_empty() {
+            args.args[0].clone().try_into_value::<i64>(vm)?.max(0) as u64
+        } else {
+            0
+        };
+        let still_open = STANDALONE_PREVIEW_HOST.with(|slot| -> PyResult<bool> {
+            let mut opt = slot.borrow_mut();
+            let Some(host) = opt.as_mut() else {
+                return Ok(false);
+            };
+            if !host.app.viewport_to_window.contains_key(&viewport_id) {
+                return Ok(false);
+            }
+            let timeout = Some(xos_core::time::Duration::from_millis(16));
+            let _ = host.event_loop.pump_app_events(timeout, &mut host.app);
+            Ok(host.app.viewport_to_window.contains_key(&viewport_id))
+        })?;
+        Ok(vm.ctx.new_bool(still_open).into())
+    }
+}
+
+/// xos.frame._pause_viewport(viewport_id) — block until the preview window is closed.
+fn frame_pause_viewport(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
+    {
+        return Ok(vm.ctx.none());
+    }
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+    {
+        use winit::platform::pump_events::EventLoopExtPumpEvents;
+
+        let viewport_id: u64 = if !args.args.is_empty() {
+            args.args[0].clone().try_into_value::<i64>(vm)?.max(0) as u64
+        } else {
+            0
+        };
+        standalone_present_viewport_inner(viewport_id, vm)?;
+        STANDALONE_PREVIEW_HOST.with(|slot| {
+            let mut opt = slot.borrow_mut();
+            if let Some(host) = opt.as_mut() {
+                host.app.pause_blocking.insert(viewport_id);
+                if let Some(es) = host.app.f3_engine_state.get_mut(&viewport_id) {
+                    es.paused = true;
+                }
+                while host.app.pause_blocking.contains(&viewport_id) {
+                    if !host.app.viewport_to_window.contains_key(&viewport_id) {
+                        break;
+                    }
+                    let timeout = Some(xos_core::time::Duration::from_millis(250));
+                    let _ = host.event_loop.pump_app_events(timeout, &mut host.app);
+                }
+                host.app.pause_blocking.remove(&viewport_id);
+            }
+            Ok(())
+        })?;
+        Ok(vm.ctx.none())
+    }
 }
 
 /// xos.frame._begin_standalone(width=800, height=600) -> frame dict
@@ -813,17 +1358,7 @@ fn frame_begin_standalone(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         600
     };
 
-    {
-        let mut buffers = STANDALONE_FRAME_BUFFERS.lock().map_err(|_| {
-            vm.new_runtime_error("standalone frame buffer lock poisoned".to_string())
-        })?;
-        let buf = buffers.entry(viewport_id).or_default();
-        let required = width.saturating_mul(height).saturating_mul(4);
-        if buf.len() != required {
-            buf.resize(required, 0);
-        }
-        crate::rasterizer::set_frame_buffer_context(buf.as_mut_slice(), width, height);
-    }
+    ensure_standalone_buffer(viewport_id, width, height, vm)?;
 
     let tensor_dict = vm.ctx.new_dict();
     tensor_dict.set_item(
@@ -837,7 +1372,10 @@ fn frame_begin_standalone(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             .into(),
         vm,
     )?;
-    tensor_dict.set_item("device", vm.ctx.new_str("cpu").into(), vm)?;
+    let device_label = crate::device_policy::app_compute_device(vm)
+        .map(|d| d.as_str().to_string())
+        .unwrap_or_else(|_| "cpu".to_string());
+    tensor_dict.set_item("device", vm.ctx.new_str(device_label).into(), vm)?;
     tensor_dict.set_item("dtype", vm.ctx.new_str("uint8").into(), vm)?;
     tensor_dict.set_item("size", vm.ctx.new_int(width * height * 4).into(), vm)?;
     tensor_dict.set_item(
@@ -845,6 +1383,7 @@ fn frame_begin_standalone(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         vm.ctx.new_int(viewport_id as i64).into(),
         vm,
     )?;
+    tensor_dict.set_item("_xos_frame_backing", vm.ctx.new_bool(true).into(), vm)?;
 
     let frame_dict = vm.ctx.new_dict();
     frame_dict.set_item("width", vm.ctx.new_int(width).into(), vm)?;
@@ -969,114 +1508,42 @@ fn frame_standalone_ui_scale(_args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 }
 
 /// xos.frame._present_standalone() - presents standalone buffer in a non-blocking native window.
-fn frame_present_standalone(_args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
-    {
-        return Ok(vm.ctx.none());
-    }
-    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
-    {
-        let viewport_id: u64 = if !_args.args.is_empty() {
-            let id: i64 = _args.args[0].clone().try_into_value(vm)?;
-            id.max(0) as u64
-        } else {
-            0
-        };
-        let width = *crate::rasterizer::CURRENT_FRAME_WIDTH
-            .lock()
-            .unwrap() as u32;
-        let height = *crate::rasterizer::CURRENT_FRAME_HEIGHT
-            .lock()
-            .unwrap() as u32;
-        let frame = STANDALONE_FRAME_BUFFERS
-            .lock()
-            .map_err(|_| vm.new_runtime_error("standalone frame buffer lock poisoned".to_string()))?
-            .get(&viewport_id)
-            .cloned()
-            .unwrap_or_default();
-
-        STANDALONE_PREVIEW_HOST.with(|slot| {
-            let mut opt = slot.borrow_mut();
-            if opt.is_none() {
-                let event_loop = EventLoop::new().map_err(|e| {
-                    vm.new_runtime_error(format!("failed to create preview event loop: {e}"))
-                })?;
-                *opt = Some(StandalonePreviewHost {
-                    event_loop,
-                    app: StandalonePreviewApp::new(),
-                });
-            }
-            if let Some(host) = opt.as_mut() {
-                host.app.pending_frames.insert(
-                    viewport_id,
-                    StandalonePendingFrame {
-                        width: width.max(1),
-                        height: height.max(1),
-                        rgba: frame,
-                    },
-                );
-                if let Some(pf) = host.app.pending_frames.get(&viewport_id) {
-                    host.app.source_frames.insert(
-                        viewport_id,
-                        StandalonePendingFrame {
-                            width: pf.width,
-                            height: pf.height,
-                            rgba: pf.rgba.clone(),
-                        },
-                    );
-                    if host.app.viewport_paused(viewport_id) {
-                        host.app.paused_base_frames.insert(
-                            viewport_id,
-                            StandalonePendingFrame {
-                                width: pf.width,
-                                height: pf.height,
-                                rgba: pf.rgba.clone(),
-                            },
-                        );
-                    }
-                }
-                if !host.app.viewport_to_window.contains_key(&viewport_id) {
-                    host.app
-                        .pending_window_creates
-                        .insert(viewport_id, (width.max(1), height.max(1)));
-                }
-                host.app.render_viewport(viewport_id);
-                loop {
-                    let timeout = if host.app.viewport_paused(viewport_id) {
-                        Some(xos_core::time::Duration::from_millis(250))
-                    } else {
-                        Some(xos_core::time::Duration::ZERO)
-                    };
-                    match host.event_loop.pump_app_events(timeout, &mut host.app) {
-                        PumpStatus::Continue => {}
-                        PumpStatus::Exit(_) => {
-                            // Keep EventLoop alive: many platforms allow only one per process.
-                        }
-                    }
-                    let mut stepped = false;
-                    if let Some(es) = host.app.f3_engine_state.get_mut(&viewport_id) {
-                        if es.paused && es.pending_step_ticks > 0 {
-                            es.pending_step_ticks = es.pending_step_ticks.saturating_sub(1);
-                            stepped = true;
-                        }
-                    }
-                    if stepped {
-                        break;
-                    }
-                    if !host.app.viewport_paused(viewport_id) {
-                        break;
-                    }
-                }
-            }
-            Ok(())
-        })?;
-        Ok(vm.ctx.none())
-    }
+fn frame_present_standalone(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let viewport_id: u64 = if !args.args.is_empty() {
+        args.args[0].clone().try_into_value::<i64>(vm)?.max(0) as u64
+    } else {
+        0
+    };
+    standalone_present_viewport_inner(viewport_id, vm)?;
+    Ok(vm.ctx.none())
 }
 
 /// Create the xos module with Application base class
+fn tensor_registry_bytes(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let id = args
+        .args
+        .first()
+        .ok_or_else(|| vm.new_type_error("_tensor_registry_bytes(id, dtype) requires id".to_string()))?
+        .clone()
+        .try_into_value::<i64>(vm)?;
+    let dtype_label = args
+        .args
+        .get(1)
+        .map(|o| o.clone().try_into_value::<String>(vm))
+        .transpose()?
+        .unwrap_or_else(|| "float32".to_string());
+    let dtype = crate::dtypes::DType::from_str(&dtype_label).unwrap_or(crate::dtypes::DType::Float32);
+    crate::tensor_buf::tensor_registry_as_bytearray(id.max(0) as u64, dtype, vm)
+        .ok_or_else(|| vm.new_runtime_error("tensor registry id not found".to_string()))
+}
+
 pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     let module = vm.new_module("xos", vm.ctx.new_dict(), None);
+
+    // Register before nested bootstraps so ``import xos`` does not re-enter ``make_module``.
+    if let Ok(modules) = vm.sys_module.get_attr("modules", vm) {
+        let _ = modules.set_item("xos", module.as_object().to_owned(), vm);
+    }
 
     // Add functions to the module
     module
@@ -1099,7 +1566,24 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     }
 
     module
+        .set_attr("clear", vm.new_function("clear", xos_clear), vm)
+        .unwrap();
+    module
         .set_attr("sleep", vm.new_function("sleep", xos_sleep), vm)
+        .unwrap();
+    module
+        .set_attr(
+            "default_device",
+            vm.ctx.new_str(crate::device::default_tensor_device()),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr(
+            "_standalone_tick_pace",
+            vm.new_function("_standalone_tick_pace", standalone_tick_pace),
+            vm,
+        )
         .unwrap();
     let time_module = vm.new_module("xos.time", vm.ctx.new_dict(), None);
     time_module
@@ -1205,12 +1689,35 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
         .unwrap();
     frame_module
         .set_attr(
+            "_present_viewport",
+            vm.new_function("_present_viewport", frame_present_viewport),
+            vm,
+        )
+        .unwrap();
+    frame_module
+        .set_attr(
+            "_pause_viewport",
+            vm.new_function("_pause_viewport", frame_pause_viewport),
+            vm,
+        )
+        .unwrap();
+    frame_module
+        .set_attr(
+            "_tick_viewport",
+            vm.new_function("_tick_viewport", frame_tick_viewport),
+            vm,
+        )
+        .unwrap();
+    frame_module
+        .set_attr(
             "_standalone_tensor_data",
             vm.new_function("_standalone_tensor_data", frame_standalone_tensor_data),
             vm,
         )
         .unwrap();
     module.set_attr("frame", frame_module, vm).unwrap();
+
+    crate::testing::install_testing(vm, module.clone());
 
     crate::json_api::register_json(&module, vm);
 
@@ -1274,6 +1781,13 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
         .set_attr("zeros", tensors_module.get_attr("zeros", vm).unwrap(), vm)
         .unwrap();
     module
+        .set_attr(
+            "zeros_like",
+            tensors_module.get_attr("zeros_like", vm).unwrap(),
+            vm,
+        )
+        .unwrap();
+    module
         .set_attr("ones", tensors_module.get_attr("ones", vm).unwrap(), vm)
         .unwrap();
     module
@@ -1290,6 +1804,9 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
         .unwrap();
     module
         .set_attr("clip", tensors_module.get_attr("clip", vm).unwrap(), vm)
+        .unwrap();
+    module
+        .set_attr("allclose", tensors_module.get_attr("allclose", vm).unwrap(), vm)
         .unwrap();
     module
         .set_attr(
@@ -1324,11 +1841,84 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
         .unwrap();
     module
         .set_attr(
+            "_tensor_sum",
+            vm.new_function("_tensor_sum", crate::tensors::tensor_sum),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr(
             "_tensor_min_max_mean",
             vm.new_function(
                 "_tensor_min_max_mean",
                 crate::tensors::tensor_min_max_mean,
             ),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr(
+            "_materialize_frame_tensor",
+            vm.new_function(
+                "_materialize_frame_tensor",
+                crate::frame_tensor::materialize_frame_tensor,
+            ),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr(
+            "_flush_frame_tensor",
+            vm.new_function("_flush_frame_tensor", crate::frame_tensor::flush_frame_tensor),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr(
+            "_materialize_conv_output",
+            vm.new_function(
+                "_materialize_conv_output",
+                crate::ops::conv::materialize_conv_output,
+            ),
+            vm,
+        )
+        .unwrap();
+
+    module
+        .set_attr(
+            "_tensor_registry_bytes",
+            vm.new_function("_tensor_registry_bytes", tensor_registry_bytes),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr(
+            "_tensor_printpack",
+            vm.new_function("_tensor_printpack", crate::pack::tensor_printpack),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr(
+            "_tensor_randomize",
+            vm.new_function("_tensor_randomize", crate::tensors::tensor_randomize),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr("all", vm.new_function("all", crate::pack::all_fn), vm)
+        .unwrap();
+    module
+        .set_attr(
+            "compress",
+            vm.new_function("compress", crate::pack::compress_fn),
+            vm,
+        )
+        .unwrap();
+    module
+        .set_attr(
+            "decompress",
+            vm.new_function("decompress", crate::pack::decompress_fn),
             vm,
         )
         .unwrap();
@@ -1400,6 +1990,16 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
         module.set_attr("bool", dtype, vm).ok();
     }
 
+    module
+        .set_attr(
+            "_sync_tensor_to_standalone",
+            vm.new_function("_sync_tensor_to_standalone", sync_tensor_to_standalone),
+            vm,
+        )
+        .unwrap();
+    crate::render::install_render(vm, module.clone());
+    crate::space::install_space(vm, module.clone());
+
     // Define the Application base class in Python
     let application_class_code = crate::engine::pyapp::APPLICATION_CLASS_CODE;
 
@@ -1422,6 +2022,9 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     if let Ok(app_class) = scope.globals.get_item("Application", vm) {
         module.set_attr("Application", app_class, vm).unwrap();
     }
+    if let Ok(verb_cls) = scope.globals.get_item("Verbosities", vm) {
+        module.set_attr("Verbosities", verb_cls, vm).ok();
+    }
     if let Ok(engine_state_cls) = scope.globals.get_item("EngineState", vm) {
         vm.builtins
             .set_attr("EngineState", engine_state_cls.clone(), vm)
@@ -1439,6 +2042,9 @@ pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
 
     crate::mesh::register_mesh(&module, vm);
     crate::mouse::register_mouse(&module, vm);
+
+    // Last: patch module __dict__ so ``xos.clipboard`` / ``xos.clipboard = ...`` hit OS clipboard.
+    crate::clipboard::install_clipboard(vm, module.clone());
 
     module
 }

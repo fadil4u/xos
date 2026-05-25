@@ -24,6 +24,7 @@ COPY --from=planner /app/recipe.json recipe.json
 COPY src/crates/xos-core/patches/ct2rs src/crates/xos-core/patches/ct2rs
 COPY src/crates/xos-core/patches/gpu-allocator src/crates/xos-core/patches/gpu-allocator
 COPY src/crates/xos-core/patches/sentencepiece-sys src/crates/xos-core/patches/sentencepiece-sys
+COPY src/crates/xos-core/patches/pixels src/crates/xos-core/patches/pixels
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo install --path src/crates/xos-cli --locked --root /usr/local --bin xos --bin xpy --bin xrs

@@ -5,9 +5,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustpython_vm::Interpreter;
+#[cfg(all(not(target_os = "ios"), not(target_arch = "wasm32")))]
+use rustpython_vm::AsObject;
 use xos_core::engine::Application;
+#[cfg(all(not(target_os = "ios"), not(target_arch = "wasm32")))]
+use xos_core::engine::{start_headless_native, start_native, start_overlay_native};
 use xos_core::find_xos_project_root;
 use xos_python::engine::pyapp::PyApp;
+#[cfg(all(not(target_os = "ios"), not(target_arch = "wasm32")))]
+use xos_python::runtime::python_app_wants_headless;
 use xos_python::runtime::execute_python_code;
 
 /// One app folder under `src/apps/`.
@@ -287,6 +293,8 @@ fn make_app_interpreter() -> Interpreter {
             "xos".to_owned(),
             Box::new(xos_python::xos_module::make_module),
         );
+        #[cfg(target_arch = "wasm32")]
+        xos_python::runtime::wasm_interpreter_init(vm);
     })
 }
 
@@ -379,9 +387,16 @@ pub fn run_python_app_from_descriptor(desc: &PythonAppDescriptor) {
 
     #[cfg(all(not(target_os = "ios"), not(target_arch = "wasm32")))]
     {
-        use xos_core::engine::{start_native, start_overlay_native};
+        let headless = python_app_wants_headless(&interpreter, &app_inst);
+        if headless {
+            interpreter.enter(|vm| {
+                let _ = app_inst.set_attr("screen", vm.ctx.new_bool(true), vm);
+            });
+        }
         let pyapp = PyApp::new(interpreter, app_inst);
-        let result = if desc.name == "overlay" {
+        let result = if headless {
+            start_headless_native(Box::new(pyapp), 800, 600)
+        } else if desc.name == "overlay" {
             start_overlay_native(Box::new(pyapp))
         } else {
             start_native(Box::new(pyapp))

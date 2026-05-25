@@ -1,6 +1,9 @@
 use super::f3_menu::F3Menu;
 
 use crate::burn_raster;
+use crate::compute_device::ComputeDevice;
+#[cfg(target_arch = "wasm32")]
+use burn::tensor::TensorPrimitive;
 use xos_tensor::{BurnTensor, WgpuDevice};
 use crate::time::Instant;
 use std::ptr::NonNull;
@@ -102,14 +105,41 @@ pub struct FrameState {
     pixels_mirror: Option<(NonNull<u8>, usize)>,
     gpu_dirty: bool,
     cpu_dirty: bool,
+    /// When true, present via GPU blit once `pixels` and Burn share a `wgpu` version.
+    gpu_present_enabled: bool,
     /// Safe region bounding rectangle for UI elements
     pub safe_region_boundaries: SafeRegionBoundingRectangle,
+    /// Async GPU→CPU readback in flight (wasm canvas path).
+    #[cfg(target_arch = "wasm32")]
+    wasm_readback_pending: bool,
+    /// Bumped when a new readback is scheduled; stale async results are dropped.
+    #[cfg(target_arch = "wasm32")]
+    wasm_readback_generation: u64,
+}
+
+/// Drain pending fusion ops before async host readback (must not block-sync on wasm).
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn drain_gpu_for_readback(tensor: &BurnTensor<3>) {
+    let TensorPrimitive::Float(fusion) = tensor.clone().into_primitive() else {
+        return;
+    };
+    fusion.client.drain();
 }
 
 impl FrameState {
     /// Create a new FrameState with given dimensions and safe region (opaque black).
     pub fn new(width: u32, height: u32, safe_region: SafeRegionBoundingRectangle) -> Self {
-        let device = WgpuDevice::default();
+        Self::new_with_device(width, height, safe_region, WgpuDevice::default(), true)
+    }
+
+    /// Create frame state on a specific Burn device (use shared pixels device for GPU present).
+    pub fn new_with_device(
+        width: u32,
+        height: u32,
+        safe_region: SafeRegionBoundingRectangle,
+        device: WgpuDevice,
+        gpu_present_enabled: bool,
+    ) -> Self {
         let h = height as usize;
         let w = width as usize;
         let len = (width * height * 4) as usize;
@@ -127,8 +157,73 @@ impl FrameState {
             pixels_mirror: None,
             gpu_dirty: false,
             cpu_dirty: false,
+            gpu_present_enabled,
             safe_region_boundaries: safe_region,
+            #[cfg(target_arch = "wasm32")]
+            wasm_readback_pending: false,
+            #[cfg(target_arch = "wasm32")]
+            wasm_readback_generation: 0,
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[inline]
+    pub(crate) fn wasm_readback_pending(&self) -> bool {
+        self.wasm_readback_pending
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn begin_wasm_readback(&mut self) -> u64 {
+        self.wasm_readback_pending = true;
+        self.wasm_readback_generation = self.wasm_readback_generation.wrapping_add(1);
+        self.wasm_readback_generation
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn clear_wasm_readback_pending(&mut self) {
+        self.wasm_readback_pending = false;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[inline]
+    pub(crate) fn wasm_readback_generation_matches(&self, generation: u64) -> bool {
+        self.wasm_readback_generation == generation
+    }
+
+    /// Apply async readback result into CPU staging (wasm only).
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn complete_wasm_readback(&mut self, data: burn::tensor::TensorData) {
+        let h = self.height as usize;
+        let w = self.width as usize;
+        self.write_f32_rgba_to_staging(&data, h, w);
+        self.gpu_dirty = false;
+        self.wasm_readback_pending = false;
+    }
+
+    #[inline]
+    pub fn gpu_present_enabled(&self) -> bool {
+        self.gpu_present_enabled
+    }
+
+    #[inline]
+    pub fn is_gpu_dirty(&self) -> bool {
+        self.gpu_dirty
+    }
+
+    /// After a successful GPU blit to the display texture (CPU staging may be stale).
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+    #[inline]
+    pub(crate) fn is_cpu_dirty(&self) -> bool {
+        self.cpu_dirty
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+    pub(crate) fn mark_gpu_presented(&mut self) {
+        self.gpu_dirty = false;
+    }
+
+    pub fn set_gpu_present_enabled(&mut self, enabled: bool) {
+        self.gpu_present_enabled = enabled;
     }
 
     /// # Safety
@@ -160,8 +255,9 @@ impl FrameState {
         }
     }
 
+    /// GPU device used by the frame Burn tensor (Metal/WGPU). Public for ops that run on the same device as the viewport.
     #[inline]
-    pub(crate) fn device(&self) -> &WgpuDevice {
+    pub fn device(&self) -> &WgpuDevice {
         &self.device
     }
 
@@ -181,7 +277,14 @@ impl FrameState {
         self.cpu_dirty = false;
     }
 
-    pub(crate) fn ensure_gpu_from_cpu(&mut self) {
+    /// Mark that CPU staging / the pixels mirror was written (next GPU op re-uploads from CPU).
+    pub fn mark_cpu_staging_dirty(&mut self) {
+        self.cpu_dirty = true;
+        self.gpu_dirty = false;
+    }
+
+    /// Upload CPU staging (or pixels mirror) into the Burn GPU tensor when `cpu_dirty`.
+    pub fn ensure_gpu_from_cpu(&mut self) {
         if self.cpu_dirty {
             let w = self.width as usize;
             let h = self.height as usize;
@@ -204,10 +307,29 @@ impl FrameState {
         self.cpu_dirty = true;
     }
 
+    /// Copy the GPU frame tensor into CPU staging / the pixels mirror (for display after GPU ops).
+    pub fn publish_gpu_to_staging(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.gpu_dirty && !self.cpu_dirty {
+            self.sync_tensor_to_cpu();
+            self.gpu_dirty = false;
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn sync_tensor_to_cpu(&mut self) {
         let h = self.height as usize;
         let w = self.width as usize;
         let data = self.tensor.clone().into_data();
+        self.write_f32_rgba_to_staging(&data, h, w);
+    }
+
+    fn write_f32_rgba_to_staging(
+        &mut self,
+        data: &burn::tensor::TensorData,
+        h: usize,
+        w: usize,
+    ) {
         let s = data.as_slice::<f32>().expect("frame f32");
         let buf = self.staging_slice_mut();
         for i in 0..(h * w) {
@@ -221,6 +343,7 @@ impl FrameState {
 
     /// Immutable RGBA bytes; syncs from GPU if needed.
     pub fn data(&mut self) -> &[u8] {
+        #[cfg(not(target_arch = "wasm32"))]
         if self.gpu_dirty {
             self.sync_tensor_to_cpu();
             self.gpu_dirty = false;
@@ -230,11 +353,27 @@ impl FrameState {
 
     /// Get mutable access to the frame buffer (zero-copy for rasterizer)
     pub fn buffer_mut(&mut self) -> &mut [u8] {
+        #[cfg(not(target_arch = "wasm32"))]
         if self.gpu_dirty {
             self.sync_tensor_to_cpu();
             self.gpu_dirty = false;
         }
-        self.cpu_dirty = true;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.cpu_dirty = true;
+        }
+        #[cfg(target_arch = "wasm32")]
+        if !self.gpu_dirty {
+            self.cpu_dirty = true;
+        }
+        self.staging_slice_mut()
+    }
+
+    /// CPU staging pointer for legacy rasterizer context during tick (does not mark CPU dirty).
+    ///
+    /// GPU conv / fill paths use the Burn tensor; only call [`Self::mark_cpu_staging_dirty`]
+    /// after actually writing this buffer.
+    pub fn staging_slice_mut_for_tick(&mut self) -> &mut [u8] {
         self.staging_slice_mut()
     }
 
@@ -245,7 +384,9 @@ impl FrameState {
 
     /// Resize the frame (opaque black).
     pub fn resize(&mut self, width: u32, height: u32) {
-        *self = Self::new(width, height, self.safe_region_boundaries.clone());
+        let gpu_present = self.gpu_present_enabled;
+        let device = self.device.clone();
+        *self = Self::new_with_device(width, height, self.safe_region_boundaries.clone(), device, gpu_present);
     }
 
     /// Replace the inset used for layout / Python `safe_region` (e.g. host-driven safe area).
@@ -365,6 +506,8 @@ pub struct KeyboardState {
 pub struct EngineState {
     /// Frame state containing pixel array and safe region boundaries
     pub frame: FrameState,
+    /// Resolved app compute backend (`cpu` = staging/rasterizer only; `gpu` = Burn tensor + present).
+    pub compute_device: ComputeDevice,
     pub mouse: MouseState,
     pub keyboard: KeyboardState,
     /// Global F3 menu (FPS + UI scale; drawn by the engine after each app tick).
@@ -378,6 +521,8 @@ pub struct EngineState {
     pub paused: bool,
     /// Number of one-tick step requests queued while paused.
     pub pending_step_ticks: u32,
+    /// Set when entering pause; the host captures a frozen frame snapshot once.
+    pub paused_frame_snapshot_pending: bool,
     /// View zoom applied to the app-rendered frame before overlays (1.0 = full frame).
     pub frame_view_zoom: f32,
     /// Target view zoom used by smoothing.
@@ -413,6 +558,20 @@ pub fn f3_ui_scale_multiplier(percent: u16) -> f32 {
 }
 
 impl EngineState {
+    /// Apply a Python `device` preference (`None` / missing → auto).
+    pub fn apply_compute_device_pref(&mut self, pref: Option<&str>) -> Result<(), String> {
+        let parsed = ComputeDevice::parse_pref(pref)?;
+        self.compute_device = ComputeDevice::resolve_auto(parsed);
+        self.frame
+            .set_gpu_present_enabled(self.compute_device.gpu_present_enabled());
+        Ok(())
+    }
+
+    #[inline]
+    pub fn compute_device_label(&self) -> &'static str {
+        self.compute_device.as_str()
+    }
+
     /// Same as [`f3_ui_scale_multiplier`]: `ui_scale_percent / 100` (25–500% → 0.25–5.0).
     #[inline]
     pub fn ui_scale_coefficient(&self) -> f32 {

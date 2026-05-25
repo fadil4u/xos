@@ -1,6 +1,15 @@
 use rustpython_vm::{builtins::PyModule, function::FuncArgs, PyRef, PyResult, VirtualMachine};
 
-use xos_core::monitors::{self, MonitorDescriptor};
+use xos_core::monitors::MonitorDescriptor;
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(target_os = "macos", target_os = "windows")
+))]
+use xos_core::monitors;
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(target_os = "macos", target_os = "windows")
+))]
 use crate::json_codec::py_frame_from_rgba_bytes;
 
 /// System type enum - matches target OS
@@ -158,6 +167,7 @@ fn system_monitor_get_frame(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         any(target_os = "macos", target_os = "windows")
     )))]
     {
+        let _ = args;
         return Err(vm.new_runtime_error(
             "xos.system.Monitor.get_frame is only available on native macOS and Windows builds"
                 .into(),

@@ -5,25 +5,29 @@
 //! - Python-facing CPU [`Tensor`] lives in `xos-python` (`tensor_buf`); frame RGBA uses [`xos_core::engine::FrameState`].
 
 pub mod conv;
+pub mod wgpu_init;
 
 pub use burn::tensor::backend::Backend;
 pub use burn::tensor::{ElementConversion, Int, Shape, TensorData};
 
-// Desktop: full Burn WGPU. iOS / WASM: use NdArray (CPU) for the default `XosBackend` so
-// `FrameState::new` never calls `WgpuDevice::default()` before a platform GPU service is initialized.
-// Swift already renders iOS with Metal; the browser engine presents from the CPU framebuffer.
-#[cfg(any(target_os = "ios", target_arch = "wasm32"))]
-pub use burn::backend::ndarray::NdArray as Wgpu;
-#[cfg(any(target_os = "ios", target_arch = "wasm32"))]
-pub type WgpuDevice = <Wgpu as Backend>::Device;
-#[cfg(all(not(target_os = "ios"), not(target_arch = "wasm32")))]
+/// Default backend: Burn WGPU (Metal on Apple, WebGPU in the browser, Vulkan/SPIR-V elsewhere).
+#[cfg(any(
+    all(not(target_os = "ios"), not(target_arch = "wasm32")),
+    target_os = "ios",
+    target_arch = "wasm32"
+))]
 pub use burn_wgpu::{Wgpu, WgpuDevice};
 
 pub use conv::{conv2d, depthwise_conv2d};
 
-/// Default backend and device for xos tensor ops (WGPU on desktop; NdArray on iOS/WASM).
+/// Default backend and device for xos tensor ops.
 pub type XosBackend = Wgpu;
 pub type XosDevice = WgpuDevice;
+
+/// Label for Python `tensor.device` after GPU-backed ops.
+pub fn compute_device_label() -> &'static str {
+    "gpu"
+}
 
 use burn::tensor::Float;
 

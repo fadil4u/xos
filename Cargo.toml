@@ -15,6 +15,7 @@ xos-auth = { path = "src/crates/xos-auth" }
 xos-mesh = { path = "src/crates/xos-mesh" }
 xos-tensor = { path = "src/crates/xos-tensor" }
 xos-audio = { path = "src/crates/xos-audio" }
+serde_json = "1"
 darling = "0.21.3"
 variadics_please = "1"
 
@@ -53,7 +54,7 @@ resolver = "2"
 
 # Bump release version here only — all workspace crates inherit via `*.workspace = true`.
 [workspace.package]
-version = "0.3.19-pre5"
+version = "0.3.19-pre6"
 edition = "2021"
 license = "MIT"
 authors = ["Dyllan McCreary <dyllan@xlate.ai>"]
@@ -63,6 +64,7 @@ repository = "https://github.com/xlateai/xos"
 gpu-allocator = { path = "src/crates/xos-core/patches/gpu-allocator" }
 sentencepiece-sys = { path = "src/crates/xos-core/patches/sentencepiece-sys" }
 ct2rs = { path = "src/crates/xos-core/patches/ct2rs" }
+pixels = { path = "src/crates/xos-core/patches/pixels" }
 
 # Windows MSVC + release: stripping proc-macro rlibs/DLLs breaks rustc's ability to load them
 # (E0463), which then breaks downstream crates (e.g. cubecl-ir / darling).

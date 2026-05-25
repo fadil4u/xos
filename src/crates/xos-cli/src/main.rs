@@ -25,6 +25,7 @@ use tiny_http::{Method, Response, Server};
 use uuid::Uuid;
 use xos::python_api::{
     parse_script_cli_flags, run_python_app, run_python_file, run_python_interactive,
+    run_test_suite,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -157,6 +158,15 @@ enum Commands {
         /// Dev build (`debug`) instead of optimized release (faster compile; slower binary).
         #[arg(long)]
         no_release: bool,
+    },
+    /// Run `src/tests/**/*.py` files that use `@xos.test`.
+    Test {
+        /// Only run test functions with this name (e.g. `test_frame_transforms`).
+        /// If the name appears in multiple files, every matching case is run.
+        name: Option<String>,
+        /// Directory to search (default: `<project>/src/tests`)
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
     /// Execute Python scripts (`xpy` is a shortcut for this command).
     #[command(name = "py", visible_alias = "python")]
@@ -922,6 +932,21 @@ fn main() {
             cli_exe,
         }) => {
             run_path_command(code, data, cli_exe);
+        }
+        Some(Commands::Test { name, path }) => {
+            let root = match xos::find_xos_project_root() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("❌ {e}");
+                    std::process::exit(1);
+                }
+            };
+            let tests_dir = path.unwrap_or_else(|| root.join("src").join("tests"));
+            if !tests_dir.is_dir() {
+                eprintln!("❌ tests directory not found: {}", tests_dir.display());
+                std::process::exit(1);
+            }
+            std::process::exit(run_test_suite(&tests_dir, name.as_deref()));
         }
         Some(Commands::Py { file, wasm, rest }) => {
             if let Some(file_path) = file {

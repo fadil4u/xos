@@ -1,4 +1,4 @@
-mod conv;
+pub mod conv;
 mod shift;
 
 use rustpython_vm::{builtins::PyModule, PyRef, VirtualMachine};

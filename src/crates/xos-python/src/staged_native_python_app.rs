@@ -18,10 +18,13 @@ pub(crate) fn source_declares_headless_window_app(source: &str) -> bool {
         if line.is_empty() {
             continue;
         }
-        if line.contains("headless: bool = True") {
+        if line.contains("headless: bool = True") || line.contains("headless:bool = True") {
             return true;
         }
-        if line.contains("headless=True") || line.contains("headless = True") {
+        if line.contains("headless=True")
+            || line.contains("headless = True")
+            || line.contains("headless: bool=True")
+        {
             return true;
         }
     }

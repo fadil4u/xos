@@ -126,6 +126,7 @@ pub fn boxed_xpy_app() -> Option<Box<dyn Application>> {
             "xos".to_owned(),
             Box::new(xos_python::xos_module::make_module),
         );
+        xos_python::runtime::wasm_interpreter_init(vm);
     });
 
     let (run_result, _output, app_instance, _) =

@@ -16,7 +16,7 @@ use crate::python_text::{
     sync_embed_text_norm_rect, tick_text_widget,
 };
 use xos_python::rasterizer::{
-    CURRENT_FRAME_BUFFER, CURRENT_FRAME_HEIGHT, CURRENT_FRAME_WIDTH,
+    note_frame_cpu_write, CURRENT_FRAME_BUFFER, CURRENT_FRAME_HEIGHT, CURRENT_FRAME_WIDTH,
 };
 use xos_core::rasterizer::text::fonts;
 use xos_core::rasterizer::text::ui_markup;
@@ -204,6 +204,7 @@ fn paint_button_immediate(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         canvas_height as u32,
         is_hovered,
     );
+    note_frame_cpu_write();
 
     Ok(vm.ctx.none())
 }
@@ -538,9 +539,11 @@ fn text_render(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             spacing: (spacing_x, spacing_y),
         };
         if should_render {
-            text_ui
+            let state = text_ui
                 .render(buffer, canvas_width, canvas_height)
-                .map_err(|e| vm.new_runtime_error(e))?
+                .map_err(|e| vm.new_runtime_error(e))?;
+            note_frame_cpu_write();
+            state
         } else {
             // Compute layout/render state without touching the live frame buffer.
             let mut scratch =

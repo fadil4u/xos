@@ -14,6 +14,9 @@ use webbrowser;
 pub mod ai;
 pub mod blank_app;
 pub mod burn_raster;
+pub mod compute_device;
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+pub mod gpu_present;
 pub mod coder_log;
 pub mod engine;
 pub mod fs;
@@ -297,16 +300,42 @@ fn ensure_compiled_wasm_output(static_dir: &Path) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn launch_browser(app_name: &str) {
-    launch_browser_query(&format!("app={app_name}"));
+fn launch_browser(app_name: &str, port: u16) {
+    launch_browser_query(&format!("app={app_name}"), port);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn launch_browser_query(query: &str) {
-    let url = format!("http://localhost:8080/?{query}");
+fn launch_browser_query(query: &str, port: u16) {
+    let url = format!("http://localhost:{port}/?{query}");
     thread::spawn(move || {
         let _ = webbrowser::open(&url);
     });
+}
+
+/// Bind the wasm static file server, trying 8080 then the next free port.
+#[cfg(not(target_arch = "wasm32"))]
+fn bind_wasm_http_server() -> (u16, tiny_http::Server) {
+    const PORT_FIRST: u16 = 8080;
+    const PORT_LAST: u16 = 8099;
+    for port in PORT_FIRST..=PORT_LAST {
+        match tiny_http::Server::http(format!("0.0.0.0:{port}")) {
+            Ok(server) => return (port, server),
+            Err(e) => {
+                let in_use = e
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+                    || e.to_string().contains("Address already in use");
+                if in_use {
+                    continue;
+                }
+                eprintln!("❌ failed to bind wasm server on port {port}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    eprintln!("❌ no free port in {PORT_FIRST}–{PORT_LAST} (another wasm server may still be running).");
+    eprintln!("   Stop it with: lsof -ti :8080 | xargs kill");
+    std::process::exit(1);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -343,10 +372,12 @@ fn mime_type(path: &Path) -> &'static str {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn start_web_server(static_dir: PathBuf) {
+fn serve_wasm_http_server(server: tiny_http::Server, static_dir: PathBuf, port: u16) {
     let index_path = static_dir.join("index.html");
-    let server = Server::http("0.0.0.0:8080").unwrap();
-    println!("🚀 Serving at http://localhost:8080");
+    println!("🚀 Serving at http://localhost:{port}");
+    if port != 8080 {
+        println!("ℹ️  Port 8080 was in use; using http://localhost:{port} instead.");
+    }
 
     for request in server.incoming_requests() {
         let url = request.url();
@@ -431,8 +462,9 @@ pub fn run_python_wasm_source(filename: &str, source: &str, flags: &[String]) {
         percent_encode_query_component(&payload_id),
         percent_encode_query_component(filename),
     );
-    launch_browser_query(&query);
-    start_web_server(static_dir);
+    let (port, server) = bind_wasm_http_server();
+    launch_browser_query(&query, port);
+    serve_wasm_http_server(server, static_dir, port);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -580,13 +612,17 @@ pub fn run<T: engine::Application + 'static>(app: T) {
             let project_root = xos_project_root_or_exit();
             let static_dir = wasm_compile_output_dir(&project_root);
             ensure_compiled_wasm_output(&static_dir);
-            launch_browser(app_name);
-            start_web_server(static_dir);
+            let (port, server) = bind_wasm_http_server();
+            launch_browser(app_name, port);
+            serve_wasm_http_server(server, static_dir, port);
         } else if args.react_native {
             println!("📱 Launching app in React Native mode...");
             build_wasm(app_name);
             let static_dir = react_native_static_dir(&xos_project_root_or_exit());
-            thread::spawn(move || start_web_server(static_dir));
+            thread::spawn(move || {
+                let (port, server) = bind_wasm_http_server();
+                serve_wasm_http_server(server, static_dir, port);
+            });
             launch_expo();
         } else {
             // println!("🖥️  Launching app in native mode...");

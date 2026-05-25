@@ -2,6 +2,7 @@ use super::engine::{
     tick_frame_delta, Application, CursorStyle, CursorStyleSetter, EngineState, FrameState,
     KeyboardModifiers, KeyboardState, MouseState, SafeRegionBoundingRectangle,
 };
+use crate::compute_device::ComputeDevice;
 use super::{
     apply_frame_view_zoom, f3_menu_boost_interaction_fade, f3_menu_handle_frame_zoom_scroll,
     f3_menu_handle_mouse_down, f3_menu_handle_mouse_move, f3_menu_handle_mouse_up,
@@ -112,6 +113,7 @@ struct AppState {
     engine_state: EngineState,
     app: Box<dyn Application>,
     size: winit::dpi::PhysicalSize<u32>,
+    #[cfg_attr(target_os = "ios", allow(dead_code))]
     raster_cache: RasterCache,
     last_tick_instant: Option<Instant>,
     // Modifier key tracking for shortcuts
@@ -171,36 +173,80 @@ impl AppState {
         }
     }
 
+    /// Point `EngineState::frame` writes at the live `pixels` surface buffer (windowed native).
+    fn bind_pixels_mirror(&mut self) -> bool {
+        // In GPU-compute + CPU-present fallback mode, avoid mirror binding.
+        // We want staging-owned bytes and an explicit copy path to pixels.frame_mut().
+        if self.engine_state.compute_device == ComputeDevice::Gpu
+            && !self.engine_state.frame.gpu_present_enabled()
+        {
+            self.engine_state.frame.clear_pixels_mirror_buffer();
+            return false;
+        }
+
+        let expected_len = (self.size.width as usize)
+            .saturating_mul(self.size.height as usize)
+            .saturating_mul(4);
+        let frame = self.pixels.frame_mut();
+        if frame.len() != expected_len {
+            return false;
+        }
+        unsafe {
+            self.engine_state
+                .frame
+                .set_pixels_mirror_buffer(frame.as_mut_ptr(), frame.len());
+        }
+        true
+    }
+
     fn render_pixels(&mut self) -> Result<(), pixels::Error> {
-        self.pixels.render_with(|encoder, render_target, context| {
-            crate::rasterizer::render_pending_gpu_passes(
-                &mut self.raster_cache,
-                encoder,
-                &context.device,
-                &context.queue,
-                &context.texture,
-                context.texture_extent,
-                context.texture_format,
-            );
-            context.scaling_renderer.render(encoder, render_target);
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        })
+        #[cfg(not(target_os = "ios"))]
+        {
+            let skip_cpu = crate::gpu_present::should_skip_cpu_upload(&self.engine_state.frame);
+            self.pixels.set_skip_cpu_texture_upload(skip_cpu);
+            if !skip_cpu {
+                self.engine_state.frame.publish_gpu_to_staging();
+            }
+
+            let mut gpu_blit = false;
+            self.pixels.render_with(|encoder, render_target, context| {
+                if self.engine_state.frame.gpu_present_enabled() {
+                    gpu_blit = crate::rasterizer::render_pending_gpu_passes(
+                        &mut self.raster_cache,
+                        &mut self.engine_state.frame,
+                        encoder,
+                        &context.device,
+                        &context.queue,
+                        &context.texture,
+                        context.texture_extent,
+                        context.texture_format,
+                    );
+                }
+                if skip_cpu && !gpu_blit {
+                    self.engine_state.frame.publish_gpu_to_staging();
+                    crate::gpu_present::upload_staging_to_pixels_texture(
+                        context,
+                        self.engine_state.frame.data(),
+                    );
+                }
+                context.scaling_renderer.render(encoder, render_target);
+                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+            })?;
+
+            if gpu_blit {
+                self.engine_state.frame.mark_gpu_presented();
+            }
+            return Ok(());
+        }
+        #[cfg(target_os = "ios")]
+        {
+            self.engine_state.frame.publish_gpu_to_staging();
+            self.pixels.render()
+        }
     }
 
     fn tick_and_render_frame(&mut self) {
-        let expected_len = (self.size.width * self.size.height * 4) as usize;
-        let mut mirror_ok = false;
-        {
-            let f = self.pixels.frame_mut();
-            if f.len() == expected_len {
-                unsafe {
-                    self.engine_state
-                        .frame
-                        .set_pixels_mirror_buffer(f.as_mut_ptr(), f.len());
-                }
-                mirror_ok = true;
-            }
-        }
+        let mirror_ok = self.bind_pixels_mirror();
 
         if self.engine_state.paused {
             if self.engine_state.pending_step_ticks > 0 {
@@ -211,15 +257,17 @@ impl AppState {
                 self.capture_paused_base_frame();
             } else {
                 self.last_tick_instant = Some(Instant::now());
-                if self.paused_base_frame.is_empty() {
+                if self.paused_base_frame.is_empty()
+                    || self.engine_state.paused_frame_snapshot_pending
+                {
                     self.capture_paused_base_frame();
+                    self.engine_state.paused_frame_snapshot_pending = false;
                 }
                 self.restore_paused_base_frame();
             }
         } else {
             tick_frame_delta(&mut self.engine_state, &mut self.last_tick_instant);
             let _ = self.app.tick(&mut self.engine_state);
-            self.capture_paused_base_frame();
         }
 
         tick_frame_view_zoom(&mut self.engine_state);
@@ -235,14 +283,8 @@ impl AppState {
             let mouse_left = self.engine_state.mouse.is_left_clicking;
             let mouse_right = self.engine_state.mouse.is_right_clicking;
             let safe_region = self.engine_state.frame.safe_region_boundaries.clone();
-            let (buffer, keyboard) = {
-                let buffer_ptr = self.engine_state.frame.buffer_mut() as *mut [u8];
-                let keyboard_ptr: *mut crate::ui::onscreen_keyboard::OnScreenKeyboard =
-                    &mut self.engine_state.keyboard.onscreen;
-                (unsafe { &mut *buffer_ptr }, unsafe { &mut *keyboard_ptr })
-            };
-            keyboard.tick(
-                buffer,
+
+            self.engine_state.keyboard.onscreen.tick_logic(
                 width,
                 height,
                 mouse_x,
@@ -253,11 +295,50 @@ impl AppState {
                 mouse_right,
                 &safe_region,
             );
+
+            if self.engine_state.keyboard.onscreen.needs_framebuffer_access() {
+                if self.engine_state.compute_device == ComputeDevice::Cpu {
+                    let buffer = self.engine_state.frame.staging_slice_mut_for_tick();
+                    self.engine_state
+                        .keyboard
+                        .onscreen
+                        .tick_draw_cpu(buffer, width, height, &safe_region);
+                    self.engine_state.frame.mark_cpu_staging_dirty();
+                } else {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    self.engine_state.keyboard.onscreen.draw_overlay_gpu(
+                        &mut self.engine_state.frame,
+                        width,
+                        height,
+                        &safe_region,
+                    );
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let buffer = self.engine_state.frame.buffer_mut();
+                        self.engine_state
+                            .keyboard
+                            .onscreen
+                            .tick_draw_cpu(buffer, width, height, &safe_region);
+                    }
+                }
+            }
         }
 
         tick_f3_menu(&mut self.engine_state);
 
         if mirror_ok {
+            // Fallback mode: GPU compute is active but direct GPU present is disabled
+            // (e.g. adapter/descriptor mismatch). Mirror the latest staging frame into
+            // pixels' CPU frame so render() presents real content instead of black.
+            if self.engine_state.compute_device == ComputeDevice::Gpu
+                && !self.engine_state.frame.gpu_present_enabled()
+            {
+                let src = self.engine_state.frame.data().to_vec();
+                let dst = self.pixels.frame_mut();
+                if dst.len() == src.len() {
+                    dst.copy_from_slice(&src);
+                }
+            }
             self.engine_state.frame.clear_pixels_mirror_buffer();
             let _ = self.render_pixels();
         } else {
@@ -305,7 +386,8 @@ impl ApplicationHandler for AppState {
                         .resize_surface(self.size.width, self.size.height);
                     self.engine_state
                         .resize_frame(self.size.width, self.size.height);
-                    // Notify app of screen size change
+                    // Route resize draws (e.g. uniform_fill) to the display buffer, not cpu_staging.
+                    let _ = self.bind_pixels_mirror();
                     let _ = self.app.on_screen_size_change(
                         &mut self.engine_state,
                         self.size.width,
@@ -332,6 +414,7 @@ impl ApplicationHandler for AppState {
                         .resize_surface(self.size.width, self.size.height);
                     self.engine_state
                         .resize_frame(self.size.width, self.size.height);
+                    let _ = self.bind_pixels_mirror();
                     let _ = self.app.on_screen_size_change(
                         &mut self.engine_state,
                         self.size.width,
@@ -354,7 +437,7 @@ impl ApplicationHandler for AppState {
                         .resize_surface(self.size.width, self.size.height);
                     self.engine_state
                         .resize_frame(self.size.width, self.size.height);
-                    // Notify app of screen size change
+                    let _ = self.bind_pixels_mirror();
                     let _ = self.app.on_screen_size_change(
                         &mut self.engine_state,
                         self.size.width,
@@ -732,11 +815,51 @@ impl ApplicationHandler for AppStateWrapper {
             };
 
             let size = window.inner_size();
-            let surface_texture = SurfaceTexture::new(size.width, size.height, &window);
-            let pixels = match PixelsBuilder::new(size.width, size.height, surface_texture)
-                .enable_vsync(false)
-                .build()
-            {
+            #[cfg(not(target_os = "ios"))]
+            let mut used_default_wgpu_descriptor = false;
+            let pixels = match {
+                #[cfg(not(target_os = "ios"))]
+                {
+                    PixelsBuilder::new(
+                        size.width,
+                        size.height,
+                        SurfaceTexture::new(size.width, size.height, &window),
+                    )
+                        .enable_vsync(false)
+                        .device_descriptor_from_adapter(crate::gpu_present::shared_wgpu_device_descriptor)
+                        .build()
+                        .or_else(|primary_err| {
+                            used_default_wgpu_descriptor = true;
+                            if std::env::var("XOS_LOG_WGPU_FALLBACK")
+                                .ok()
+                                .as_deref()
+                                == Some("1")
+                            {
+                                eprintln!(
+                                    "Primary pixels device init failed ({}); retrying with default wgpu descriptor.",
+                                    primary_err
+                                );
+                            }
+                            PixelsBuilder::new(
+                                size.width,
+                                size.height,
+                                SurfaceTexture::new(size.width, size.height, &window),
+                            )
+                                .enable_vsync(false)
+                                .build()
+                        })
+                }
+                #[cfg(target_os = "ios")]
+                {
+                    PixelsBuilder::new(
+                        size.width,
+                        size.height,
+                        SurfaceTexture::new(size.width, size.height, &window),
+                    )
+                        .enable_vsync(false)
+                        .build()
+                }
+            } {
                 Ok(p) => unsafe { std::mem::transmute(p) }, // SAFETY: window outlives pixels
                 Err(e) => {
                     eprintln!("Failed to create pixels: {}", e);
@@ -744,9 +867,24 @@ impl ApplicationHandler for AppStateWrapper {
                 }
             };
 
+            #[cfg(not(target_os = "ios"))]
+            let burn_device = crate::gpu_present::burn_device_from_pixels(&pixels);
+            #[cfg(target_os = "ios")]
+            let burn_device = xos_tensor::XosDevice::default();
+            #[cfg(not(target_os = "ios"))]
+            let gpu_present_enabled = !used_default_wgpu_descriptor;
+            #[cfg(target_os = "ios")]
+            let gpu_present_enabled = true;
             let safe_region = SafeRegionBoundingRectangle::full_screen();
             let mut engine_state = EngineState {
-                frame: FrameState::new(size.width, size.height, safe_region),
+                frame: FrameState::new_with_device(
+                    size.width,
+                    size.height,
+                    safe_region,
+                    burn_device,
+                    gpu_present_enabled,
+                ),
+                compute_device: ComputeDevice::resolve_auto(None),
                 mouse: MouseState {
                     x: 0.0,
                     y: 0.0,
@@ -765,6 +903,7 @@ impl ApplicationHandler for AppStateWrapper {
                 delta_time_seconds: 1.0 / 60.0,
                 paused: false,
                 pending_step_ticks: 0,
+                paused_frame_snapshot_pending: false,
                 frame_view_zoom: 1.0,
                 frame_view_zoom_target: 1.0,
                 frame_view_zoom_velocity: 0.0,
@@ -780,6 +919,12 @@ impl ApplicationHandler for AppStateWrapper {
                 SHOULD_EXIT.store(true, Ordering::Relaxed);
                 event_loop.exit();
                 return;
+            }
+            #[cfg(not(target_os = "ios"))]
+            if used_default_wgpu_descriptor {
+                // Keep compute on GPU if requested, but force CPU-present fallback when
+                // the shared descriptor path failed; app.setup() may have re-enabled it.
+                engine_state.frame.set_gpu_present_enabled(false);
             }
 
             let app =
@@ -894,6 +1039,7 @@ pub fn start_headless_native(
     let safe_region = SafeRegionBoundingRectangle::full_screen();
     let mut engine_state = EngineState {
         frame: FrameState::new(width.max(1), height.max(1), safe_region),
+        compute_device: ComputeDevice::resolve_auto(None),
         mouse: MouseState {
             x: 0.0,
             y: 0.0,
@@ -912,6 +1058,7 @@ pub fn start_headless_native(
         delta_time_seconds: 1.0 / 60.0,
         paused: false,
         pending_step_ticks: 0,
+        paused_frame_snapshot_pending: false,
         frame_view_zoom: 1.0,
         frame_view_zoom_target: 1.0,
         frame_view_zoom_velocity: 0.0,

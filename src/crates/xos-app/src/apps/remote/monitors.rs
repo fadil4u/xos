@@ -1,5 +1,14 @@
 //! Desktop monitor enumeration and scaled RGBA capture for [`super::monitor_bootstrap`] / `xos.system.monitors`.
 
+#![cfg_attr(
+    not(all(
+        not(target_arch = "wasm32"),
+        not(target_os = "ios"),
+        any(target_os = "macos", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+
 /// Native pixel size, placement, identity, and coarse refresh Hz when the OS exposes it (0 otherwise).
 #[derive(Clone, Debug)]
 pub struct MonitorDescriptor {
@@ -18,10 +27,10 @@ pub struct MonitorDescriptor {
 }
 
 fn stream_dims(native_w: u32, native_h: u32) -> (u32, u32) {
-    let STREAM_MAX_W = crate::apps::remote::remote::STREAM_MAX_W;
+    let stream_max_w = crate::apps::remote::remote::STREAM_MAX_W;
     let vw = native_w.max(1);
     let vh = native_h.max(1);
-    let scale = (STREAM_MAX_W as f32 / vw as f32).min(1.0f32);
+    let scale = (stream_max_w as f32 / vw as f32).min(1.0f32);
     let tw = ((vw as f32) * scale).round().max(1.0) as u32;
     let th = ((vh as f32) * scale).round().max(1.0) as u32;
     (tw, th)

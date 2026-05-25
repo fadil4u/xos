@@ -29,10 +29,28 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          shared-key: xos-windows-cli
 
       - name: Compile CLI
         shell: pwsh
         run: cargo build -p xos-cli --bin xos --release
+
+      - name: Publish cache results
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-cli-${{ github.sha }}
+          path: target/release/xos.exe
+          if-no-files-found: error
+
+      - name: Add CLI to PATH
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value "$pwd\target\release"
+
+      - name: Unit Tests
+        shell: pwsh
+        run: xos test
 
   macos:
     name: macOS compile
@@ -46,10 +64,28 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          shared-key: xos-macos-cli
 
       - name: Compile CLI
         shell: bash
         run: cargo build -p xos-cli --bin xos --release
+
+      - name: Publish cache results
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-cli-${{ github.sha }}
+          path: target/release/xos
+          if-no-files-found: error
+
+      - name: Add CLI to PATH
+        shell: bash
+        run: echo "$PWD/target/release" >> "$GITHUB_PATH"
+
+      - name: Unit Tests
+        shell: bash
+        run: xos test
 
   wasm:
     name: WASM compile
@@ -65,6 +101,9 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          shared-key: xos-linux-wasm
 
       - name: Setup wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
@@ -94,7 +133,7 @@ jobs:
           if-no-files-found: error
 
   docker:
-    name: Docker build
+    name: Docker compile
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -119,7 +158,29 @@ jobs:
             echo "short_sha=${short_sha}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Compile
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          pull: true
+          push: false
+          load: true
+          tags: xos-ci-test:latest
+          cache-from: |
+            type=registry,ref=xlateai/xos:prerelease
+            type=registry,ref=xlateai/xos:latest
+            type=gha,scope=xos-docker
+          cache-to: type=gha,scope=xos-docker,mode=max
+
+      - name: Unit Tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/workspace" -w /workspace xos-ci-test:latest test
+
       - name: Build and push commit-tag image
+        if: ${{ success() }}
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -128,5 +189,6 @@ jobs:
           cache-from: |
             type=registry,ref=xlateai/xos:prerelease
             type=registry,ref=xlateai/xos:latest
+            type=gha,scope=xos-docker
           tags: |
             xlateai/xos:${{ steps.tags.outputs.short_sha }}

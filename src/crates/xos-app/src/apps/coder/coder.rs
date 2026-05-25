@@ -2042,7 +2042,11 @@ impl Application for CoderApp {
                             }
                             
                             // Create Python frame object from engine state
-                            let frame_dict = xos_python::engine::py_bindings::create_py_frame_state(vm, &mut state.frame)
+                            let frame_dict = xos_python::engine::py_bindings::create_py_frame_state(
+                                vm,
+                                &mut state.frame,
+                                state.compute_device,
+                            )
                                 .map_err(|e| { eprintln!("Failed to create frame object: {:?}", e); () })?;
                             
                             if let Ok(wrapper_class) = vm.builtins.get_attr("Frame", vm) {
@@ -2105,7 +2109,12 @@ impl Application for CoderApp {
                         self.interpreter.enter(|vm| {
                             // Update frame data before calling tick
                             if let Ok(Some(frame_obj)) = vm.get_attribute_opt(app_instance.clone(), "frame") {
-                                let _ = xos_python::engine::py_bindings::update_py_frame_state(vm, frame_obj.clone(), &mut state.frame);
+                                let _ = xos_python::engine::py_bindings::update_py_frame_state(
+                                    vm,
+                                    frame_obj.clone(),
+                                    &mut state.frame,
+                                    state.compute_device,
+                                );
                                 
                                 // Update mouse data
                                 let mouse_dict = vm.ctx.new_dict();

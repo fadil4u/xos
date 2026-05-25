@@ -7,12 +7,15 @@ use xos_mesh::state::{LINE_EDITOR, MESH};
 use xos_mesh::terminal::INPUT_INTERRUPT;
 #[cfg(not(target_arch = "wasm32"))]
 use xos_mesh::{MeshMode, MeshSession, Packet};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::json_codec::{
-    decode_mesh_jpeg_bytes_best_effort, json_value_to_py, py_to_json_value,
-    try_mesh_frame_rgba_arc_for_broadcast,
+    decode_mesh_jpeg_bytes_best_effort, json_value_to_py, try_mesh_frame_rgba_arc_for_broadcast,
 };
+use crate::json_codec::py_to_json_value;
 use crate::runtime::format_python_exception;
-use rustpython_vm::builtins::{PyDict, PyModule};
+use rustpython_vm::builtins::PyModule;
+#[cfg(not(target_arch = "wasm32"))]
+use rustpython_vm::builtins::PyDict;
 use rustpython_vm::function::FuncArgs;
 use rustpython_vm::AsObject;
 use rustpython_vm::{PyRef, PyResult, VirtualMachine};

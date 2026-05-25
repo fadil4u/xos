@@ -1,6 +1,9 @@
 use rustpython_vm::{
     builtins::PyModule, function::FuncArgs, PyObjectRef, PyRef, PyResult, VirtualMachine,
 };
+use xos_core::compute_device::ComputeDevice;
+
+use crate::device_policy;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use std::sync::OnceLock;
@@ -158,6 +161,7 @@ fn parse_f64(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<f64> {
 /// If shape is provided as a tuple, returns an array of random values
 /// dtype can be specified (default: inferred from context - float32 for kernels, uint8 for images)
 fn uniform(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    let target_device = device_policy::tensor_device_for_constructor(&args, vm)?;
     let args_vec = args.args;
 
     // Parse low parameter (default: 0.0) - accept int or float
@@ -282,6 +286,9 @@ fn uniform(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
         let py_tensor = Tensor::new(random_data, shape.clone());
         let dict = py_tensor.to_py_dict(vm, DType::Float32)?;
+        if let Ok(d) = dict.clone().downcast::<rustpython_vm::builtins::PyDict>() {
+            device_policy::tag_tensor_device(&d, &target_device, vm);
+        }
 
         // Wrap in _TensorWrapper for nice display and compatibility
         if let Ok(wrapper_class) = vm.builtins.get_attr("Tensor", vm) {
@@ -324,6 +331,9 @@ fn uniform(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
         let py_tensor = Tensor::new(random_data, shape.clone());
         let dict = py_tensor.to_py_dict(vm, DType::UInt8)?;
+        if let Ok(d) = dict.clone().downcast::<rustpython_vm::builtins::PyDict>() {
+            device_policy::tag_tensor_device(&d, &target_device, vm);
+        }
 
         // Wrap in _TensorWrapper for nice display and compatibility
         if let Ok(wrapper_class) = vm.builtins.get_attr("Tensor", vm) {
@@ -334,6 +344,96 @@ fn uniform(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
         Ok(dict.into())
     }
+}
+
+/// Fill a standalone tensor's flat ``_data`` (e.g. Game-of-Life ``state``), not ``frame.tensor``.
+fn fill_tensor_uniform(
+    tensor_hint: &PyObjectRef,
+    low: f64,
+    high: f64,
+    vm: &VirtualMachine,
+) -> PyResult<()> {
+    use crate::dtypes::DType;
+    use crate::tensor_buf::{tensor_flat_data_list, tensor_shape_tuple};
+    use rustpython_vm::builtins::{PyDict, PyList};
+
+    let shape = tensor_shape_tuple(tensor_hint, vm)?;
+    let total: usize = shape.iter().product();
+    let mut flat = tensor_flat_data_list(tensor_hint, vm)?;
+    if flat.len() != total {
+        flat.resize(total, 0.0);
+    }
+
+    let mut cur = tensor_hint.clone();
+    let mut dtype_label = "float32".to_string();
+    for _ in 0..8 {
+        if let Some(dict) = cur.downcast_ref::<PyDict>() {
+            if let Ok(dt) = dict.get_item("dtype", vm) {
+                if let Ok(s) = dt.str(vm) {
+                    dtype_label = s.to_string();
+                }
+            }
+        }
+        if let Ok(Some(attr)) = vm.get_attribute_opt(cur.clone(), "_data") {
+            cur = attr;
+            continue;
+        }
+        break;
+    }
+    let dtype = DType::from_str(&dtype_label).unwrap_or(DType::Float32);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        for v in flat.iter_mut() {
+            let r: f64 = rng.random();
+            let sample = low + r * (high - low);
+            *v = if dtype == DType::UInt8 {
+                (sample.clamp(0.0, 1.0) * 255.0).round() as f32
+            } else {
+                sample as f32
+            };
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        for v in flat.iter_mut() {
+            let r = js_sys::Math::random();
+            let sample = low + r * (high - low);
+            *v = if dtype == DType::UInt8 {
+                (sample.clamp(0.0, 1.0) * 255.0).round() as f32
+            } else {
+                sample as f32
+            };
+        }
+    }
+
+    // Sync registry + visible Python list.
+    if let Some(dict) = tensor_hint.downcast_ref::<PyDict>() {
+        if let Ok(id_obj) = dict.get_item("_rust_tensor", vm) {
+            if let Ok(id) = id_obj.try_into_value::<i64>(vm) {
+                crate::tensor_buf::write_tensor_data_by_id(id.max(0) as u64, &flat);
+            }
+        }
+        if let Ok(data_obj) = dict.get_item("_data", vm) {
+            if let Some(list) = data_obj.downcast_ref::<PyList>() {
+                let mut vec = list.borrow_vec_mut();
+                for (i, &v) in flat.iter().enumerate() {
+                    if i >= vec.len() {
+                        break;
+                    }
+                    vec[i] = if dtype.is_float() {
+                        vm.ctx.new_float(v as f64).into()
+                    } else {
+                        vm.ctx.new_int(v as i64).into()
+                    };
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// xos.random.uniform_fill(array, low, high) - fill array directly with random values (ZERO COPY)
@@ -350,33 +450,59 @@ fn uniform_fill(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         )));
     }
 
-    let _array_dict = &args_vec[0]; // Array dict (not used, we access buffer directly)
+    let tensor_hint = &args_vec[0];
     let low: f64 = parse_f64(&args_vec[1], vm)?;
     let high: f64 = parse_f64(&args_vec[2], vm)?;
 
-    // Get the frame buffer from global context
-    let buffer_guard = crate::rasterizer::CURRENT_FRAME_BUFFER
-        .lock()
-        .unwrap();
-    let width = *crate::rasterizer::CURRENT_FRAME_WIDTH
-        .lock()
-        .unwrap();
-    let height = *crate::rasterizer::CURRENT_FRAME_HEIGHT
-        .lock()
-        .unwrap();
+    let frame_dev = device_policy::tensor_device_label(tensor_hint, vm)?;
+    let engine_dev = device_policy::require_engine_device(vm, "uniform_fill", &frame_dev)?;
 
-    let buffer_ptr = buffer_guard.as_ref().ok_or_else(|| {
-        vm.new_runtime_error(
-            "No frame buffer context set. uniform_fill must be called during tick().".to_string(),
-        )
+    if !device_policy::is_frame_backed_tensor(tensor_hint, vm) {
+        fill_tensor_uniform(tensor_hint, low, high, vm)?;
+        let sentinel = vm.ctx.new_dict();
+        sentinel.set_item("_direct_fill", vm.ctx.new_bool(true).into(), vm)?;
+        return Ok(sentinel.into());
+    }
+
+    if engine_dev == ComputeDevice::Gpu {
+        if crate::engine::py_engine_tls::with_engine_state_mut(|state| {
+            xos_core::burn_raster::uniform_fill_rgba(&mut state.frame, low as f32, high as f32);
+            true
+        })
+        .is_some()
+        {
+            let sentinel = vm.ctx.new_dict();
+            sentinel.set_item("_direct_fill", vm.ctx.new_bool(true).into(), vm)?;
+            return Ok(sentinel.into());
+        }
+        return Err(vm.new_runtime_error(
+            "uniform_fill(): GPU path unavailable (engine state not bound during tick)"
+                .to_string(),
+        ));
+    }
+
+    crate::xos_module::with_frame_write_buffer(vm, Some(tensor_hint), |buffer| {
+        // Frame buffers are RGBA display surfaces; keep alpha opaque so random fills
+        // (e.g. TV static) don't appear black due to accidental transparency.
+        fill_buffer_uniform_random_rgba_opaque(buffer, low, high, vm)?;
+        let _ = crate::engine::py_engine_tls::with_tick_engine_state_mut(|state| {
+            state.frame.mark_cpu_staging_dirty();
+        });
+        Ok(())
     })?;
 
-    let buffer_len = width * height * 4;
-    let ptr = buffer_ptr.as_ptr();
-    let buffer = unsafe { std::slice::from_raw_parts_mut(ptr, buffer_len) };
-    drop(buffer_guard);
+    // Return sentinel dict to signal that data is already in buffer
+    let sentinel = vm.ctx.new_dict();
+    sentinel.set_item("_direct_fill", vm.ctx.new_bool(true).into(), vm)?;
+    Ok(sentinel.into())
+}
 
-    // Fill buffer directly with random values
+fn fill_buffer_uniform_random(
+    buffer: &mut [u8],
+    low: f64,
+    high: f64,
+    _vm: &VirtualMachine,
+) -> PyResult<()> {
     #[cfg(target_arch = "wasm32")]
     {
         for pixel in buffer.iter_mut() {
@@ -384,38 +510,28 @@ fn uniform_fill(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             let value = low + random * (high - low);
             *pixel = value.clamp(0.0, 255.0) as u8;
         }
+        return Ok(());
     }
 
     // Metal GPU path for iOS/macOS - 10x+ faster than CPU
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        if try_fill_random_metal(buffer, low, high) {
-            // Successfully filled on GPU - return immediately
-            let sentinel = vm.ctx.new_dict();
-            sentinel.set_item("_direct_fill", vm.ctx.new_bool(true).into(), vm)?;
-            return Ok(sentinel.into());
-        }
-        // If Metal fails, fall through to CPU path
+    if try_fill_random_metal(buffer, low, high) {
+        return Ok(());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        // OPTIMIZATION 1: Parallel CPU generation using rayon
-        // OPTIMIZATION 2: Generate u64s and split into bytes for 8x fewer RNG calls
         use rand::Rng;
         use rayon::prelude::*;
 
         let scale = (high - low) / 255.0;
         let offset = low;
 
-        // Split buffer into chunks for parallel processing
-        // Use chunk size that's multiple of 8 for u64 efficiency
-        const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks for good cache locality
+        const CHUNK_SIZE: usize = 64 * 1024;
 
         buffer.par_chunks_mut(CHUNK_SIZE).for_each(|chunk| {
             let mut rng = rand::rng();
 
-            // Process 8 bytes at a time using u64
             let chunks = chunk.len() / 8;
             let remainder = chunk.len() % 8;
 
@@ -430,7 +546,6 @@ fn uniform_fill(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
                 }
             }
 
-            // Handle remaining bytes
             if remainder > 0 {
                 let random_u64: u64 = rng.random();
                 let bytes = random_u64.to_le_bytes();
@@ -442,12 +557,21 @@ fn uniform_fill(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
                 }
             }
         });
+        Ok(())
     }
+}
 
-    // Return sentinel dict to signal that data is already in buffer
-    let sentinel = vm.ctx.new_dict();
-    sentinel.set_item("_direct_fill", vm.ctx.new_bool(true).into(), vm)?;
-    Ok(sentinel.into())
+fn fill_buffer_uniform_random_rgba_opaque(
+    buffer: &mut [u8],
+    low: f64,
+    high: f64,
+    vm: &VirtualMachine,
+) -> PyResult<()> {
+    fill_buffer_uniform_random(buffer, low, high, vm)?;
+    for px in buffer.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    Ok(())
 }
 
 /// xos.random.randint(a, b) -> int in the inclusive range [a, b]

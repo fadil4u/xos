@@ -88,6 +88,15 @@ fn cargo_bin_dir_hint() -> String {
     "~/.cargo/bin".to_string()
 }
 
+fn installed_cli_executable(stem: &str) -> PathBuf {
+    let name = if cfg!(windows) {
+        format!("{stem}.exe")
+    } else {
+        stem.to_string()
+    };
+    PathBuf::from(cargo_bin_dir_hint()).join(name)
+}
+
 /// Copy `src` over `dest`, replacing an existing file if present.
 ///
 /// On **Windows**, a running `xos.exe` locks the file so plain `copy` fails (error 32 / 5). The usual
@@ -480,8 +489,9 @@ fn write_wasm_index_html(output_dir: &Path) -> io::Result<()> {
       }
     }
     try {
-      const init = (await import("./pkg/xos_wasm.js")).default;
-      await init();
+      const wasm = await import("./pkg/xos_wasm.js");
+      await wasm.default();
+      await wasm.xos_launch();
       console.log("xos wasm: initialized");
     } catch (error) {
       console.error("xos wasm: failed to initialize", error);
@@ -759,18 +769,19 @@ pub fn xos_compile_command(verbose: bool, clean: bool, release: bool) -> bool {
         }
         Some(path_updated) => {
             if verbose {
-                let out = standard_xos_executable(&project_root, release);
+                let built_out = standard_xos_executable(&project_root, release);
+                let installed_out = installed_cli_executable("xos");
                 let profile_label = profile_dir_name(release);
                 if path_updated {
                     println!(
-                        "✅ PATH updated ({profile_label}). Main binary: {} (`{}`)",
-                        out.display(),
-                        cargo_bin_dir_hint()
+                        "✅ Compile OK ({profile_label}). Installed CLI: {} (build artifact: {})",
+                        installed_out.display(),
+                        built_out.display()
                     );
                 } else {
                     println!(
-                        "✅ Compile OK ({profile_label}): {} (see warning above about PATH)",
-                        out.display()
+                        "✅ Compile OK ({profile_label}). Build artifact: {} (installed CLI update failed; see warning above)",
+                        built_out.display()
                     );
                 }
             }

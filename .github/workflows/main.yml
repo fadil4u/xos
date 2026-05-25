@@ -3,10 +3,10 @@ name: CI
 on:
   push:
     branches:
-      - main
+      - "**"
   pull_request:
     branches:
-      - main
+      - "**"
   workflow_dispatch:
     inputs:
       force_compiler:
@@ -48,7 +48,10 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
           PR_BASE_REF: ${{ github.base_ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           FORCE_COMPILER: ${{ github.event.inputs.force_compiler || 'false' }}
         shell: bash
         run: |
@@ -64,7 +67,10 @@ jobs:
           out = Path(os.environ["GITHUB_OUTPUT"])
           event_name = os.environ.get("EVENT_NAME", "")
           push_before = os.environ.get("PUSH_BEFORE", "")
+          push_head = os.environ.get("PUSH_HEAD", "")
           pr_base_ref = os.environ.get("PR_BASE_REF", "")
+          pr_base_sha = os.environ.get("PR_BASE_SHA", "")
+          pr_head_sha = os.environ.get("PR_HEAD_SHA", "")
           force_compiler = os.environ.get("FORCE_COMPILER", "false").lower() == "true"
 
           def run(*args):
@@ -171,7 +177,24 @@ jobs:
           is_pre_release = c["pre"] != ""
           is_full_release = version_changed and c["pre"] == ""
 
-          run_compiler = force_compiler or pre_changed or is_full_release
+          workflow_changed = False
+          workflow_paths = {
+              ".github/workflows/main.yml",
+              ".github/workflows/compiler.yml",
+          }
+          diff_range = None
+          if event_name == "pull_request" and pr_base_sha and pr_head_sha:
+              diff_range = (pr_base_sha, pr_head_sha)
+          elif event_name == "push" and push_before and push_before != "0" * 40 and push_head:
+              diff_range = (push_before, push_head)
+
+          if diff_range is not None:
+              changed = run("git", "diff", "--name-only", diff_range[0], diff_range[1])
+              if changed.returncode == 0:
+                  changed_paths = {line.strip() for line in changed.stdout.splitlines() if line.strip()}
+                  workflow_changed = any(path in workflow_paths for path in changed_paths)
+
+          run_compiler = force_compiler or pre_changed or is_full_release or workflow_changed
           wasm_artifact_name = f"xos-wasm-zip-v{current_version}"
 
           lines = {
@@ -182,6 +205,7 @@ jobs:
               "pre_changed": str(pre_changed).lower(),
               "is_pre_release": str(is_pre_release).lower(),
               "is_full_release": str(is_full_release).lower(),
+              "workflow_changed": str(workflow_changed).lower(),
               "run_compiler": str(run_compiler).lower(),
               "wasm_artifact_name": wasm_artifact_name,
           }
@@ -208,6 +232,22 @@ jobs:
             echo "PRs into main must bump -preN in Cargo.toml."
             echo "Current:  ${{ needs.classify-version.outputs.current_version }}"
             echo "Against main: ${{ needs.classify-version.outputs.previous_version }}"
+            printf '%s\n' \
+              "" \
+              "# 📝 NOTICE:" \
+              "The reason for this failure is due to how our continuous integrations testing system works in regards to our pull requests in github." \
+              "" \
+              "In order to run our compiler tests and unit suites, you must first ensure that you update the version contained within the base \"Cargo.toml\" file." \
+              "" \
+              "In there under [workspace.package] you will see a \"version\" definition for the above listed versions. Please make sure to appropriately update this value so that when you push your commit to the pull request, it will in turn execute the full compiler and unit test suites." \
+              "" \
+              "Upon passing each compiler run and subsequent unit tests, each checkmark will show green ✅, and you may merge your pull request." \
+              "" \
+              "Please make sure to understand the versioning system. There is two components: major and pre. For general cases, you will likely only even add or update the -pre version. It should look something like \"-pre0\" or \"-pre1\" incrementally bumping as a revision." \
+              "" \
+              "In case others are merging with the same version bumps, this will naturally sort itself out when other users go to pull the downstream changes, and the github CI run will fail because the main branch was updated and you must now bump again." \
+              "" \
+              "Thank you, and have a good day. 🚀"
             exit 1
           fi
 
@@ -217,7 +257,7 @@ jobs:
     if: |
       always() &&
       (github.event_name == 'pull_request' && needs.enforce-pr-policy.result == 'success') ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.classify-version.outputs.run_compiler == 'true') ||
+      (github.event_name == 'push' && needs.classify-version.outputs.run_compiler == 'true') ||
       (github.event_name == 'workflow_dispatch' && needs.classify-version.outputs.run_compiler == 'true')
     uses: ./.github/workflows/compiler.yml
     with:

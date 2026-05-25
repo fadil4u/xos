@@ -2,6 +2,8 @@
 //! Desktop: toggle with **F3** (or host binding). iOS: **three-finger long-press** on the
 //! main viewport (same idea as Expo’s dev gesture); implemented in `XosViewportView.swift`.
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::compute_device::ComputeDevice;
 use crate::engine::{
     frame_view_rect_norm, EngineState, F3_UI_SCALE_MAX_PERCENT, F3_UI_SCALE_MIN_PERCENT,
     FRAME_VIEW_ZOOM_MAX, FRAME_VIEW_ZOOM_MIN,
@@ -22,8 +24,33 @@ const FRAME_ZOOM_WHEEL_RATE: f32 = 0.085;
 const F3_INTERACTION_FADE_DECAY: f32 = 3.2;
 const FONT_OPTION_BASE_SIZE: f32 = 19.0;
 const FONT_HEADER_BASE_SIZE: f32 = 17.0;
+const RUNTIME_INFO_BASE_SIZE: f32 = 15.0;
 #[cfg(target_os = "ios")]
 const IOS_MESH_TOGGLE_LABEL_BASE_SIZE: f32 = 16.0;
+
+/// Full-frame CPU rectangle (wasm + native CPU compute device).
+macro_rules! f3_blend_rect {
+    ($buffer:expr, $fw:expr, $fh:expr, $($rest:tt)*) => {
+        blend_rect_cpu($buffer, $fw, $fh, $($rest)*);
+    };
+}
+
+#[inline]
+#[cfg(not(target_arch = "wasm32"))]
+fn rect_rel(
+    scratch: &mut [u8],
+    pw: usize,
+    ph: usize,
+    pl: i32,
+    pt: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    rgba: (u8, u8, u8, u8),
+) {
+    blend_rect_cpu(scratch, pw, ph, x0 - pl, y0 - pt, x1 - pl, y1 - pt, rgba);
+}
 
 pub struct F3Menu {
     /// When false, FPS is still tracked but the menu is not drawn. Toggle with F3 (desktop) or
@@ -31,6 +58,7 @@ pub struct F3Menu {
     pub visible: bool,
     fps_rasterizer: TextRasterizer,
     scale_rasterizer: TextRasterizer,
+    runtime_info_rasterizer: TextRasterizer,
     font_header_rasterizer: TextRasterizer,
     font_option_rasterizers: Vec<TextRasterizer>,
     font_option_families: Vec<FontFamily>,
@@ -50,6 +78,9 @@ pub struct F3Menu {
     interaction_fade: f32,
     /// True when the last mouse down was consumed by the F3 panel (skip matching mouse up for the app).
     pub(crate) pointer_captured: bool,
+    /// CPU scratch for F3 labels (uploaded as one GPU patch; avoids full-frame readback).
+    #[cfg(not(target_arch = "wasm32"))]
+    text_scratch: Vec<u8>,
 }
 
 impl std::fmt::Debug for F3Menu {
@@ -67,6 +98,8 @@ impl F3Menu {
         fps_rasterizer.set_text("— FPS".to_string());
         let mut scale_rasterizer = TextRasterizer::new(font.clone(), BASE_FONT);
         scale_rasterizer.set_text("Scale: 100%".to_string());
+        let mut runtime_info_rasterizer = TextRasterizer::new(font.clone(), RUNTIME_INFO_BASE_SIZE);
+        runtime_info_rasterizer.set_text("Device: cpu | Context: cpu-staging | Platform: native".to_string());
         let mut font_header_rasterizer = TextRasterizer::new(font, FONT_HEADER_BASE_SIZE);
         font_header_rasterizer.set_text("Default font".to_string());
         let mut font_option_rasterizers = Vec::with_capacity(font_option_families.len());
@@ -89,6 +122,7 @@ impl F3Menu {
             visible: false,
             fps_rasterizer,
             scale_rasterizer,
+            runtime_info_rasterizer,
             font_header_rasterizer,
             font_option_rasterizers,
             font_option_families,
@@ -103,6 +137,8 @@ impl F3Menu {
             scale_zoom_velocity: 0.0,
             interaction_fade: 0.0,
             pointer_captured: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            text_scratch: Vec::new(),
         }
     }
 
@@ -150,6 +186,7 @@ struct PanelGeom {
     toggle_top: f32,
     #[cfg(target_os = "ios")]
     toggle_bottom: f32,
+    runtime_info_top: f32,
     font_option_count: usize,
     button_left: f32,
     button_right: f32,
@@ -187,6 +224,7 @@ fn panel_geom(
     let font_option_gap = (4.0 * us).max(2.0);
     #[cfg(target_os = "ios")]
     let toggle_h = (28.0 * us).max(18.0);
+    let runtime_info_h = (22.0 * us).max(14.0);
     let font_options_h = if font_option_count == 0 {
         0.0
     } else {
@@ -207,6 +245,7 @@ fn panel_geom(
     let toggle_extra = line_gap + toggle_h;
     #[cfg(not(target_os = "ios"))]
     let toggle_extra = 0.0_f32;
+    let runtime_info_extra = line_gap + runtime_info_h;
     let panel_h = pad
         + line_h
         + line_gap
@@ -216,6 +255,7 @@ fn panel_geom(
         + font_extra
         + minimap_extra
         + toggle_extra
+        + runtime_info_extra
         + pad;
     let panel_left = w - panel_w - pad;
     let panel_top = safe_top + pad;
@@ -254,6 +294,22 @@ fn panel_geom(
     };
     #[cfg(target_os = "ios")]
     let toggle_bottom = toggle_top + toggle_h;
+    let runtime_info_top = if cfg!(target_os = "ios") {
+        #[cfg(target_os = "ios")]
+        {
+            toggle_bottom + line_gap
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            slider_bottom + line_gap
+        }
+    } else if show_minimap {
+        minimap_bottom + line_gap
+    } else if font_option_count > 0 {
+        font_options_top + font_options_h + line_gap
+    } else {
+        slider_bottom + line_gap
+    };
     PanelGeom {
         panel_left,
         panel_top,
@@ -275,6 +331,7 @@ fn panel_geom(
         toggle_top,
         #[cfg(target_os = "ios")]
         toggle_bottom,
+        runtime_info_top,
         font_option_count,
         button_left,
         button_right,
@@ -345,6 +402,10 @@ fn sync_f3_default_font(menu: &mut F3Menu) {
     let mut scale = TextRasterizer::new(active_font.clone(), menu.scale_rasterizer.font_size);
     scale.set_text(menu.scale_rasterizer.text.clone());
     menu.scale_rasterizer = scale;
+    let mut runtime_info =
+        TextRasterizer::new(active_font.clone(), menu.runtime_info_rasterizer.font_size);
+    runtime_info.set_text(menu.runtime_info_rasterizer.text.clone());
+    menu.runtime_info_rasterizer = runtime_info;
     let mut header = TextRasterizer::new(active_font, menu.font_header_rasterizer.font_size);
     header.set_text(menu.font_header_rasterizer.text.clone());
     menu.font_header_rasterizer = header;
@@ -385,6 +446,32 @@ fn tick_scale_zoom_smoothing(state: &mut EngineState) {
     state.f3_menu.scale_zoom_velocity = 0.0;
     state.f3_menu.scale_zoom_value = next;
     state.ui_scale_percent = next.round() as u16;
+}
+
+#[inline]
+fn runtime_platform_label() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        return "windows";
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return "macos";
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return "linux";
+    }
+    #[cfg(target_os = "ios")]
+    {
+        return "ios";
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        return "wasm";
+    }
+    #[allow(unreachable_code)]
+    "unknown"
 }
 
 /// Handle Ctrl/Cmd + wheel zoom on the F3 scale.
@@ -462,6 +549,8 @@ fn measure_f3_panel(state: &mut EngineState) -> Option<(PanelGeom, f32)> {
     } else {
         (1.0 / state.delta_time_seconds.max(1e-5)).round().max(0.0) as u32
     };
+    let runtime_device = state.compute_device.as_str();
+    let runtime_platform = runtime_platform_label();
 
     {
         let menu = &mut state.f3_menu;
@@ -474,6 +563,14 @@ fn measure_f3_panel(state: &mut EngineState) -> Option<(PanelGeom, f32)> {
         menu.scale_rasterizer
             .set_text(format!("Scale: {}%", state.ui_scale_percent));
         menu.scale_rasterizer.tick(width, height);
+        menu.runtime_info_rasterizer
+            .set_font_size(RUNTIME_INFO_BASE_SIZE * ui_scale);
+        menu.runtime_info_rasterizer.set_text(format!(
+            "Device: {} | Platform: {}",
+            runtime_device,
+            runtime_platform
+        ));
+        menu.runtime_info_rasterizer.tick(width, height);
 
         menu.font_header_rasterizer
             .set_font_size(FONT_HEADER_BASE_SIZE * ui_scale);
@@ -515,8 +612,17 @@ fn measure_f3_panel(state: &mut EngineState) -> Option<(PanelGeom, f32)> {
     let button_size = (22.0 * ui_scale).max(12.0);
     let button_gap = (6.0 * ui_scale).max(3.0);
     let slider_w = (200.0 * ui_scale).max(120.0);
+    let runtime_w: f32 = state
+        .f3_menu
+        .runtime_info_rasterizer
+        .characters
+        .iter()
+        .map(|c| c.metrics.advance_width)
+        .sum();
     // Keep panel width stable so FPS/scale text width changes don't make the slider jitter horizontally.
-    let content_w = slider_w.max(button_size * 2.0 + button_gap + 240.0 * ui_scale);
+    let content_w = slider_w
+        .max(button_size * 2.0 + button_gap + 240.0 * ui_scale)
+        .max(runtime_w + 18.0 * ui_scale);
     let (_, _, vw, vh) = frame_view_rect_norm(state);
     let show_minimap = vw < 0.999 || vh < 0.999;
     let geom = panel_geom(
@@ -562,7 +668,11 @@ pub fn f3_menu_handle_mouse_down(state: &mut EngineState) -> bool {
         && my <= geom.step_bottom;
     if on_button {
         f3_menu_boost_interaction_fade(state);
+        let entering_pause = !state.paused;
         state.paused = !state.paused;
+        if entering_pause {
+            state.paused_frame_snapshot_pending = true;
+        }
         state.f3_menu.scale_dragging = false;
         state.f3_menu.pointer_captured = true;
         return true;
@@ -668,14 +778,34 @@ pub fn tick_f3_menu(state: &mut EngineState) {
     let width = shape[1] as f32;
     let height = shape[0] as f32;
 
-    let buffer = state.frame.buffer_mut();
+    // Windows currently uses CPU F3 composition for stability; for GPU apps,
+    // refresh staging from GPU first so overlays are composited over the
+    // latest frame (avoids "frozen/static" visuals under F3).
+    #[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+    if state.compute_device == ComputeDevice::Gpu {
+        state.frame.publish_gpu_to_staging();
+    }
+
+    // Windows safety: keep F3 on CPU composition for now.
+    // GPU F3 overlay can trigger device-driver crashes on some stacks.
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
+    if state.compute_device == ComputeDevice::Gpu && state.frame.gpu_present_enabled() {
+        draw_f3_panel_native(state, &geom, knob_w, overlay_alpha, view_rect, width, height);
+        return;
+    }
+
     let fw = width as usize;
     let fh = height as usize;
+    #[cfg(target_arch = "wasm32")]
+    let buffer = state.frame.buffer_mut();
+    #[cfg(not(target_arch = "wasm32"))]
+    let buffer = state.frame.staging_slice_mut_for_tick();
 
+    {
     // Opaque black panel behind text and slider.
     let panel_x1 = (geom.panel_left + geom.panel_w).ceil() as i32;
     let panel_y1 = (geom.panel_top + geom.panel_h).ceil() as i32;
-    blend_rect(
+    f3_blend_rect!(
         buffer,
         fw,
         fh,
@@ -689,7 +819,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
     // Slider track
     let track_x1 = geom.slider_right.ceil() as i32;
     let track_y1 = geom.slider_bottom.ceil() as i32;
-    blend_rect(
+    f3_blend_rect!(
         buffer,
         fw,
         fh,
@@ -710,7 +840,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
     } else {
         (120, 92, 26, 0xff)
     };
-    blend_rect(
+    f3_blend_rect!(
         buffer,
         fw,
         fh,
@@ -731,7 +861,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
     } else {
         (70, 70, 70, 0xff)
     };
-    blend_rect(
+    f3_blend_rect!(
         buffer,
         fw,
         fh,
@@ -759,7 +889,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
     let bar_x1 = bar_x0 + ((sw as f32 * 0.11).round().max(1.0) as i32);
     let bar_y0 = step_y0 + (sh as f32 * 0.22) as i32;
     let bar_y1 = step_y0 + (sh as f32 * 0.78) as i32;
-    blend_rect(buffer, fw, fh, bar_x0, bar_y0, bar_x1, bar_y1, icon_col);
+    f3_blend_rect!(buffer, fw, fh, bar_x0, bar_y0, bar_x1, bar_y1, icon_col);
 
     let tri_left = step_x0 + (sw as f32 * 0.26) as i32;
     let tri_right = step_x0 + (sw as f32 * 0.62) as i32;
@@ -770,7 +900,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
         let t = (tri_right - 1 - x) as f32 / (tri_right - tri_left).max(1) as f32;
         let y0 = (tri_mid as f32 - t * (tri_mid - tri_top) as f32) as i32;
         let y1 = (tri_mid as f32 + t * (tri_bottom - tri_mid) as f32) as i32;
-        blend_rect(buffer, fw, fh, x, y0, x + 1, y1 + 1, icon_col);
+        f3_blend_rect!(buffer, fw, fh, x, y0, x + 1, y1 + 1, icon_col);
     }
 
     if state.paused {
@@ -786,7 +916,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
             let t = (right - 1 - x) as f32 / (right - left).max(1) as f32;
             let y0 = (mid as f32 - t * (mid - top) as f32) as i32;
             let y1 = (mid as f32 + t * (bottom - mid) as f32) as i32;
-            blend_rect(
+            f3_blend_rect!(
                 buffer,
                 fw,
                 fh,
@@ -806,7 +936,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
         let x_start = btn_x0 + ((w - (bar_w * 2 + gap)) / 2);
         let y_start = btn_y0 + (h as f32 * 0.20) as i32;
         let y_end = btn_y0 + (h as f32 * 0.80) as i32;
-        blend_rect(
+        f3_blend_rect!(
             buffer,
             fw,
             fh,
@@ -816,7 +946,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
             y_end,
             (250, 240, 220, (255.0 * overlay_alpha) as u8),
         );
-        blend_rect(
+        f3_blend_rect!(
             buffer,
             fw,
             fh,
@@ -840,7 +970,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
     let knob_x1 = (knob_left + knob_w_i as f32).ceil() as i32;
     let knob_y0 = (geom.slider_top - 1.0).floor() as i32;
     let knob_y1 = (geom.slider_bottom + 1.0).ceil() as i32;
-    blend_rect(
+    f3_blend_rect!(
         buffer,
         fw,
         fh,
@@ -869,7 +999,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
         } else {
             (48, 48, 48, (190.0 * overlay_alpha) as u8)
         };
-        blend_rect(
+        f3_blend_rect!(
             buffer,
             fw,
             fh,
@@ -889,7 +1019,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
         let mini_w = (mx1 - mx0).max(1) as f32;
         let mini_h = (my1 - my0).max(1) as f32;
 
-        blend_rect(
+        f3_blend_rect!(
             buffer,
             fw,
             fh,
@@ -911,7 +1041,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
         let full_y0 = (my0 as f32 + (mini_h - full_h) * 0.5).round() as i32;
         let full_x1 = (full_x0 as f32 + full_w).round() as i32;
         let full_y1 = (full_y0 as f32 + full_h).round() as i32;
-        blend_rect(
+        f3_blend_rect!(
             buffer,
             fw,
             fh,
@@ -927,7 +1057,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
         let lens_y0 = (full_y0 as f32 + vy * full_h).round() as i32;
         let lens_x1 = (lens_x0 as f32 + vw * full_w).round() as i32;
         let lens_y1 = (lens_y0 as f32 + vh * full_h).round() as i32;
-        blend_rect(
+        f3_blend_rect!(
             buffer,
             fw,
             fh,
@@ -945,7 +1075,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
         let ty0 = geom.toggle_top.floor() as i32;
         let tx1 = geom.toggle_right.ceil() as i32;
         let ty1 = geom.toggle_bottom.ceil() as i32;
-        blend_rect(
+        f3_blend_rect!(
             buffer,
             fw,
             fh,
@@ -970,7 +1100,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
         } else {
             (88, 88, 96, (220.0 * overlay_alpha) as u8)
         };
-        blend_rect(
+        f3_blend_rect!(
             buffer,
             fw,
             fh,
@@ -986,7 +1116,7 @@ pub fn tick_f3_menu(state: &mut EngineState) {
         } else {
             switch_x0 + 2.0
         };
-        blend_rect(
+        f3_blend_rect!(
             buffer,
             fw,
             fh,
@@ -995,16 +1125,6 @@ pub fn tick_f3_menu(state: &mut EngineState) {
             (knob_x + knob_d).ceil() as i32,
             (switch_y1 - 2.0).ceil() as i32,
             (238, 238, 242, (255.0 * overlay_alpha) as u8),
-        );
-        blend_text(
-            buffer,
-            width,
-            height,
-            &state.f3_menu.ios_mesh_toggle_rasterizer,
-            geom.toggle_left + (8.0 * geom.ui_scale),
-            geom.toggle_top + ((geom.toggle_bottom - geom.toggle_top) * 0.23),
-            (245, 245, 245),
-            overlay_alpha,
         );
     }
 
@@ -1018,38 +1138,455 @@ pub fn tick_f3_menu(state: &mut EngineState) {
     let line_h = 32.0 * ui_scale;
     let label_origin_y = fps_origin_y + line_h + line_gap;
 
-    blend_text(
+    draw_f3_text_layer_cpu(
+        &state.f3_menu,
         buffer,
+        fw,
+        fh,
+        &geom,
         width,
         height,
-        &state.f3_menu.fps_rasterizer,
+        overlay_alpha,
         fps_origin_x,
         fps_origin_y,
+        label_origin_x,
+        label_origin_y,
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    state.frame.mark_cpu_staging_dirty();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn draw_f3_panel_native(
+    state: &mut EngineState,
+    geom: &PanelGeom,
+    knob_w: f32,
+    overlay_alpha: f32,
+    view_rect: (f32, f32, f32, f32),
+    width: f32,
+    height: f32,
+) {
+    let pw = geom.panel_w.ceil().max(1.0) as usize;
+    let ph = geom.panel_h.ceil().max(1.0) as usize;
+    let pl = geom.panel_left.floor() as i32;
+    let pt = geom.panel_top.floor() as i32;
+    let pl_f = geom.panel_left;
+    let pt_f = geom.panel_top;
+
+    let scratch = &mut state.f3_menu.text_scratch;
+    scratch.resize(pw * ph * 4, 0);
+    scratch.fill(0);
+
+    let panel_x1 = (geom.panel_left + geom.panel_w).ceil() as i32;
+    let panel_y1 = (geom.panel_top + geom.panel_h).ceil() as i32;
+    rect_rel(
+        scratch,
+        pw,
+        ph,
+        pl,
+        pt,
+        geom.panel_left as i32,
+        geom.panel_top as i32,
+        panel_x1,
+        panel_y1,
+        (0, 0, 0, (255.0 * overlay_alpha) as u8),
+    );
+
+    let track_x1 = geom.slider_right.ceil() as i32;
+    let track_y1 = geom.slider_bottom.ceil() as i32;
+    rect_rel(
+        scratch,
+        pw,
+        ph,
+        pl,
+        pt,
+        geom.slider_left as i32,
+        geom.slider_top as i32,
+        track_x1,
+        track_y1,
+        (55, 55, 55, (255.0 * overlay_alpha) as u8),
+    );
+
+    let btn_x0 = geom.button_left.floor() as i32;
+    let btn_y0 = geom.button_top.floor() as i32;
+    let btn_x1 = geom.button_right.ceil() as i32;
+    let btn_y1 = geom.button_bottom.ceil() as i32;
+    let btn_bg = if state.paused {
+        (34, 128, 76, 0xff)
+    } else {
+        (120, 92, 26, 0xff)
+    };
+    rect_rel(
+        scratch,
+        pw,
+        ph,
+        pl,
+        pt,
+        btn_x0,
+        btn_y0,
+        btn_x1,
+        btn_y1,
+        (btn_bg.0, btn_bg.1, btn_bg.2, (255.0 * overlay_alpha) as u8),
+    );
+
+    let step_x0 = geom.step_left.floor() as i32;
+    let step_y0 = geom.step_top.floor() as i32;
+    let step_x1 = geom.step_right.ceil() as i32;
+    let step_y1 = geom.step_bottom.ceil() as i32;
+    let step_bg = if state.paused {
+        (44, 72, 124, 0xff)
+    } else {
+        (70, 70, 70, 0xff)
+    };
+    rect_rel(
+        scratch,
+        pw,
+        ph,
+        pl,
+        pt,
+        step_x0,
+        step_y0,
+        step_x1,
+        step_y1,
+        (
+            step_bg.0,
+            step_bg.1,
+            step_bg.2,
+            (255.0 * overlay_alpha) as u8,
+        ),
+    );
+
+    let sw = (step_x1 - step_x0).max(4);
+    let sh = (step_y1 - step_y0).max(4);
+    let icon_col = if state.paused {
+        (228, 240, 255, (255.0 * overlay_alpha) as u8)
+    } else {
+        (155, 155, 155, (255.0 * overlay_alpha) as u8)
+    };
+    let bar_x0 = step_x0 + (sw as f32 * 0.68) as i32;
+    let bar_x1 = bar_x0 + ((sw as f32 * 0.11).round().max(1.0) as i32);
+    let bar_y0 = step_y0 + (sh as f32 * 0.22) as i32;
+    let bar_y1 = step_y0 + (sh as f32 * 0.78) as i32;
+    rect_rel(scratch, pw, ph, pl, pt, bar_x0, bar_y0, bar_x1, bar_y1, icon_col);
+
+    let tri_left = step_x0 + (sw as f32 * 0.26) as i32;
+    let tri_right = step_x0 + (sw as f32 * 0.62) as i32;
+    let tri_top = step_y0 + (sh as f32 * 0.24) as i32;
+    let tri_bottom = step_y0 + (sh as f32 * 0.76) as i32;
+    let tri_mid = (tri_top + tri_bottom) / 2;
+    for x in tri_left..tri_right {
+        let t = (tri_right - 1 - x) as f32 / (tri_right - tri_left).max(1) as f32;
+        let y0 = (tri_mid as f32 - t * (tri_mid - tri_top) as f32) as i32;
+        let y1 = (tri_mid as f32 + t * (tri_bottom - tri_mid) as f32) as i32;
+        rect_rel(scratch, pw, ph, pl, pt, x, y0, x + 1, y1 + 1, icon_col);
+    }
+
+    if state.paused {
+        let w = (btn_x1 - btn_x0).max(2);
+        let h = (btn_y1 - btn_y0).max(2);
+        let left = btn_x0 + (w as f32 * 0.34) as i32;
+        let right = btn_x0 + (w as f32 * 0.72) as i32;
+        let top = btn_y0 + (h as f32 * 0.24) as i32;
+        let bottom = btn_y0 + (h as f32 * 0.76) as i32;
+        let mid = (top + bottom) / 2;
+        for x in left..right {
+            let t = (right - 1 - x) as f32 / (right - left).max(1) as f32;
+            let y0 = (mid as f32 - t * (mid - top) as f32) as i32;
+            let y1 = (mid as f32 + t * (bottom - mid) as f32) as i32;
+            rect_rel(
+                scratch,
+                pw,
+                ph,
+                pl,
+                pt,
+                x,
+                y0,
+                x + 1,
+                y1 + 1,
+                (235, 245, 235, (255.0 * overlay_alpha) as u8),
+            );
+        }
+    } else {
+        let w = (btn_x1 - btn_x0).max(4);
+        let h = (btn_y1 - btn_y0).max(4);
+        let bar_w = ((w as f32) * 0.18).round().max(1.0) as i32;
+        let gap = ((w as f32) * 0.14).round().max(1.0) as i32;
+        let x_start = btn_x0 + ((w - (bar_w * 2 + gap)) / 2);
+        let y_start = btn_y0 + (h as f32 * 0.20) as i32;
+        let y_end = btn_y0 + (h as f32 * 0.80) as i32;
+        rect_rel(
+            scratch,
+            pw,
+            ph,
+            pl,
+            pt,
+            x_start,
+            y_start,
+            x_start + bar_w,
+            y_end,
+            (250, 240, 220, (255.0 * overlay_alpha) as u8),
+        );
+        rect_rel(
+            scratch,
+            pw,
+            ph,
+            pl,
+            pt,
+            x_start + bar_w + gap,
+            y_start,
+            x_start + bar_w + gap + bar_w,
+            y_end,
+            (250, 240, 220, (255.0 * overlay_alpha) as u8),
+        );
+    }
+
+    let knob_w_i = knob_w as i32;
+    let inner = (geom.slider_right - geom.slider_left - knob_w).max(1.0);
+    let range = (F3_UI_SCALE_MAX_PERCENT - F3_UI_SCALE_MIN_PERCENT) as f32;
+    let t = (state
+        .ui_scale_percent
+        .saturating_sub(F3_UI_SCALE_MIN_PERCENT) as f32)
+        / range.max(1.0);
+    let knob_left = geom.slider_left + t * inner;
+    let knob_x1 = (knob_left + knob_w_i as f32).ceil() as i32;
+    let knob_y0 = (geom.slider_top - 1.0).floor() as i32;
+    let knob_y1 = (geom.slider_bottom + 1.0).ceil() as i32;
+    rect_rel(
+        scratch,
+        pw,
+        ph,
+        pl,
+        pt,
+        knob_left as i32,
+        knob_y0,
+        knob_x1,
+        knob_y1,
+        (220, 220, 220, (255.0 * overlay_alpha) as u8),
+    );
+
+    let selected_family = fonts::default_font_family();
+    for idx in 0..geom.font_option_count {
+        let Some((x0, x1, y0, y1)) = font_option_rect(geom, idx) else {
+            continue;
+        };
+        let is_selected = state
+            .f3_menu
+            .font_option_families
+            .get(idx)
+            .copied()
+            .map(|f| f == selected_family)
+            .unwrap_or(false);
+        let bg = if is_selected {
+            (46, 138, 72, (220.0 * overlay_alpha) as u8)
+        } else {
+            (48, 48, 48, (190.0 * overlay_alpha) as u8)
+        };
+        rect_rel(
+            scratch,
+            pw,
+            ph,
+            pl,
+            pt,
+            x0.floor() as i32,
+            y0.floor() as i32,
+            x1.ceil() as i32,
+            y1.ceil() as i32,
+            bg,
+        );
+    }
+
+    if geom.show_minimap {
+        let mx0 = geom.minimap_left.floor() as i32;
+        let my0 = geom.minimap_top.floor() as i32;
+        let mx1 = geom.minimap_right.ceil() as i32;
+        let my1 = geom.minimap_bottom.ceil() as i32;
+        let mini_w = (mx1 - mx0).max(1) as f32;
+        let mini_h = (my1 - my0).max(1) as f32;
+
+        rect_rel(
+            scratch,
+            pw,
+            ph,
+            pl,
+            pt,
+            mx0,
+            my0,
+            mx1,
+            my1,
+            (40, 40, 40, (255.0 * overlay_alpha) as u8),
+        );
+
+        let frame_aspect = (width / height.max(1.0)).max(1e-4);
+        let mini_aspect = (mini_w / mini_h).max(1e-4);
+        let (full_w, full_h) = if frame_aspect >= mini_aspect {
+            (mini_w * 0.9, (mini_w * 0.9) / frame_aspect)
+        } else {
+            (mini_h * 0.9 * frame_aspect, mini_h * 0.9)
+        };
+        let full_x0 = (mx0 as f32 + (mini_w - full_w) * 0.5).round() as i32;
+        let full_y0 = (my0 as f32 + (mini_h - full_h) * 0.5).round() as i32;
+        let full_x1 = (full_x0 as f32 + full_w).round() as i32;
+        let full_y1 = (full_y0 as f32 + full_h).round() as i32;
+        rect_rel(
+            scratch,
+            pw,
+            ph,
+            pl,
+            pt,
+            full_x0,
+            full_y0,
+            full_x1,
+            full_y1,
+            (96, 96, 96, (210.0 * overlay_alpha) as u8),
+        );
+
+        let (vx, vy, vw, vh) = view_rect;
+        let lens_x0 = (full_x0 as f32 + vx * full_w).round() as i32;
+        let lens_y0 = (full_y0 as f32 + vy * full_h).round() as i32;
+        let lens_x1 = (lens_x0 as f32 + vw * full_w).round() as i32;
+        let lens_y1 = (lens_y0 as f32 + vh * full_h).round() as i32;
+        rect_rel(
+            scratch,
+            pw,
+            ph,
+            pl,
+            pt,
+            lens_x0,
+            lens_y0,
+            lens_x1,
+            lens_y1,
+            (56, 124, 255, (190.0 * overlay_alpha) as u8),
+        );
+    }
+
+    #[cfg(target_os = "ios")]
+    {
+        let tx0 = geom.toggle_left.floor() as i32;
+        let ty0 = geom.toggle_top.floor() as i32;
+        let tx1 = geom.toggle_right.ceil() as i32;
+        let ty1 = geom.toggle_bottom.ceil() as i32;
+        rect_rel(
+            scratch,
+            pw,
+            ph,
+            pl,
+            pt,
+            tx0,
+            ty0,
+            tx1,
+            ty1,
+            (46, 46, 52, (220.0 * overlay_alpha) as u8),
+        );
+
+        let toggle_w = (tx1 - tx0).max(8) as f32;
+        let toggle_h = (ty1 - ty0).max(8) as f32;
+        let switch_w = (toggle_w * 0.20).clamp(22.0, 40.0);
+        let switch_h = (toggle_h * 0.55).clamp(14.0, 24.0);
+        let switch_x1 = tx1 as f32 - (8.0 * geom.ui_scale);
+        let switch_x0 = switch_x1 - switch_w;
+        let switch_y0 = ty0 as f32 + (toggle_h - switch_h) * 0.5;
+        let switch_y1 = switch_y0 + switch_h;
+        let is_on = state.f3_menu.ios_mesh_enabled;
+        let track_col = if is_on {
+            (60, 150, 88, (230.0 * overlay_alpha) as u8)
+        } else {
+            (88, 88, 96, (220.0 * overlay_alpha) as u8)
+        };
+        rect_rel(
+            scratch,
+            pw,
+            ph,
+            pl,
+            pt,
+            switch_x0.floor() as i32,
+            switch_y0.floor() as i32,
+            switch_x1.ceil() as i32,
+            switch_y1.ceil() as i32,
+            track_col,
+        );
+        let knob_d = (switch_h - 4.0).max(8.0);
+        let knob_x = if is_on {
+            switch_x1 - knob_d - 2.0
+        } else {
+            switch_x0 + 2.0
+        };
+        rect_rel(
+            scratch,
+            pw,
+            ph,
+            pl,
+            pt,
+            knob_x.floor() as i32,
+            (switch_y0 + 2.0).floor() as i32,
+            (knob_x + knob_d).ceil() as i32,
+            (switch_y1 - 2.0).ceil() as i32,
+            (238, 238, 242, (255.0 * overlay_alpha) as u8),
+        );
+    }
+
+    let ui_scale = F3Menu::ui_scale(width.max(height));
+    let pad = F3Menu::padding_scaled(ui_scale);
+    let fps_origin_x = geom.panel_left + pad;
+    let fps_origin_y = geom.panel_top + pad;
+    let label_origin_x = geom.panel_left + pad;
+    let line_gap = 6.0 * ui_scale;
+    let line_h = 32.0 * ui_scale;
+    let label_origin_y = fps_origin_y + line_h + line_gap;
+
+    #[cfg(target_os = "ios")]
+    blend_text_into_scratch(
+        scratch,
+        pw,
+        ph,
+        &state.f3_menu.ios_mesh_toggle_rasterizer,
+        geom.toggle_left + (8.0 * geom.ui_scale) - pl_f,
+        geom.toggle_top + ((geom.toggle_bottom - geom.toggle_top) * 0.23) - pt_f,
+        (245, 245, 245),
+        overlay_alpha,
+    );
+    blend_text_into_scratch(
+        scratch,
+        pw,
+        ph,
+        &state.f3_menu.fps_rasterizer,
+        fps_origin_x - pl_f,
+        fps_origin_y - pt_f,
         (0, 255, 0),
         overlay_alpha,
     );
-    blend_text(
-        buffer,
-        width,
-        height,
+    blend_text_into_scratch(
+        scratch,
+        pw,
+        ph,
         &state.f3_menu.scale_rasterizer,
-        label_origin_x,
-        label_origin_y,
+        label_origin_x - pl_f,
+        label_origin_y - pt_f,
         (255, 255, 255),
         overlay_alpha,
     );
-    blend_text(
-        buffer,
-        width,
-        height,
+    blend_text_into_scratch(
+        scratch,
+        pw,
+        ph,
+        &state.f3_menu.runtime_info_rasterizer,
+        geom.slider_left - pl_f,
+        geom.runtime_info_top - pt_f,
+        (190, 210, 245),
+        overlay_alpha,
+    );
+    blend_text_into_scratch(
+        scratch,
+        pw,
+        ph,
         &state.f3_menu.font_header_rasterizer,
-        geom.slider_left,
-        geom.font_header_top,
+        geom.slider_left - pl_f,
+        geom.font_header_top - pt_f,
         (210, 210, 210),
         overlay_alpha,
     );
     for (idx, text_rasterizer) in state.f3_menu.font_option_rasterizers.iter().enumerate() {
-        let Some((x0, _x1, y0, y1)) = font_option_rect(&geom, idx) else {
+        let Some((x0, _x1, y0, y1)) = font_option_rect(geom, idx) else {
             continue;
         };
         let text_w: f32 = text_rasterizer
@@ -1057,13 +1594,107 @@ pub fn tick_f3_menu(state: &mut EngineState) {
             .iter()
             .map(|c| c.metrics.advance_width)
             .sum();
-        let tx =
-            x0 + ((geom.slider_right - geom.slider_left - text_w) * 0.5).max(8.0 * geom.ui_scale);
+        let tx = x0 + ((geom.slider_right - geom.slider_left - text_w) * 0.5)
+            .max(8.0 * geom.ui_scale);
         let ty = y0 + ((y1 - y0 - FONT_OPTION_BASE_SIZE * geom.ui_scale) * 0.35).max(2.0);
-        blend_text(
+        blend_text_into_scratch(
+            scratch,
+            pw,
+            ph,
+            text_rasterizer,
+            tx - pl_f,
+            ty - pt_f,
+            (245, 245, 245),
+            overlay_alpha,
+        );
+    }
+
+    crate::burn_raster::blend_rgba_patch(&mut state.frame, pl, pt, pw, ph, scratch);
+}
+
+fn draw_f3_text_layer_cpu(
+    menu: &F3Menu,
+    buffer: &mut [u8],
+    width: usize,
+    height: usize,
+    geom: &PanelGeom,
+    _frame_w: f32,
+    _frame_h: f32,
+    overlay_alpha: f32,
+    fps_origin_x: f32,
+    fps_origin_y: f32,
+    label_origin_x: f32,
+    label_origin_y: f32,
+) {
+    let wf = width as f32;
+    let hf = height as f32;
+    #[cfg(target_os = "ios")]
+    blend_text_cpu(
+        buffer,
+        wf,
+        hf,
+        &menu.ios_mesh_toggle_rasterizer,
+            geom.toggle_left + (8.0 * geom.ui_scale),
+            geom.toggle_top + ((geom.toggle_bottom - geom.toggle_top) * 0.23),
+            (245, 245, 245),
+            overlay_alpha,
+        );
+    blend_text_cpu(
+        buffer,
+        wf,
+        hf,
+        &menu.fps_rasterizer,
+            fps_origin_x,
+            fps_origin_y,
+            (0, 255, 0),
+            overlay_alpha,
+        );
+    blend_text_cpu(
+        buffer,
+        wf,
+        hf,
+        &menu.scale_rasterizer,
+            label_origin_x,
+            label_origin_y,
+            (255, 255, 255),
+            overlay_alpha,
+        );
+    blend_text_cpu(
+        buffer,
+        wf,
+        hf,
+        &menu.runtime_info_rasterizer,
+        geom.slider_left,
+        geom.runtime_info_top,
+        (190, 210, 245),
+        overlay_alpha,
+    );
+    blend_text_cpu(
+        buffer,
+        wf,
+        hf,
+        &menu.font_header_rasterizer,
+            geom.slider_left,
+            geom.font_header_top,
+            (210, 210, 210),
+            overlay_alpha,
+        );
+        for (idx, text_rasterizer) in menu.font_option_rasterizers.iter().enumerate() {
+            let Some((x0, _x1, y0, y1)) = font_option_rect(&geom, idx) else {
+                continue;
+            };
+            let text_w: f32 = text_rasterizer
+                .characters
+                .iter()
+                .map(|c| c.metrics.advance_width)
+                .sum();
+            let tx =
+                x0 + ((geom.slider_right - geom.slider_left - text_w) * 0.5).max(8.0 * geom.ui_scale);
+            let ty = y0 + ((y1 - y0 - FONT_OPTION_BASE_SIZE * geom.ui_scale) * 0.35).max(2.0);
+        blend_text_cpu(
             buffer,
-            width,
-            height,
+            wf,
+            hf,
             text_rasterizer,
             tx,
             ty,
@@ -1073,7 +1704,51 @@ pub fn tick_f3_menu(state: &mut EngineState) {
     }
 }
 
-fn blend_text(
+#[cfg(not(target_arch = "wasm32"))]
+fn blend_text_into_scratch(
+    buffer: &mut [u8],
+    buf_w: usize,
+    buf_h: usize,
+    rasterizer: &TextRasterizer,
+    origin_x: f32,
+    origin_y: f32,
+    rgb: (u8, u8, u8),
+    overlay_alpha: f32,
+) {
+    for character in &rasterizer.characters {
+        let char_x = origin_x + character.x;
+        let char_y = origin_y + character.y;
+        let cw = character.width as usize;
+        if cw == 0 {
+            continue;
+        }
+        for (bitmap_y, row) in character.bitmap.chunks(cw).enumerate() {
+            for (bitmap_x, &alpha) in row.iter().enumerate() {
+                if alpha == 0 {
+                    continue;
+                }
+                let px = (char_x + bitmap_x as f32) as i32;
+                let py = (char_y + bitmap_y as f32) as i32;
+                if px >= 0 && px < buf_w as i32 && py >= 0 && py < buf_h as i32 {
+                    let idx = ((py as u32 * buf_w as u32 + px as u32) * 4) as usize;
+                    let alpha_f = (alpha as f32 / 255.0) * overlay_alpha;
+                    buffer[idx] = ((rgb.0 as f32 * alpha_f)
+                        + (buffer[idx] as f32 * (1.0 - alpha_f)))
+                        as u8;
+                    buffer[idx + 1] = ((rgb.1 as f32 * alpha_f)
+                        + (buffer[idx + 1] as f32 * (1.0 - alpha_f)))
+                        as u8;
+                    buffer[idx + 2] = ((rgb.2 as f32 * alpha_f)
+                        + (buffer[idx + 2] as f32 * (1.0 - alpha_f)))
+                        as u8;
+                    buffer[idx + 3] = 0xff;
+                }
+            }
+        }
+    }
+}
+
+fn blend_text_cpu(
     buffer: &mut [u8],
     width: f32,
     height: f32,
@@ -1116,7 +1791,7 @@ fn blend_text(
     }
 }
 
-fn blend_rect(
+fn blend_rect_cpu(
     buffer: &mut [u8],
     width: usize,
     height: usize,

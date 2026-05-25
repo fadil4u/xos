@@ -113,6 +113,7 @@ pub extern "system" fn Java_ai_xlate_xos_XosNative_init(
         let safe_region = SafeRegionBoundingRectangle::full_screen();
         let mut engine = EngineState {
             frame: FrameState::new(width as u32, height as u32, safe_region),
+            compute_device: xos_core::compute_device::ComputeDevice::resolve_auto(None),
             mouse: MouseState {
                 x: 0.0,
                 y: 0.0,
@@ -131,6 +132,7 @@ pub extern "system" fn Java_ai_xlate_xos_XosNative_init(
             delta_time_seconds: 1.0 / 60.0,
             paused: false,
             pending_step_ticks: 0,
+            paused_frame_snapshot_pending: false,
             frame_view_zoom: 1.0,
             frame_view_zoom_target: 1.0,
             frame_view_zoom_velocity: 0.0,

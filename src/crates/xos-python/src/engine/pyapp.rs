@@ -316,6 +316,25 @@ def _nested_list_to_tuple(nested):
         return tuple(_nested_list_to_tuple(x) for x in nested)
     return nested
 
+def _format_scalar_value(v):
+    if isinstance(v, bool):
+        return "True" if v else "False"
+    if isinstance(v, float):
+        if v == float(int(v)) and abs(v) < 1e15:
+            return str(int(v))
+        return "{:.6g}".format(v)
+    return repr(v)
+
+def _format_nested_values(data):
+    """Compact nested tuple formatting for ``tostring(full=True)``."""
+    if isinstance(data, tuple):
+        if not data:
+            return "()"
+        if isinstance(data[0], tuple):
+            return "(" + ", ".join(_format_nested_values(row) for row in data) + ")"
+        return "(" + ", ".join(_format_scalar_value(x) for x in data) + ")"
+    return _format_scalar_value(data)
+
 class Tensor:
     """xos.Tensor — dict-backed tensor (``shape``, ``dtype``, ``_data``) or flat list + optional ``shape``."""
     def __init__(self, data, shape=None):
@@ -335,11 +354,174 @@ class Tensor:
         d = self._data.get("_data")
         if isinstance(d, list):
             return iter(d)
+        if isinstance(d, (bytes, bytearray)):
+            return iter(d)
         return iter([])
 
     def __len__(self):
         d = self._data.get("_data")
-        return len(d) if isinstance(d, list) else 0
+        if isinstance(d, (list, bytes, bytearray)):
+            return len(d)
+        return 0
+
+    def _flat_storage(self):
+        d = self._data.get("_data")
+        if isinstance(d, (list, bytes, bytearray)) and len(d) > 0:
+            return d
+        return None
+
+    def _ensure_flat(self):
+        import xos
+        if self._flat_storage() is not None:
+            return
+        if self._data.get("_rust_tensor") is not None and self._attach_registry_flat():
+            return
+        if self._data.get("_xos_gpu_conv_output"):
+            xos._materialize_conv_output(self)
+            return
+        if (
+            self._data.get("_xos_viewport_id") is not None
+            or self._data.get("_xos_frame_backing")
+            or self._data.get("_xos_frame_materialized")
+        ):
+            xos._materialize_frame_tensor(self)
+            return
+        xos._materialize_frame_tensor(self)
+
+    def _flat_len(self, flat):
+        return len(flat)
+
+    def _flat_get(self, flat, i):
+        if isinstance(flat, (bytes, bytearray)):
+            if self.dtype == "float32":
+                import struct
+                return struct.unpack_from("<f", flat, i * 4)[0]
+            return flat[i]
+        return flat[i]
+
+    def _attach_registry_flat(self):
+        rid = self._data.get("_rust_tensor")
+        if rid is None:
+            return False
+        import xos
+        ba = xos._tensor_registry_bytes(int(rid), str(self._data.get("dtype", "float32")))
+        if ba is None:
+            return False
+        self._data["_data"] = ba
+        return True
+
+    def _cmp_scalar(self, other):
+        if (
+            isinstance(other, float)
+            and self._data.get("dtype") == "uint8"
+            and other == 0.5
+        ):
+            return 127.5
+        return other
+
+    def _maybe_flush_frame(self):
+        import xos
+        if (
+            self._data.get("_xos_viewport_id") is not None
+            or self._data.get("_xos_frame_backing")
+            or self._data.get("_xos_frame_materialized")
+        ):
+            xos._flush_frame_tensor(self)
+
+    def _broadcast_rhs_flat(self, lshape, rshape, left, right):
+        if len(left) == len(right):
+            return right
+        if (
+            len(lshape) == 2
+            and len(rshape) == 3
+            and lshape[0] == rshape[0]
+            and lshape[1] == rshape[1]
+            and rshape[2] == 1
+        ):
+            return right
+        if (
+            len(lshape) == 3
+            and len(rshape) == 2
+            and lshape[0] == rshape[0]
+            and lshape[1] == rshape[1]
+            and lshape[2] == 1
+        ):
+            return right
+        if (
+            len(lshape) == 3
+            and len(rshape) == 3
+            and lshape[0] == rshape[0]
+            and lshape[1] == rshape[1]
+            and lshape[2] == 4
+            and rshape[2] == 3
+        ):
+            h, w = int(lshape[0]), int(lshape[1])
+            out = []
+            for i in range(h * w):
+                rv = right[i * 3]
+                for _ in range(4):
+                    out.append(rv)
+            return out
+        raise ValueError(
+            "shape mismatch for broadcast: {} vs {} ({} vs {} elements)".format(
+                lshape, rshape, len(left), len(right)
+            )
+        )
+
+    def _masked_assign(self, mask_tensor, value):
+        flat = self._flat_storage()
+        if flat is None:
+            raise TypeError("tensor has no flat storage for masked assignment")
+        mask = mask_tensor._flat_storage()
+        if mask is None:
+            raise TypeError("boolean mask must be a tensor with flat _data")
+        if self._flat_len(flat) != self._flat_len(mask):
+            raise IndexError(
+                "boolean mask length ({}) must equal tensor size ({})".format(
+                    self._flat_len(mask), self._flat_len(flat)
+                )
+            )
+        n = self._flat_len(flat)
+        if isinstance(value, Tensor):
+            vflat = value._flat_storage()
+            if vflat is None:
+                raise TypeError("assigned value must be scalar or same-length tensor")
+            if self._flat_len(vflat) == 1:
+                scalar = self._flat_get(vflat, 0)
+                for i in range(n):
+                    if int(self._flat_get(mask, i)) != 0:
+                        if isinstance(flat, bytearray):
+                            flat[i] = int(scalar) & 0xFF
+                        elif isinstance(flat, bytes):
+                            ba = bytearray(flat)
+                            ba[i] = int(scalar) & 0xFF
+                            self._data["_data"] = ba
+                            flat = ba
+                        else:
+                            flat[i] = scalar
+                return
+            if self._flat_len(vflat) == n:
+                for i in range(n):
+                    if int(self._flat_get(mask, i)) != 0:
+                        if isinstance(flat, (bytes, bytearray)):
+                            if isinstance(flat, bytes):
+                                flat = bytearray(flat)
+                                self._data["_data"] = flat
+                            flat[i] = int(self._flat_get(vflat, i)) & 0xFF
+                        else:
+                            flat[i] = self._flat_get(vflat, i)
+                return
+            raise TypeError("assigned value must be scalar or same-length tensor")
+        scalar = value
+        for i in range(n):
+            if int(self._flat_get(mask, i)) != 0:
+                if isinstance(flat, (bytes, bytearray)):
+                    if isinstance(flat, bytes):
+                        flat = bytearray(flat)
+                        self._data["_data"] = flat
+                    flat[i] = int(scalar) & 0xFF
+                else:
+                    flat[i] = scalar
 
     def _getitem_int_index(self, key):
         """Row-major integer indexing: ``t[i]``, ``t[i,j]``, … partial views or a scalar."""
@@ -387,6 +569,31 @@ class Tensor:
                 and all(type(x) is int for x in key)
             ):
                 return self._getitem_int_index(key)
+        if isinstance(key, tuple):
+            shape = tuple(self.shape)
+            flat = self._data["_data"]
+            if (
+                len(shape) == 3
+                and len(key) == 3
+                and isinstance(key[0], slice)
+                and isinstance(key[1], int)
+                and isinstance(key[2], int)
+            ):
+                rows = list(range(*key[0].indices(shape[0])))
+                j = int(key[1])
+                k = int(key[2])
+                if j < 0:
+                    j += shape[1]
+                if k < 0:
+                    k += shape[2]
+                if j < 0 or j >= shape[1] or k < 0 or k >= shape[2]:
+                    raise IndexError("tensor index out of range")
+                out = []
+                stride_row = shape[1] * shape[2]
+                for i in rows:
+                    base = i * stride_row + j * shape[2] + k
+                    out.append(flat[base])
+                return self._wrap_vals((len(rows),), out)
         if isinstance(key, tuple) and len(key) == 2:
             a, b = key
             shape = tuple(self.shape)
@@ -417,13 +624,73 @@ class Tensor:
         })
 
     def reshape(self, new_shape):
-        flat = self._data["_data"]
+        self._ensure_flat()
+        flat = self._flat_storage()
+        if flat is None:
+            raise TypeError("tensor has no flat storage for reshape")
+        if isinstance(flat, (bytes, bytearray)):
+            flat = list(flat)
         prod = 1
         for d in new_shape:
             prod *= d
         if prod != len(flat):
             raise ValueError("reshape size mismatch")
         return self._wrap_vals(tuple(new_shape), flat)
+
+    def unsqueeze(self, axis):
+        """Insert a length-1 dimension at ``axis`` (supports negative indices)."""
+        self._ensure_flat()
+        flat = self._flat_storage()
+        if flat is None:
+            raise TypeError("tensor has no flat storage for unsqueeze")
+        if isinstance(flat, (bytes, bytearray)):
+            flat = list(flat)
+        shape = list(self.shape)
+        ndim = len(shape)
+        ax = int(axis)
+        if ax < 0:
+            ax += ndim + 1
+        if ax < 0 or ax > ndim:
+            raise IndexError("unsqueeze axis out of range")
+        new_shape = shape[:ax] + [1] + shape[ax:]
+        return self._wrap_vals(tuple(new_shape), flat)
+
+    def repeat(self, count, axis=-1):
+        """Repeat elements along ``axis`` (numpy-style; default last axis)."""
+        self._ensure_flat()
+        if int(count) < 1:
+            raise ValueError("repeat count must be >= 1")
+        count = int(count)
+        flat = self._flat_storage()
+        if flat is None:
+            raise TypeError("tensor has no flat storage for repeat")
+        if isinstance(flat, (bytes, bytearray)):
+            flat = list(flat)
+        shape = list(self.shape)
+        ndim = len(shape)
+        ax = int(axis)
+        if ax < 0:
+            ax += ndim
+        if ax < 0 or ax >= ndim:
+            raise IndexError("repeat axis out of range")
+        outer = 1
+        for s in shape[:ax]:
+            outer *= int(s)
+        axis_len = int(shape[ax])
+        inner = 1
+        for s in shape[ax + 1 :]:
+            inner *= int(s)
+        block = axis_len * inner
+        out = []
+        for o in range(outer):
+            base = o * block
+            for a in range(axis_len):
+                chunk = flat[base + a * inner : base + (a + 1) * inner]
+                for _ in range(count):
+                    out.extend(chunk)
+        new_shape = shape[:]
+        new_shape[ax] = axis_len * count
+        return self._wrap_vals(tuple(new_shape), out)
 
     def _gather_rows(self, idx_tensor):
         """Numpy-style fancy indexing along axis 0.
@@ -467,16 +734,53 @@ class Tensor:
             out.extend(flat[base : base + inner_size])
         return self._wrap_vals((len(rows),) + inner_shape, out)
 
+    def _hwc3_to_rgba(self, value):
+        """Expand ``(H, W, 3)`` uint8/float tensor to ``(H, W, 4)`` with alpha 255."""
+        value._ensure_flat()
+        vshape = tuple(value.shape)
+        flat = value._flat_storage()
+        if flat is None:
+            raise TypeError("expected tensor with flat _data for RGB upload")
+        if isinstance(flat, (bytes, bytearray)):
+            flat = list(flat)
+        if len(vshape) != 3 or int(vshape[2]) != 3:
+            return value
+        h, w = int(vshape[0]), int(vshape[1])
+        rgba = []
+        for i in range(h * w):
+            o = i * 3
+            rgba.append(int(self._flat_get(flat, o)) & 0xFF)
+            rgba.append(int(self._flat_get(flat, o + 1)) & 0xFF)
+            rgba.append(int(self._flat_get(flat, o + 2)) & 0xFF)
+            rgba.append(255)
+        return Tensor({
+            "shape": (h, w, 4),
+            "dtype": value.dtype,
+            "device": value._data.get("device", "cpu"),
+            "_data": rgba,
+        })
+
     def __setitem__(self, key, value):
         if isinstance(key, slice) and key == slice(None, None, None):
             # Full slice assignment
             # Check if value is a sentinel dict indicating direct fill already happened
             if isinstance(value, dict) and value.get('_direct_fill', False):
-                # Data already written directly to buffer by Rust - ZERO COPY! Do nothing.
+                # Data already written directly to buffer by Rust - drop stale flat cache.
+                self._data.pop("_data", None)
                 return
+            if isinstance(value, Tensor):
+                fshape = tuple(self.shape)
+                vshape = tuple(value.shape)
+                if len(fshape) == 3 and len(vshape) == 3 and int(fshape[2]) == 4 and int(vshape[2]) == 3:
+                    value = self._hwc3_to_rgba(value)
             # Call Rust function to fill buffer (handles lists and Tensor)
             import xos
             xos.rasterizer._fill_buffer(self._data, value)
+        elif isinstance(key, Tensor):
+            self._ensure_flat()
+            key._ensure_flat()
+            self._masked_assign(key, value)
+            self._maybe_flush_frame()
         else:
             self._data[key] = value
 
@@ -521,24 +825,65 @@ class Tensor:
         return self._wrap_like_self(out)
 
     def _cmp_broadcast(self, other, cmp_fn):
-        left = self._data["_data"]
+        self._ensure_flat()
+        left = self._flat_storage()
+        if left is None:
+            raise TypeError("tensor has no flat storage for comparison")
         lshape = tuple(self.shape)
         if isinstance(other, Tensor):
-            right = other._data["_data"]
+            other._ensure_flat()
+            right = other._flat_storage()
+            if right is None:
+                raise TypeError("comparison operand has no flat storage")
             rshape = tuple(other.shape)
-            if lshape == rshape:
-                return self._wrap_vals(lshape, [cmp_fn(a, b) for a, b in zip(left, right)])
-            if len(lshape) == 2 and len(rshape) == 2 and lshape[0] == rshape[0] and lshape[1] == 2 and rshape[1] == 1:
+            if self._flat_len(left) != self._flat_len(right):
+                right = self._broadcast_rhs_flat(lshape, rshape, left, right)
+            elif len(lshape) == 2 and len(rshape) == 2 and lshape[0] == rshape[0] and lshape[1] == 2 and rshape[1] == 1:
                 n = lshape[0]
                 out = []
                 for i in range(n):
-                    rv = right[i]
-                    out.append(cmp_fn(left[2 * i], rv))
-                    out.append(cmp_fn(left[2 * i + 1], rv))
+                    rv = self._flat_get(right, i)
+                    out.append(cmp_fn(self._flat_get(left, 2 * i), rv))
+                    out.append(cmp_fn(self._flat_get(left, 2 * i + 1), rv))
                 return self._wrap_vals(lshape, out)
+            n = self._flat_len(left)
+            return self._wrap_vals(
+                lshape,
+                [
+                    cmp_fn(self._flat_get(left, i), self._flat_get(right, i))
+                    for i in range(n)
+                ],
+            )
         if isinstance(other, (int, float)):
-            return self._wrap_vals(lshape, [cmp_fn(a, other) for a in left])
+            other = self._cmp_scalar(other)
+            n = self._flat_len(left)
+            return self._wrap_vals(
+                lshape, [cmp_fn(self._flat_get(left, i), other) for i in range(n)]
+            )
         raise TypeError("unsupported comparison operand")
+
+    def _logical_binary(self, other, combiner):
+        self._ensure_flat()
+        la = self._flat_storage()
+        if la is None:
+            raise TypeError("tensor has no flat storage for logical op")
+        lshape = tuple(self.shape)
+        if isinstance(other, Tensor):
+            other._ensure_flat()
+            lb = other._flat_storage()
+            if lb is None:
+                raise TypeError("logical operand has no flat storage")
+            rshape = tuple(other.shape)
+            lb = self._broadcast_rhs_flat(lshape, rshape, la, lb)
+            n = self._flat_len(la)
+            return self._wrap_vals(
+                lshape,
+                [
+                    combiner(self._flat_get(la, i), self._flat_get(lb, i))
+                    for i in range(n)
+                ],
+            )
+        raise TypeError("unsupported logical operand")
 
     def __lt__(self, other):
         return self._cmp_broadcast(other, lambda a, b: 1.0 if a < b else 0.0)
@@ -546,14 +891,44 @@ class Tensor:
     def __gt__(self, other):
         return self._cmp_broadcast(other, lambda a, b: 1.0 if a > b else 0.0)
 
+    def __eq__(self, other):
+        self._ensure_flat()
+        left = self._flat_storage()
+        if left is not None and self._flat_len(left) == 1:
+            if isinstance(other, Tensor):
+                other._ensure_flat()
+                right = other._flat_storage()
+                if right is not None and other._flat_len(right) == 1:
+                    return self._flat_get(left, 0) == other._flat_get(right, 0)
+            if isinstance(other, (int, float, bool)):
+                return self._flat_get(left, 0) == float(other)
+        return self._cmp_broadcast(other, lambda a, b: 1.0 if a == b else 0.0)
+
+    def __invert__(self):
+        self._ensure_flat()
+        d = self._flat_storage()
+        if d is None:
+            raise TypeError("tensor has no flat storage for invert")
+        n = self._flat_len(d)
+        return self._wrap_vals(
+            self.shape, [0.0 if int(self._flat_get(d, i)) != 0 else 1.0 for i in range(n)]
+        )
+
+    def __and__(self, other):
+        return self._logical_binary(
+            other, lambda a, b: 1.0 if (int(a) != 0 and int(b) != 0) else 0.0
+        )
+
+    def __rand__(self, other):
+        return self.__and__(other)
+
     def __or__(self, other):
-        if isinstance(other, Tensor):
-            la = self._data["_data"]
-            lb = other._data["_data"]
-            if len(la) != len(lb):
-                raise ValueError("or shape mismatch")
-            return self._wrap_vals(self.shape, [1.0 if (a != 0.0 or b != 0.0) else 0.0 for a, b in zip(la, lb)])
-        raise TypeError("unsupported or operand")
+        return self._logical_binary(
+            other, lambda a, b: 1.0 if (int(a) != 0 or int(b) != 0) else 0.0
+        )
+
+    def __ror__(self, other):
+        return self.__or__(other)
 
     def __neg__(self):
         return self._wrap_vals(self.shape, [-a for a in self._data["_data"]])
@@ -574,6 +949,7 @@ class Tensor:
         return self._wrap_like_self([other - a for a in left])
 
     def __mul__(self, other):
+        self._ensure_flat()
         return self._binary_op(other, lambda a, b: a * b)
 
     def __rmul__(self, other):
@@ -587,15 +963,101 @@ class Tensor:
     def dtype(self):
         return self._data.get('dtype', 'unknown')
 
-    def to(self, dtype):
-        """Return a new tensor converted to ``dtype`` using flat elementwise casting."""
-        if "_data" not in self._data or not isinstance(self._data["_data"], list):
+    @property
+    def device(self):
+        return self._data.get('device', 'cpu')
+
+    @property
+    def default_device(self):
+        import xos
+        return getattr(xos, "default_device", "cpu")
+
+    def printpack(self, compress=False):
+        """Return a single-line pack string (optionally deflate-compressed). Does not print."""
+        import xos
+        self._ensure_flat()
+        return xos._tensor_printpack(self, compress=compress)
+
+    def randomize(self):
+        """Fill all elements with random values between this tensor's dtype MIN and MAX."""
+        import xos
+        xos._tensor_randomize(self)
+        return self
+
+    _DEVICE_NAMES = frozenset({"cpu", "gpu", "wasm"})
+    _DEVICE_ALIASES = {
+        "cuda": "gpu",
+        "mps": "gpu",
+        "metal": "gpu",
+        "wgpu": "gpu",
+    }
+
+    def _normalize_device(self, dev):
+        if hasattr(dev, "type"):
+            dev = dev.type
+        d = str(dev).strip().lower()
+        return self._DEVICE_ALIASES.get(d, d)
+
+    def _is_device_target(self, name):
+        return name in self._DEVICE_NAMES or name in self._DEVICE_ALIASES
+
+    def _to_device(self, device):
+        if self._data.get("_xos_gpu_conv_output") and self._flat_storage() is None:
+            import xos
+            xos._materialize_conv_output(self)
+        flat = self._flat_storage()
+        if flat is None:
+            raise TypeError("tensor has no element data for to()")
+        dev = self._normalize_device(device)
+        if dev not in self._DEVICE_NAMES:
+            raise ValueError(f"unsupported device for to(): {device}")
+        if isinstance(flat, list):
+            data = list(flat)
+        elif isinstance(flat, (bytes, bytearray)):
+            data = bytearray(flat)
+        else:
+            raise TypeError("tensor has no element data for to()")
+        return Tensor({
+            "shape": tuple(self.shape),
+            "dtype": self.dtype,
+            "device": dev,
+            "_data": data,
+        })
+
+    def to(self, target=None, *, dtype=None, device=None):
+        """Cast ``dtype`` and/or set ``device`` (metadata; compute still uses the active backend)."""
+        if self._data.get("_xos_gpu_conv_output") and self._flat_storage() is None:
+            import xos
+            xos._materialize_conv_output(self)
+        if self._flat_storage() is None:
+            raise TypeError("tensor has no element data for to()")
+        flat = self._flat_storage()
+        if not isinstance(flat, list) and not isinstance(flat, (bytes, bytearray)):
             raise TypeError("tensor has no element data for to()")
 
-        if isinstance(dtype, str):
-            target = dtype.strip().lower()
-        elif hasattr(dtype, "name"):
-            target = str(dtype.name).strip().lower()
+        if device is not None:
+            out = self._to_device(device)
+            if dtype is None and target is None:
+                return out
+            base = out
+        else:
+            base = self
+
+        if target is None and dtype is None:
+            if device is not None:
+                return base
+            raise TypeError("to() requires a dtype or device")
+
+        if dtype is not None:
+            target = dtype
+        elif isinstance(target, str):
+            target = target.strip().lower()
+            if self._is_device_target(target):
+                return base._to_device(target)
+        elif hasattr(target, "type"):
+            return base._to_device(target)
+        elif hasattr(target, "name"):
+            target = str(target.name).strip().lower()
         else:
             raise TypeError("dtype must be a dtype object or string")
 
@@ -610,27 +1072,34 @@ class Tensor:
         }
         target = alias.get(target, target)
 
-        src = self._data["_data"]
+        src = base._flat_storage()
         if target == "uint8":
             out = []
-            for v in src:
-                iv = int(v)
-                if iv < 0:
-                    iv = 0
-                elif iv > 255:
-                    iv = 255
-                out.append(iv)
+            if isinstance(src, (bytes, bytearray)):
+                for v in src:
+                    out.append(int(v))
+            else:
+                for v in src:
+                    iv = int(v)
+                    if iv < 0:
+                        iv = 0
+                    elif iv > 255:
+                        iv = 255
+                    out.append(iv)
         elif target in ("int8", "int16", "int32", "int64", "uint16", "uint32", "uint64"):
             out = [int(v) for v in src]
         elif target in ("float16", "float32", "float64"):
-            out = [float(v) for v in src]
+            if isinstance(src, (bytes, bytearray)):
+                out = [float(v) for v in src]
+            else:
+                out = [float(v) for v in src]
         else:
             raise ValueError(f"unsupported dtype for to(): {target}")
 
         return Tensor({
-            "shape": tuple(self.shape),
+            "shape": tuple(base.shape),
             "dtype": target,
-            "device": self._data.get("device", "cpu"),
+            "device": base._data.get("device", "cpu"),
             "_data": out,
         })
     
@@ -655,6 +1124,10 @@ class Tensor:
     def tuple(self):
         """Same as ``list()`` but with tuples at each nesting level."""
         return _nested_list_to_tuple(self.list())
+
+    def astuple(self):
+        """Nested tuples for ``shape`` (alias for ``tuple()``)."""
+        return self.tuple()
 
     def min(self, axis=None, out=None, keepdims=False, **kwargs):
         """Global minimum (numpy-style signature); reductions run in Rust. ``axis`` / ``out`` / ``keepdims`` … not implemented yet."""
@@ -720,19 +1193,77 @@ class Tensor:
 
         return xos._tensor_mean(self)
 
-    def __str__(self):
+    def sum(self, axis=None, dtype=None, out=None, keepdims=False, **kwargs):
+        """Arithmetic sum over the flat buffer (numpy-style ``axis=None`` default)."""
+        if kwargs:
+            raise TypeError(
+                "Tensor.sum() got unexpected keyword arguments: "
+                + ", ".join(sorted(kwargs.keys()))
+            )
+        if out is not None:
+            raise NotImplementedError("Tensor.sum(out=...) is not implemented yet")
+        if keepdims:
+            raise NotImplementedError("Tensor.sum(keepdims=True) is not implemented yet")
+        import xos
+        if axis is None and dtype is None:
+            return xos._tensor_sum(self)
+        return xos._tensor_sum(self, axis=axis, dtype=dtype)
+
+    def tostring(self, full=False):
+        """Human-readable string; ``full=True`` prints every element."""
+        if not full:
+            return self._summary_string()
+        self._ensure_flat()
         if "_data" not in self._data:
-            return f"xos.Tensor(shape={self.shape}, dtype=u8)"
+            return "xos.Tensor(shape={}, dtype={}, device={!r}, empty)".format(
+                self.shape, self.dtype, self.device
+            )
+        try:
+            data = self.astuple()
+        except Exception:
+            return "xos.Tensor(shape={}, dtype={}, device={!r}, <opaque>)".format(
+                self.shape, self.dtype, self.device
+            )
+        values = _format_nested_values(data)
+        return "xos.Tensor(shape={}, dtype={}, device={!r}, values={})".format(
+            self.shape, self.dtype, self.device, values
+        )
+
+    def _summary_string(self):
+        if "_data" not in self._data:
+            return "xos.Tensor(shape={}, dtype=u8)".format(self.shape)
+        self._ensure_flat()
+        flat = self._flat_storage()
+        if flat is not None and self._flat_len(flat) == 1:
+            v = self._flat_get(flat, 0)
+            if self.dtype == "bool":
+                scalar = "True" if int(v) != 0 else "False"
+            elif self.dtype.startswith("int") or self.dtype.startswith("uint"):
+                scalar = str(int(v))
+            else:
+                scalar = str(float(v))
+            return "xos.Tensor({}, dtype={}, device={!r})".format(
+                scalar, self.dtype, self.device
+            )
         import xos
 
         try:
             mn, mx, av = xos._tensor_min_max_mean(self)
         except ValueError:
-            return f"xos.Tensor(shape={self.shape}, dtype={self.dtype}, empty)"
+            return "xos.Tensor(shape={}, dtype={}, empty)".format(
+                self.shape, self.dtype
+            )
         except TypeError:
-            return f"xos.Tensor(shape={self.shape}, dtype={self.dtype}, <opaque flat storage>)"
-        return f"xos.Tensor(shape={self.shape}, dtype={self.dtype}, min={float(mn):.3f}, max={float(mx):.3f}, mean={float(av):.3f})"
-    
+            return "xos.Tensor(shape={}, dtype={}, <opaque flat storage>)".format(
+                self.shape, self.dtype
+            )
+        return "xos.Tensor(shape={}, dtype={}, min={:.3f}, max={:.3f}, mean={:.3f})".format(
+            self.shape, self.dtype, float(mn), float(mx), float(av)
+        )
+
+    def __str__(self):
+        return self._summary_string()
+
     def __repr__(self):
         return self.__str__()
 
@@ -790,7 +1321,7 @@ class Frame:
     
     @property
     def tensor(self):
-        """CPU RGBA frame tensor (``xos.Tensor``) with slice assignment."""
+        """RGBA frame tensor (``xos.Tensor``); compute uses GPU on native via Burn/WGPU."""
         return self._tensor
     
     def get_width(self):
@@ -848,8 +1379,18 @@ class Frame:
             if bound:
                 xos.frame._end_standalone()
 
+class Verbosities:
+  """Debug flags for xos apps (see ``Application.verbosities``)."""
+  function_calls = False
+
+DEFAULT_MAX_FPS = 2048.0
+
+
 class Application:
     """Base class for xos applications. Extend this class and implement __init__() and tick().
+
+    Set ``function_calls = True`` on a subclass to trace method entry (including ``__init__``)
+    before ``app.run()`` — instance ``app.verbosities.function_calls`` only applies after creation.
 
     ``self.safe_region`` is an ``xos.SafeRegion`` (``x1,y1,x2,y2`` in the same normalized space as ``xos.ui.Text``)
     refreshed each engine tick — use ``safe_region.renormalize(lx1, ly1, lx2, ly2)`` for inset-local ``0..1`` rects.
@@ -862,8 +1403,10 @@ class Application:
     Conventional order is ``self.keyboard.on_events(self)`` then ``self.text.on_events(self)`` for
     pointer, ``key_char``, and shortcuts alike — no special cases per event type are required.
     """
-    
-    def __init__(self, headless=None):
+
+    function_calls = False
+
+    def __init__(self, headless=None, device=None, width=None, height=None, max_fps=None):
         import builtins
         next_id = int(getattr(builtins, "__xos_next_viewport_id__", 0))
         builtins.__xos_next_viewport_id__ = next_id + 1
@@ -885,8 +1428,26 @@ class Application:
         self.safe_region = SafeRegion(0.0, 0.0, 1.0, 1.0)
         if headless is not None:
             self.headless = bool(headless)
+        if device is not None:
+            self.device = device
+        if width is not None:
+            self._xos_standalone_width = int(max(1, int(width)))
+        if height is not None:
+            self._xos_standalone_height = int(max(1, int(height)))
+        raw_max_fps = max_fps if max_fps is not None else getattr(self, "max_fps", DEFAULT_MAX_FPS)
+        self.max_fps = float(raw_max_fps)
 
-        # Empty standalone framebuffer before first tick() or run(); enables frame.clear etc. in __init__.
+        self.verbosities = Verbosities()
+        class_verb = getattr(type(self), "verbosities", None)
+        if isinstance(class_verb, Verbosities):
+            self.verbosities.function_calls = bool(class_verb.function_calls)
+        elif bool(getattr(type(self), "function_calls", False)):
+            self.verbosities.function_calls = True
+
+        # Register before standalone frame so device/headless class attrs are visible to native ops.
+        import builtins
+        builtins.__xos_app_instance__ = self
+        # Standalone framebuffer for __init__ drawing (uniform_fill, rasterizer, etc.).
         self._xos_init_standalone_frame()
 
     def _xos_init_standalone_frame(self):
@@ -901,7 +1462,7 @@ class Application:
         fd["_xos_viewport_id"] = int(self._xos_viewport_id)
         self.frame = Frame(fd)
         self.mouse = {"x": 0.0, "y": 0.0, "is_left_clicking": False, "is_right_clicking": False}
-        xos.rasterizer.fill(self.frame, (0, 0, 0, 255))
+        xos.rasterizer.fill(self.frame.tensor, (0, 0, 0, 255))
         xos.frame._end_standalone()
 
     @property
@@ -909,9 +1470,55 @@ class Application:
         """F3 UI scale as percent/100 (100% → 1.0, 25–500% → 0.25–5.0). Updated each tick."""
         return float(getattr(self, "xos_scale", 1.0))
 
+    @staticmethod
+    def _xos_wrap_subclass_method(app_cls_name, method_name, fn):
+        if isinstance(fn, (staticmethod, classmethod)):
+            return fn
+
+        def wrapper(self, *args, **kwargs):
+            import builtins
+            import time
+            import xos
+
+            verb = getattr(self, "verbosities", None)
+            trace = verb is not None and getattr(verb, "function_calls", False)
+            depth = 0
+            if trace:
+                depth = int(getattr(builtins, "__xos_trace_depth__", 0))
+                prefix = ("│   " * depth) + "├── "
+                xos.print_color(f"{prefix}&b{app_cls_name}&f.&5{method_name}&f()")
+                builtins.__xos_trace_depth__ = depth + 1
+                t0 = time.perf_counter()
+            try:
+                return fn(self, *args, **kwargs)
+            finally:
+                if trace:
+                    ms = (time.perf_counter() - t0) * 1000.0
+                    out_prefix = ("│   " * depth) + "└── "
+                    xos.print_color(
+                        f"{out_prefix}&8{ms:,.2f} ms&f  &7{app_cls_name}.{method_name}&f"
+                    )
+                    builtins.__xos_trace_depth__ = depth
+
+        wrapper.__name__ = getattr(fn, "__name__", method_name)
+        return wrapper
+
     @classmethod
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
+        for name, attr in list(cls.__dict__.items()):
+            if name.startswith("_"):
+                continue
+            if not callable(attr):
+                continue
+            if isinstance(attr, (staticmethod, classmethod, property)):
+                continue
+            setattr(
+                cls,
+                name,
+                Application._xos_wrap_subclass_method(cls.__name__, name, attr),
+            )
+
         user_tick = cls.__dict__.get("tick")
         if user_tick is None:
             return
@@ -979,6 +1586,11 @@ class Application:
                     xos.frame._present_standalone(int(getattr(self, "_xos_viewport_id", 0)))
                 xos.frame._end_standalone()
                 self._xos_ticks_completed = int(getattr(self, "_xos_ticks_completed", 0)) + 1
+                # Enforced in Rust for higher precision and lower Python overhead.
+                xos._standalone_tick_pace(
+                    int(getattr(self, "_xos_viewport_id", 0)),
+                    float(getattr(self, "max_fps", DEFAULT_MAX_FPS)),
+                )
     
     def get_width(self):
         """Get the current frame width"""
@@ -989,8 +1601,16 @@ class Application:
         return self.frame.get_height()
     
     def tick(self):
-        """Called every frame. Override this method."""
-        raise NotImplementedError("Subclasses must implement tick()")
+        """Called every frame.
+
+        Base `Application` supports functional-style usage (`app = xos.Application(...); app.tick()`)
+        by running the full pre/post pipeline even without a subclass override.
+        """
+        self._xos_pre_tick()
+        try:
+            return None
+        finally:
+            self._xos_post_tick()
 
     def pre_tick(self):
         """Called before each tick() in both run() and standalone tick() modes."""
@@ -1033,26 +1653,104 @@ pub struct PyApp {
     app_instance: Option<PyObjectRef>,
     /// Number of `tick()` calls that have fully finished (starts at 0; incremented after each tick).
     ticks_completed: u64,
+    /// RGBA snapshot of the standalone framebuffer drawn during `Application.__init__`.
+    init_frame_snapshot: Option<(Vec<u8>, usize, usize)>,
+    init_viewport_id: Option<u64>,
+    init_blit_applied: bool,
 }
 
 impl PyApp {
     pub fn new(interpreter: Interpreter, app_instance: PyObjectRef) -> Self {
-        Self {
+        let mut app = Self {
             interpreter,
-            app_instance: Some(app_instance),
+            app_instance: Some(app_instance.clone()),
             ticks_completed: 0,
+            init_frame_snapshot: None,
+            init_viewport_id: None,
+            init_blit_applied: false,
+        };
+        // Snapshot __init__ framebuffer immediately after the script runs (before engine setup).
+        let viewport_id = app.interpreter.enter(|vm| {
+            crate::xos_module::python_app_viewport_id(vm, &app_instance)
+        });
+        if let Some(viewport_id) = viewport_id {
+            app.init_viewport_id = Some(viewport_id);
+            app.capture_init_frame_snapshot(viewport_id);
+        }
+        app
+    }
+
+    fn capture_init_frame_snapshot(&mut self, viewport_id: u64) {
+        if !crate::xos_module::standalone_frame_was_drawn(viewport_id) {
+            return;
+        }
+        if let Some(snapshot) = crate::xos_module::snapshot_standalone_init_frame(viewport_id) {
+            self.init_frame_snapshot = Some(snapshot);
         }
     }
+
+    fn try_apply_init_frame_snapshot(&mut self, state: &mut EngineState) -> bool {
+        if self.init_blit_applied {
+            return false;
+        }
+        let shape = state.frame.shape();
+        let dest_h = shape[0];
+        let dest_w = shape[1];
+        let dest = state.frame.buffer_mut();
+
+        let applied = if let Some((src, src_w, src_h)) = self.init_frame_snapshot.as_ref() {
+            crate::xos_module::blit_rgba_init_to_buffer(src, *src_w, *src_h, dest, dest_w, dest_h)
+        } else if let Some(viewport_id) = self.init_viewport_id {
+            crate::xos_module::apply_standalone_init_to_engine_buffer(
+                viewport_id,
+                dest,
+                dest_w,
+                dest_h,
+            )
+        } else {
+            false
+        };
+
+        if applied {
+            if state.compute_device == xos_core::compute_device::ComputeDevice::Gpu {
+                state.frame.ensure_gpu_from_cpu();
+            }
+            self.init_blit_applied = true;
+        }
+        applied
+    }
+}
+
+fn read_python_device_pref(
+    vm: &rustpython_vm::VirtualMachine,
+    app_instance: &rustpython_vm::PyObjectRef,
+) -> Option<String> {
+    vm.get_attribute_opt(app_instance.clone(), "device")
+        .ok()
+        .flatten()
+        .and_then(|obj| {
+            if obj.is(&vm.ctx.none()) {
+                None
+            } else {
+                obj.try_into_value::<String>(vm).ok()
+            }
+        })
 }
 
 impl Application for PyApp {
     fn setup(&mut self, state: &mut EngineState) -> Result<(), String> {
         if let Some(ref app_instance) = self.app_instance {
-            self.interpreter.enter(|vm| {
+            let viewport_id = self.interpreter.enter(|vm| -> Result<Option<u64>, String> {
+                let pref = read_python_device_pref(vm, app_instance);
+                state
+                    .apply_compute_device_pref(pref.as_deref())
+                    .map_err(|e| e.to_string())?;
+
                 // Create Python frame object from engine state
                 let frame_dict = crate::engine::py_bindings::create_py_frame_state(
                     vm,
                     &mut state.frame,
+                    state.compute_device,
                 )
                 .map_err(|e| format!("Failed to create frame object: {:?}", e))?;
 
@@ -1127,8 +1825,16 @@ impl Application for PyApp {
                 sync_app_safe_region(vm, app_instance, &state.frame.safe_region_boundaries)
                     .map_err(|e| format!("Failed to sync safe_region: {:?}", e))?;
 
-                Ok(())
-            })
+                Ok(crate::xos_module::python_app_viewport_id(vm, app_instance))
+            })?;
+
+            // Refresh snapshot; display blit is deferred to tick() when the pixels buffer is active.
+            if let Some(viewport_id) = viewport_id {
+                self.init_viewport_id = Some(viewport_id);
+                self.capture_init_frame_snapshot(viewport_id);
+            }
+
+            Ok(())
         } else {
             Err("No Python app instance".to_string())
         }
@@ -1140,13 +1846,20 @@ impl Application for PyApp {
             let shape = state.frame.shape();
             let width = shape[1];
             let height = shape[0];
-            let buffer = state.frame.buffer_mut();
+            // Bind CPU staging for rasterizer/text; do not pull GPU→CPU here (sync happens once before present).
+            let buffer = state.frame.staging_slice_mut_for_tick();
             crate::rasterizer::set_frame_buffer_context(buffer, width, height);
+
+            // Apply __init__ framebuffer to the live display buffer (pixels mirror when windowed).
+            let _ = self.try_apply_init_frame_snapshot(state);
 
             let tick_index = self.ticks_completed;
             let mut tick_failed = false;
 
             self.interpreter.enter(|vm| {
+                #[cfg(target_arch = "wasm32")]
+                crate::runtime::install_wasm_python_stdio(vm);
+
                 // Require subclasses to call super().__init__() so base fields exist.
                 let initialized_ok = match vm.get_attribute_opt(app_instance.clone(), "_xos_initialized") {
                     Ok(Some(flag_obj)) => flag_obj.clone().try_into_value::<bool>(vm).unwrap_or(false),
@@ -1163,7 +1876,12 @@ Call super().__init__() in your app __init__ before using tick().",
 
                 // Update frame data before calling tick
                 if let Ok(Some(frame_obj)) = vm.get_attribute_opt(app_instance.clone(), "frame") {
-                    let _ = crate::engine::py_bindings::update_py_frame_state(vm, frame_obj.clone(), &mut state.frame);
+                    let _ = crate::engine::py_bindings::update_py_frame_state(
+                        vm,
+                        frame_obj.clone(),
+                        &mut state.frame,
+                        state.compute_device,
+                    );
 
                     // Update mouse data
                     let mouse_dict = vm.ctx.new_dict();
@@ -1204,6 +1922,14 @@ Call super().__init__() in your app __init__ before using tick().",
                 }
             } else {
                 self.ticks_completed = self.ticks_completed.saturating_add(1);
+            }
+
+            if crate::rasterizer::FRAME_CPU_WRITTEN
+                .lock()
+                .map(|w| *w)
+                .unwrap_or(false)
+            {
+                state.frame.mark_cpu_staging_dirty();
             }
 
             // Clear the frame buffer context after tick
@@ -1350,20 +2076,25 @@ Call super().__init__() in your app __init__ before using tick().",
             let shape = state.frame.shape();
             let frame_width = shape[1];
             let frame_height = shape[0];
-            let buffer = state.frame.buffer_mut();
+            let buffer = state.frame.staging_slice_mut_for_tick();
             crate::rasterizer::set_frame_buffer_context(
                 buffer,
                 frame_width,
                 frame_height,
             );
 
+            let _tls_guard = TickEngineStateGuard::install(state);
             self.interpreter.enter(|vm| {
+                #[cfg(target_arch = "wasm32")]
+                crate::runtime::install_wasm_python_stdio(vm);
+
                 // Update frame data before calling the handler
                 if let Ok(Some(frame_obj)) = vm.get_attribute_opt(app_instance.clone(), "frame") {
                     let _ = crate::engine::py_bindings::update_py_frame_state(
                         vm,
                         frame_obj,
                         &mut state.frame,
+                        state.compute_device,
                     );
                 }
                 // Call the Python handler
@@ -1376,6 +2107,14 @@ Call super().__init__() in your app __init__ before using tick().",
                     ));
                 }
             });
+
+            if crate::rasterizer::FRAME_CPU_WRITTEN
+                .lock()
+                .map(|w| *w)
+                .unwrap_or(false)
+            {
+                state.frame.mark_cpu_staging_dirty();
+            }
 
             // Clear the frame buffer context after handler completes
             crate::rasterizer::clear_frame_buffer_context();

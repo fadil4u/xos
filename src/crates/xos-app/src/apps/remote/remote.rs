@@ -5,6 +5,7 @@
 //! - **macOS**: [`xcap`] + [`enigo`] (grant **Screen Recording** for the `xos` binary).
 
 /// LAN remote stream width cap (height scales).
+#[allow(dead_code)]
 pub(crate) const STREAM_MAX_W: u32 = 960;
 
 /// Decode pointer fields from a mesh JSON dict: accepts legacy `nx`/`ny`/`left`/`right` or

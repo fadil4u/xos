@@ -2,13 +2,17 @@ pub mod ai;
 pub mod audio;
 pub mod auth;
 pub mod burn_train;
+pub mod clipboard;
 pub mod coordinates;
 pub mod colors;
 pub mod csv_api;
 pub mod data;
+pub mod device;
+pub mod device_policy;
 pub mod dialoguer;
 pub mod dtypes;
 pub mod engine;
+pub mod frame_tensor;
 pub mod geom;
 pub(crate) mod json_codec;
 pub mod json_api;
@@ -18,7 +22,10 @@ pub mod mesh;
 pub mod mouse;
 pub mod nn;
 pub mod ops;
+pub mod pack;
 pub mod path;
+pub mod render;
+pub mod testing;
 pub mod python_whiteboard;
 pub mod whiteboard_kernel;
 pub mod random;
@@ -27,8 +34,10 @@ pub mod regex;
 pub mod runtime;
 #[cfg(not(target_arch = "wasm32"))]
 mod repl;
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod staged_native_python_app;
 pub mod sensors;
+pub mod space;
 pub mod system;
 pub mod tensor_buf;
 pub mod tensors;
@@ -40,7 +49,8 @@ use rustpython_vm::{builtins::PyModule, PyRef, VirtualMachine};
 
 pub use json_codec::decode_mesh_jpeg_bytes_best_effort;
 pub use runtime::{
-    parse_script_cli_flags, run_python_app, run_python_file, run_python_interactive,
+    parse_script_cli_flags, python_app_wants_headless, run_python_app, run_python_file,
+    run_python_interactive, run_test_suite,
 };
 
 pub fn make_tensors_module(vm: &VirtualMachine) -> PyRef<PyModule> {

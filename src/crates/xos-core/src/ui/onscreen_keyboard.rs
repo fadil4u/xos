@@ -87,6 +87,9 @@ pub struct OnScreenKeyboard {
     pub trackpad_spoof_nx: f32,
     pub trackpad_spoof_ny: f32,
     trackpad_spoof_last_px: Option<(f32, f32)>,
+    /// CPU scratch for the keyboard region (one GPU patch upload per frame).
+    #[cfg(not(target_arch = "wasm32"))]
+    overlay_scratch: Vec<u8>,
 }
 
 impl std::fmt::Debug for OnScreenKeyboard {
@@ -126,14 +129,508 @@ impl OnScreenKeyboard {
             trackpad_spoof_nx: 0.5,
             trackpad_spoof_ny: 0.5,
             trackpad_spoof_last_px: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            overlay_scratch: Vec::new(),
         };
 
         keyboard.layout_keys();
         keyboard
     }
 
-    /// Main tick function to handle keyboard rendering and logic
-    /// Call this from the engine before drawing
+    /// True when overlay drawing may touch the framebuffer (would force GPU→CPU via [`crate::engine::FrameState::buffer_mut`]).
+    pub fn needs_framebuffer_access(&self) -> bool {
+        !self.minimized || self.is_trackpad_mode()
+    }
+
+    /// Input / layout only — safe to call every frame without syncing the frame tensor to CPU.
+    pub fn tick_logic(
+        &mut self,
+        width: u32,
+        height: u32,
+        mouse_x: f32,
+        mouse_y: f32,
+        mouse_dx: f32,
+        mouse_dy: f32,
+        mouse_left: bool,
+        mouse_right: bool,
+        safe_region: &crate::engine::SafeRegionBoundingRectangle,
+    ) {
+        let keyboard_height = if self.read_only_mode { 0.264 } else { 0.33 };
+        let keyboard_bottom_safe = safe_region.y2;
+        let keyboard_top = (keyboard_bottom_safe - keyboard_height).max(safe_region.y1);
+
+        self.data_mut().top = keyboard_top;
+        self.data_mut().bottom = keyboard_bottom_safe;
+        self.data_mut().left = 0.0;
+        self.data_mut().right = 1.0;
+
+        let now = Instant::now();
+        if let Some(ch) = self.check_key_hold_repeat(now) {
+            self.pending_chars.push(ch);
+        }
+
+        self.update_hover(mouse_x, mouse_y, width as f32, height as f32);
+        self.update_trackpad_spoof_cursor(
+            mouse_x,
+            mouse_y,
+            mouse_dx,
+            mouse_dy,
+            mouse_left,
+            mouse_right,
+            width as f32,
+            height as f32,
+        );
+    }
+
+    /// Draw keyboard chrome on the Burn frame tensor (GPU). Key labels are still CPU ([`Self::draw_key_labels`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn tick_draw_gpu(
+        &self,
+        frame: &mut crate::engine::FrameState,
+        width: u32,
+        height: u32,
+        safe_region: &crate::engine::SafeRegionBoundingRectangle,
+    ) {
+        use crate::burn_raster::{fill_circle, fill_rect};
+
+        let w = width as usize;
+        let h = height as usize;
+        if w == 0 || h == 0 {
+            return;
+        }
+
+        if !self.minimized {
+            let wf = width as f32;
+            let hf = height as f32;
+            let x0 = (self.data.left * wf).round().clamp(0.0, wf) as i32;
+            let x1 = (self.data.right * wf).round().clamp(0.0, wf) as i32;
+            let y0 = (self.data.top * hf).round().clamp(0.0, hf) as i32;
+            let y1 = (self.data.bottom * hf).round().clamp(0.0, hf) as i32;
+
+            let bg = if self.trackpad_mode {
+                TRACKPAD_COLOR
+            } else {
+                KEYBOARD_BG_COLOR
+            };
+            fill_rect(frame, w, h, x0, y0, x1, y1, (bg.0, bg.1, bg.2, 255));
+            if y0 >= 0 && y0 + 1 <= h as i32 {
+                fill_rect(
+                    frame,
+                    w,
+                    h,
+                    x0,
+                    y0,
+                    x1,
+                    y0 + 1,
+                    (TOP_LINE_COLOR.0, TOP_LINE_COLOR.1, TOP_LINE_COLOR.2, 255),
+                );
+            }
+
+            for key in &self.keys {
+                let (kx0, ky0, kx1, ky1) = self.key_pixel_rect(width, height, key);
+                let color = if key.pressed {
+                    KEY_PRESSED_COLOR
+                } else {
+                    KEY_COLOR
+                };
+                fill_rect(
+                    frame,
+                    w,
+                    h,
+                    kx0,
+                    ky0,
+                    kx1,
+                    ky1,
+                    (color.0, color.1, color.2, 255),
+                );
+            }
+
+            let keyboard_bottom_px = safe_region.y2 * hf;
+            let screen_bottom = hf;
+            if keyboard_bottom_px < screen_bottom {
+                let border_y = keyboard_bottom_px.round() as i32;
+                if border_y >= 0 && border_y < h as i32 {
+                    fill_rect(
+                        frame,
+                        w,
+                        h,
+                        0,
+                        border_y,
+                        w as i32,
+                        border_y + 1,
+                        (0, 255, 0, 255),
+                    );
+                }
+                let fill_start_y = (border_y + 1).max(0);
+                let fill_end_y = screen_bottom as i32;
+                if fill_start_y < fill_end_y {
+                    fill_rect(
+                        frame,
+                        w,
+                        h,
+                        0,
+                        fill_start_y,
+                        w as i32,
+                        fill_end_y,
+                        (0, 0, 0, 255),
+                    );
+                }
+            }
+        }
+
+        if self.is_trackpad_mode() {
+            let wf = width as f32;
+            let hf = height as f32;
+            let (_, top_norm, _, _) = self.top_edge_coordinates();
+            let keyboard_top_px = top_norm * hf;
+            let lx = self.trackpad_spoof_nx * wf;
+            let ly = self.trackpad_spoof_ny * hf;
+            if ly < keyboard_top_px - 1.0 {
+                fill_circle(frame, w, h, lx, ly, 6.0, (255, 0, 0, 255));
+            }
+        }
+    }
+
+    /// Key label glyphs only (CPU / fontdue) — call after [`Self::tick_draw_gpu`] when visible.
+    pub fn draw_key_labels(&self, buffer: &mut [u8], width: u32, height: u32) {
+        if self.minimized {
+            return;
+        }
+        for key in &self.keys {
+            let label = self.key_label(key);
+            self.draw_key_label_only(buffer, width, height, key, &label);
+        }
+    }
+
+    /// Draw keyboard chrome + labels into a local scratch buffer, then one GPU patch (no full-frame readback).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn draw_overlay_gpu(
+        &mut self,
+        frame: &mut crate::engine::FrameState,
+        width: u32,
+        height: u32,
+        safe_region: &crate::engine::SafeRegionBoundingRectangle,
+    ) {
+        if self.minimized {
+            if self.is_trackpad_mode() {
+                use crate::burn_raster::fill_circle;
+                let wf = width as usize;
+                let hf = height as usize;
+                let hf_f = height as f32;
+                let (_, top_norm, _, _) = self.top_edge_coordinates();
+                let keyboard_top_px = top_norm * hf_f;
+                let lx = self.trackpad_spoof_nx * width as f32;
+                let ly = self.trackpad_spoof_ny * hf_f;
+                if ly < keyboard_top_px - 1.0 {
+                    fill_circle(frame, wf, hf, lx, ly, 6.0, (255, 0, 0, 255));
+                }
+            }
+            return;
+        }
+
+        let w = width as f32;
+        let h = height as f32;
+        let x0 = (self.data.left * w).round().clamp(0.0, w) as i32;
+        let x1 = (self.data.right * w).round().clamp(0.0, w) as i32;
+        let y0 = (self.data.top * h).round().clamp(0.0, h) as i32;
+        let y1 = (self.data.bottom * h).round().clamp(0.0, h) as i32;
+        let kw = ((x1 - x0).max(1)) as u32;
+        let kh = ((y1 - y0).max(1)) as u32;
+
+        let mut scratch = std::mem::take(&mut self.overlay_scratch);
+        scratch.resize((kw * kh * 4) as usize, 0);
+        scratch.fill(0);
+        Self::render_into_scratch(self, &mut scratch, kw, kh, width, height, x0, y0);
+
+        // Green line + fill below keyboard (still in frame space; small CPU patch extension).
+        let mut extend_h = 0u32;
+        let keyboard_bottom_px = safe_region.y2 * h;
+        if keyboard_bottom_px < h {
+            extend_h = (h - keyboard_bottom_px).ceil() as u32;
+        }
+        if extend_h > 0 {
+            let ext_w = width;
+            let ext_size = (ext_w * extend_h * 4) as usize;
+            let mut ext_scratch = vec![0u8; ext_size];
+            let border_y = keyboard_bottom_px.round() as i32;
+            for x in 0..ext_w as i32 {
+                let ly = 0i32;
+                if let Some(idx) = Self::local_idx(ext_w, extend_h, x, ly, 0, 0) {
+                    ext_scratch[idx] = 0;
+                    ext_scratch[idx + 1] = 255;
+                    ext_scratch[idx + 2] = 0;
+                    ext_scratch[idx + 3] = 255;
+                }
+            }
+            for y in 1..extend_h as i32 {
+                for x in 0..ext_w as i32 {
+                    if let Some(idx) = Self::local_idx(ext_w, extend_h, x, y, 0, 0) {
+                        ext_scratch[idx..idx + 4].copy_from_slice(&[0, 0, 0, 255]);
+                    }
+                }
+            }
+            crate::burn_raster::blend_rgba_patch(
+                frame,
+                0,
+                border_y,
+                ext_w as usize,
+                extend_h as usize,
+                &ext_scratch,
+            );
+        }
+
+        crate::burn_raster::blend_rgba_patch(
+            frame,
+            x0,
+            y0,
+            kw as usize,
+            kh as usize,
+            &scratch,
+        );
+        self.overlay_scratch = scratch;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline]
+    fn local_idx(
+        buf_w: u32,
+        buf_h: u32,
+        px: i32,
+        py: i32,
+        origin_x: i32,
+        origin_y: i32,
+    ) -> Option<usize> {
+        let lx = px - origin_x;
+        let ly = py - origin_y;
+        if lx >= 0 && ly >= 0 && (lx as u32) < buf_w && (ly as u32) < buf_h {
+            Some(((ly as u32 * buf_w + lx as u32) * 4) as usize)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn render_into_scratch(
+        keyboard: &Self,
+        buffer: &mut [u8],
+        buf_w: u32,
+        buf_h: u32,
+        screen_w: u32,
+        screen_h: u32,
+        origin_x: i32,
+        origin_y: i32,
+    ) {
+        let bg_color = if keyboard.trackpad_mode {
+            TRACKPAD_COLOR
+        } else {
+            KEYBOARD_BG_COLOR
+        };
+        for chunk in buffer.chunks_exact_mut(4) {
+            chunk.copy_from_slice(&[bg_color.0, bg_color.1, bg_color.2, 255]);
+        }
+        for dx in 0..buf_w {
+            if let Some(idx) = Self::local_idx(buf_w, buf_h, dx as i32, 0, 0, 0) {
+                buffer[idx] = TOP_LINE_COLOR.0;
+                buffer[idx + 1] = TOP_LINE_COLOR.1;
+                buffer[idx + 2] = TOP_LINE_COLOR.2;
+                buffer[idx + 3] = 255;
+            }
+        }
+        for key in &keyboard.keys {
+            let label = keyboard.key_label(key);
+            let (x0, y0, x1, y1) = keyboard.key_pixel_rect(screen_w, screen_h, key);
+            let lx0 = x0 - origin_x;
+            let ly0 = y0 - origin_y;
+            let key_w = (x1 - x0).max(0) as u32;
+            let key_h = (y1 - y0).max(0) as u32;
+            if key_w == 0 || key_h == 0 {
+                continue;
+            }
+            let color = if key.pressed {
+                KEY_PRESSED_COLOR
+            } else {
+                KEY_COLOR
+            };
+            keyboard.draw_rounded_rect(buffer, buf_w, buf_h, lx0, ly0, key_w, key_h, color, 8.0);
+            keyboard.draw_key_label_local(
+                buffer,
+                buf_w,
+                buf_h,
+                origin_x,
+                origin_y,
+                screen_w,
+                screen_h,
+                key,
+                &label,
+            );
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn draw_key_label_local(
+        &self,
+        buffer: &mut [u8],
+        buf_w: u32,
+        buf_h: u32,
+        origin_x: i32,
+        origin_y: i32,
+        screen_w: u32,
+        screen_h: u32,
+        key: &Key,
+        label: &str,
+    ) {
+        let (x0, y0, x1, y1) = self.key_pixel_rect(screen_w, screen_h, key);
+        let key_w = (x1 - x0).max(0) as u32;
+        let key_h = (y1 - y0).max(0) as u32;
+        if key_w == 0 || key_h == 0 {
+            return;
+        }
+
+        let key_size = (key_w as f32).min(key_h as f32);
+        let font_size = (key_size * 0.36).clamp(9.0, 43.2);
+        let line_metrics = self
+            .font
+            .horizontal_line_metrics(font_size)
+            .expect("Font missing horizontal metrics");
+        let baseline_y =
+            (y0 - origin_y) as f32 + (key_h as f32 / 2.0) + (line_metrics.ascent - line_metrics.descent) / 2.0;
+
+        let label_chars: Vec<char> = label.chars().collect();
+        let mut total_width = 0.0;
+        let mut character_data = Vec::new();
+        for &ch in &label_chars {
+            let (metrics, bitmap) = self.font.rasterize(ch, font_size);
+            total_width += metrics.advance_width;
+            character_data.push((metrics, bitmap));
+        }
+
+        let mut current_x = (x0 - origin_x) as f32 + ((key_w as f32 - total_width) / 2.0);
+        for (metrics, bitmap) in character_data {
+            let char_y = baseline_y - metrics.height as f32 - metrics.ymin as f32;
+            for y in 0..metrics.height {
+                for x in 0..metrics.width {
+                    let val = bitmap[y * metrics.width + x];
+                    if val == 0 {
+                        continue;
+                    }
+                    let sx = (current_x + x as f32) as i32;
+                    let sy = (char_y + y as f32) as i32;
+                    if let Some(idx) = Self::local_idx(buf_w, buf_h, sx, sy, 0, 0) {
+                        buffer[idx] = KEY_TEXT_COLOR.0;
+                        buffer[idx + 1] = KEY_TEXT_COLOR.1;
+                        buffer[idx + 2] = KEY_TEXT_COLOR.2;
+                        buffer[idx + 3] = val;
+                    }
+                }
+            }
+            current_x += metrics.advance_width;
+        }
+    }
+
+    fn key_pixel_rect(&self, width: u32, height: u32, key: &Key) -> (i32, i32, i32, i32) {
+        let w = width as f32;
+        let h = height as f32;
+        let keyboard_left = self.data.left * w;
+        let keyboard_right = self.data.right * w;
+        let keyboard_top = self.data.top * h;
+        let keyboard_bottom = self.data.bottom * h;
+        let keyboard_width = keyboard_right - keyboard_left;
+        let keyboard_height = keyboard_bottom - keyboard_top;
+        let x0 = (keyboard_left + key.x * keyboard_width)
+            .round()
+            .clamp(0.0, w) as i32;
+        let x1 = (keyboard_left + (key.x + key.width) * keyboard_width)
+            .round()
+            .clamp(0.0, w) as i32;
+        let y0 = (keyboard_top + key.y * keyboard_height)
+            .round()
+            .clamp(0.0, h) as i32;
+        let y1 = (keyboard_top + (key.y + key.height) * keyboard_height)
+            .round()
+            .clamp(0.0, h) as i32;
+        (x0, y0, x1, y1)
+    }
+
+    fn key_label(&self, key: &Key) -> String {
+        match key.key_type {
+            KeyType::Char(ch) => {
+                if self.shift_pressed && self.symbol_mode == SymbolMode::Standard && ch.is_alphabetic()
+                {
+                    ch.to_uppercase().to_string()
+                } else {
+                    ch.to_string()
+                }
+            }
+            KeyType::Backspace => "del".to_string(),
+            KeyType::Space => "Space".to_string(),
+            KeyType::Shift => "⇧".to_string(),
+            KeyType::Return => "enter".to_string(),
+            KeyType::Symbol => match self.symbol_mode {
+                SymbolMode::Standard => "123".to_string(),
+                SymbolMode::Symbols1 | SymbolMode::Symbols2 => "ABC".to_string(),
+            },
+            KeyType::SymbolToggle => match self.symbol_mode {
+                SymbolMode::Standard => "#+=".to_string(),
+                SymbolMode::Symbols1 => "123".to_string(),
+                SymbolMode::Symbols2 => "ABC".to_string(),
+            },
+            KeyType::Mouse => "mouse".to_string(),
+            KeyType::Copy => "copy".to_string(),
+            KeyType::Cut => "cut".to_string(),
+            KeyType::Paste => "paste".to_string(),
+            KeyType::SelectAll => "sel".to_string(),
+            KeyType::Undo => "undo".to_string(),
+            KeyType::Redo => "redo".to_string(),
+        }
+    }
+
+    /// Legacy CPU path (wasm / fallback).
+    pub fn tick_draw_cpu(
+        &self,
+        buffer: &mut [u8],
+        width: u32,
+        height: u32,
+        safe_region: &crate::engine::SafeRegionBoundingRectangle,
+    ) {
+        self.draw(buffer, width, height);
+        self.draw_trackpad_spoof_cursor(buffer, width, height);
+        if !self.minimized {
+            let height_f = height as f32;
+            let keyboard_bottom_px = safe_region.y2 * height_f;
+            let screen_bottom = height_f;
+            if keyboard_bottom_px < screen_bottom {
+                let border_y = keyboard_bottom_px.round() as i32;
+                let fill_start_y = (border_y + 1).max(0);
+                let fill_end_y = screen_bottom as i32;
+                if border_y >= 0 && border_y < height as i32 {
+                    for x in 0..width as i32 {
+                        let idx = ((border_y as u32 * width + x as u32) * 4) as usize;
+                        if idx + 3 < buffer.len() {
+                            buffer[idx + 0] = 0;
+                            buffer[idx + 1] = 255;
+                            buffer[idx + 2] = 0;
+                            buffer[idx + 3] = 0xff;
+                        }
+                    }
+                }
+                for y in fill_start_y..fill_end_y {
+                    if y >= 0 && y < height as i32 {
+                        for x in 0..width as i32 {
+                            let idx = ((y as u32 * width + x as u32) * 4) as usize;
+                            if idx + 3 < buffer.len() {
+                                buffer[idx + 0] = 0;
+                                buffer[idx + 1] = 0;
+                                buffer[idx + 2] = 0;
+                                buffer[idx + 3] = 0xff;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Main tick: logic + draw. Prefer [`Self::tick_logic`] + GPU draw from the engine to avoid readback.
     pub fn tick(
         &mut self,
         buffer: &mut [u8],
@@ -147,82 +644,18 @@ impl OnScreenKeyboard {
         mouse_right: bool,
         safe_region: &crate::engine::SafeRegionBoundingRectangle,
     ) {
-        // Position keyboard partition just above bottom safe region
-        let keyboard_height = if self.read_only_mode { 0.264 } else { 0.33 }; // read-only: 20% smaller
-        let keyboard_bottom_safe = safe_region.y2; // Bottom of safe region
-        let keyboard_top = (keyboard_bottom_safe - keyboard_height).max(safe_region.y1);
-
-        self.data_mut().top = keyboard_top;
-        self.data_mut().bottom = keyboard_bottom_safe;
-        self.data_mut().left = 0.0;
-        self.data_mut().right = 1.0;
-
-        // Handle on-screen keyboard repeat
-        let now = Instant::now();
-        if let Some(ch) = self.check_key_hold_repeat(now) {
-            self.pending_chars.push(ch);
-        }
-
-        // Update hover state
-        self.update_hover(mouse_x, mouse_y, width as f32, height as f32);
-
-        self.update_trackpad_spoof_cursor(
+        self.tick_logic(
+            width,
+            height,
             mouse_x,
             mouse_y,
             mouse_dx,
             mouse_dy,
             mouse_left,
             mouse_right,
-            width as f32,
-            height as f32,
+            safe_region,
         );
-
-        // Draw keyboard
-        self.draw(buffer, width, height);
-
-        self.draw_trackpad_spoof_cursor(buffer, width, height);
-
-        // Draw black area with green border below keyboard (in unsafe region)
-        // Only draw if keyboard is visible
-        if !self.is_minimized() {
-            let height_f = height as f32;
-            let keyboard_bottom_px = keyboard_bottom_safe * height_f;
-            let screen_bottom = height_f;
-
-            if keyboard_bottom_px < screen_bottom {
-                let border_y = keyboard_bottom_px.round() as i32;
-                let fill_start_y = (border_y + 1).max(0);
-                let fill_end_y = screen_bottom as i32;
-
-                // Draw green border line
-                if border_y >= 0 && border_y < height as i32 {
-                    for x in 0..width as i32 {
-                        let idx = ((border_y as u32 * width + x as u32) * 4) as usize;
-                        if idx + 3 < buffer.len() {
-                            buffer[idx + 0] = 0; // R
-                            buffer[idx + 1] = 255; // G
-                            buffer[idx + 2] = 0; // B
-                            buffer[idx + 3] = 0xff; // A
-                        }
-                    }
-                }
-
-                // Fill black pixels below keyboard
-                for y in fill_start_y..fill_end_y {
-                    if y >= 0 && y < height as i32 {
-                        for x in 0..width as i32 {
-                            let idx = ((y as u32 * width + x as u32) * 4) as usize;
-                            if idx + 3 < buffer.len() {
-                                buffer[idx + 0] = 0; // R
-                                buffer[idx + 1] = 0; // G
-                                buffer[idx + 2] = 0; // B
-                                buffer[idx + 3] = 0xff; // A
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        self.tick_draw_cpu(buffer, width, height, safe_region);
     }
 
     /// Pop and return a pending character from the queue, if any
@@ -1305,47 +1738,20 @@ impl OnScreenKeyboard {
         }
     }
 
-    fn draw_key(&self, buffer: &mut [u8], width: u32, height: u32, key: &Key, label: &str) {
-        let w = width as f32;
-        let h = height as f32;
-
-        // Calculate keyboard area dimensions
-        let keyboard_left = self.data.left * w;
-        let keyboard_right = self.data.right * w;
-        let keyboard_top = self.data.top * h;
-        let keyboard_bottom = self.data.bottom * h;
-        let keyboard_width = keyboard_right - keyboard_left;
-        let keyboard_height = keyboard_bottom - keyboard_top;
-
-        // Convert relative positions (0.0-1.0) to absolute pixel positions
-        let x0 = (keyboard_left + key.x * keyboard_width)
-            .round()
-            .clamp(0.0, w) as i32;
-        let x1 = (keyboard_left + (key.x + key.width) * keyboard_width)
-            .round()
-            .clamp(0.0, w) as i32;
-        let y0 = (keyboard_top + key.y * keyboard_height)
-            .round()
-            .clamp(0.0, h) as i32;
-        let y1 = (keyboard_top + (key.y + key.height) * keyboard_height)
-            .round()
-            .clamp(0.0, h) as i32;
-
+    fn draw_key_label_only(
+        &self,
+        buffer: &mut [u8],
+        width: u32,
+        height: u32,
+        key: &Key,
+        label: &str,
+    ) {
+        let (x0, y0, x1, y1) = self.key_pixel_rect(width, height, key);
         let key_w = (x1 - x0).max(0) as u32;
         let key_h = (y1 - y0).max(0) as u32;
-
         if key_w == 0 || key_h == 0 {
             return;
         }
-
-        let color = if key.pressed {
-            KEY_PRESSED_COLOR
-        } else {
-            KEY_COLOR
-        };
-
-        // Draw rounded rectangle key
-        self.draw_rounded_rect(buffer, width, height, x0, y0, key_w, key_h, color, 8.0);
 
         // Draw key label (centered) - scale font size with key size
         // Use the same approach as geometric.rs for accurate rendering
@@ -1404,6 +1810,23 @@ impl OnScreenKeyboard {
 
             current_x += metrics.advance_width;
         }
+    }
+
+    fn draw_key(&self, buffer: &mut [u8], width: u32, height: u32, key: &Key, label: &str) {
+        let (x0, y0, x1, y1) = self.key_pixel_rect(width, height, key);
+        let key_w = (x1 - x0).max(0) as u32;
+        let key_h = (y1 - y0).max(0) as u32;
+        if key_w == 0 || key_h == 0 {
+            return;
+        }
+
+        let color = if key.pressed {
+            KEY_PRESSED_COLOR
+        } else {
+            KEY_COLOR
+        };
+        self.draw_rounded_rect(buffer, width, height, x0, y0, key_w, key_h, color, 8.0);
+        self.draw_key_label_only(buffer, width, height, key, label);
     }
 }
 

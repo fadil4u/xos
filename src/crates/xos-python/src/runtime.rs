@@ -1,7 +1,9 @@
 ///! Unified Python runtime for xos
 ///! Handles execution of Python code in both CLI and coder environments
 ///! with centralized logging and error handling
-use rustpython_vm::{builtins::PyBaseExceptionRef, AsObject, Interpreter, VirtualMachine};
+use rustpython_vm::{
+    builtins::PyBaseExceptionRef, AsObject, Interpreter, PyObjectRef, VirtualMachine,
+};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -55,6 +57,81 @@ pub fn parse_script_cli_flags(rest: &[String]) -> Vec<String> {
 
 /// Callback type for capturing print output
 pub type PrintCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(target_arch = "wasm32")]
+static WASM_PRINT_SINK: Mutex<Option<PrintCallback>> = Mutex::new(None);
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_emit_print(s: &str) {
+    if let Ok(guard) = WASM_PRINT_SINK.lock() {
+        if let Some(cb) = guard.as_ref() {
+            cb(s);
+            return;
+        }
+    }
+    xos_core::print(s);
+}
+
+/// Route Python `print` / `sys.stdout` to the browser console (or an optional sink).
+#[cfg(target_arch = "wasm32")]
+pub fn set_wasm_print_sink(callback: Option<PrintCallback>) {
+    if let Ok(mut guard) = WASM_PRINT_SINK.lock() {
+        *guard = callback;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+const WASM_STDIO_SETUP: &str = r#"
+import sys
+import builtins
+
+class _XosWasmIO:
+    def write(self, s):
+        if s:
+            __xos_write__(s)
+        return len(s) if s else 0
+    def flush(self):
+        pass
+
+_io = _XosWasmIO()
+sys.stdout = _io
+sys.stderr = _io
+
+def __xos_print__(*args, sep=' ', end='\n', **kwargs):
+    __xos_write__(sep.join(str(arg) for arg in args) + end)
+
+builtins.print = __xos_print__
+"#;
+
+/// Install `sys.stdout` / `builtins.print` on the VM (RustPython leaves them unset on wasm32).
+#[cfg(target_arch = "wasm32")]
+pub fn install_wasm_python_stdio(vm: &VirtualMachine) {
+    if vm.builtins.get_attr("__xos_write__", vm).is_err() {
+        let write_fn = vm.new_function(
+            "__xos_write__",
+            |args: rustpython_vm::function::FuncArgs, vm: &VirtualMachine| -> rustpython_vm::PyResult {
+                if let Some(text_obj) = args.args.first() {
+                    if let Ok(text) = text_obj.str(vm) {
+                        wasm_emit_print(&text.to_string());
+                    }
+                }
+                Ok(vm.ctx.none())
+            },
+        );
+        let _ = vm.builtins.set_attr("__xos_write__", write_fn, vm);
+    }
+
+    let scope = vm.new_scope_with_builtins();
+    if let Err(e) = vm.run_code_string(scope, WASM_STDIO_SETUP, "<wasm-stdio>".to_string()) {
+        xos_core::print(&format!("xos wasm: failed to install Python stdio: {e:?}"));
+    }
+}
+
+/// Call from `Interpreter::with_init` on wasm before running app scripts.
+#[cfg(target_arch = "wasm32")]
+pub fn wasm_interpreter_init(vm: &VirtualMachine) {
+    install_wasm_python_stdio(vm);
+}
 
 /// How Python source is compiled before execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -127,6 +204,12 @@ pub fn execute_python_code_with_mode(
     let output_buffer_clone = Arc::clone(&output_buffer);
 
     let (result, app_instance, new_scope) = interpreter.enter(|vm| {
+        #[cfg(target_arch = "wasm32")]
+        {
+            set_wasm_print_sink(print_callback.clone());
+            install_wasm_python_stdio(vm);
+        }
+
         // Clear previous app instance from builtins
         let _ = vm
             .builtins
@@ -163,6 +246,7 @@ pub fn execute_python_code_with_mode(
 
         // Set up print capture
         let buffer_for_capture = Arc::clone(&output_buffer_clone);
+        #[cfg(not(target_arch = "wasm32"))]
         let callback_clone = print_callback.clone();
         let write_output_fn = vm.new_function(
             "__write_output__",
@@ -178,7 +262,9 @@ pub fn execute_python_code_with_mode(
                             buffer.push_str(&text_str);
                         }
 
-                        // Call callback if provided
+                        #[cfg(target_arch = "wasm32")]
+                        wasm_emit_print(&text_str);
+                        #[cfg(not(target_arch = "wasm32"))]
                         if let Some(ref callback) = callback_clone {
                             callback(&text_str);
                         }
@@ -192,7 +278,6 @@ pub fn execute_python_code_with_mode(
             .set_item("__write_output__", write_output_fn.into(), vm)
             .ok();
 
-        // Override print to capture output
         let setup_code = format!(
             r#"
 import builtins
@@ -204,7 +289,7 @@ globals()["xos"] = xos
 {}
 __original_print__ = builtins.print
 "#,
-            xos_flags_setup_python(script_flags)
+            xos_flags_setup_python(script_flags),
         );
         let setup_code = format!(
             "{}{}",
@@ -274,14 +359,25 @@ builtins.__import__ = __xos_import__
             Err(err) => Err(vm.new_syntax_error(&err, Some(code))),
         };
 
-        // Restore original print
-        let restore_code = r#"
+        // Restore original print (wasm keeps custom print + sys.stdout for tick()).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let restore_code = r#"
 builtins.print = __original_print__
 xos.print = __original_print__
 builtins.__import__ = __original_import__
 "#;
-        vm.run_code_string(scope.clone(), restore_code, "<restore>".to_string())
-            .ok();
+            vm.run_code_string(scope.clone(), restore_code, "<restore>".to_string())
+                .ok();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let restore_code = r#"
+builtins.__import__ = __original_import__
+"#;
+            vm.run_code_string(scope.clone(), restore_code, "<restore>".to_string())
+                .ok();
+        }
 
         // Handle errors
         let result = if let Err(py_exc) = exec_result {
@@ -304,13 +400,18 @@ builtins.__import__ = __original_import__
     (result, output, app_instance, Some(new_scope))
 }
 
+fn read_python_source(path: &PathBuf) -> Result<String, std::io::Error> {
+    let content = fs::read_to_string(path)?;
+    Ok(crate::frame_tensor::preprocess_tensor_logical_keywords(&content))
+}
+
 /// Run a Python file (CLI mode)
 pub fn run_python_file(file_path: &PathBuf, script_flags: &[String]) {
     let resolved_file_path = file_path
         .canonicalize()
         .unwrap_or_else(|_| file_path.clone());
     // Read the Python file
-    let code = match fs::read_to_string(&resolved_file_path) {
+    let code = match read_python_source(&resolved_file_path) {
         Ok(content) => content,
         Err(e) => {
             eprintln!(
@@ -355,6 +456,148 @@ pub fn run_python_file(file_path: &PathBuf, script_flags: &[String]) {
     }
 }
 
+fn collect_test_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_test_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("py") {
+            out.push(path);
+        }
+    }
+}
+
+/// Discover `src/tests/**/*.py`, register `@xos.test` functions, run them. Returns process exit code.
+///
+/// When `filter_name` is set, only registered cases whose function name matches are executed
+/// (all parametrize variants for that name; every file that defines the same name).
+pub fn run_test_suite(tests_dir: &std::path::Path, filter_name: Option<&str>) -> i32 {
+    let mut files = Vec::new();
+    collect_test_files(tests_dir, &mut files);
+    files.sort();
+
+    if files.is_empty() {
+        eprintln!("no tests found under {}", tests_dir.display());
+        return 1;
+    }
+
+    let interpreter = Interpreter::with_init(Default::default(), |vm| {
+        vm.add_native_module(
+            "xos".to_owned(),
+            Box::new(crate::xos_module::make_module),
+        );
+    });
+
+    interpreter.enter(|vm| {
+        let scope = vm.new_scope_with_builtins();
+        let _ = scope
+            .globals
+            .set_item("__name__", vm.ctx.new_str("__main__").into(), vm);
+        let setup = "import xos\nxos._clear_registry()";
+        if let Err(e) = vm.run_code_string(scope.clone(), setup, "<test-setup>".to_string()) {
+            eprintln!(
+                "test setup failed:\n{}",
+                format_python_exception(vm, &e)
+            );
+            return 1;
+        }
+
+        let xos_obj = match scope.globals.get_item("xos", vm) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("xos module missing: {}", format_python_exception(vm, &e));
+                return 1;
+            }
+        };
+
+        let mut load_failures = 0usize;
+        for path in &files {
+            let code = match read_python_source(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("failed to read {}: {e}", path.display());
+                    load_failures += 1;
+                    continue;
+                }
+            };
+            let label = path
+                .canonicalize()
+                .unwrap_or_else(|_| path.clone())
+                .to_string_lossy()
+                .to_string();
+
+            let file_scope = vm.new_scope_with_builtins();
+            let _ = file_scope
+                .globals
+                .set_item("xos", xos_obj.clone(), vm);
+            let _ = file_scope.globals.set_item(
+                "__file__",
+                vm.ctx.new_str(label.as_str()).into(),
+                vm,
+            );
+            let _ = file_scope
+                .globals
+                .set_item("__name__", vm.ctx.new_str("__main__").into(), vm);
+
+            if let Err(e) = vm.run_code_string(file_scope.clone(), &code, label.clone()) {
+                eprintln!(
+                    "failed to load {}:\n{}",
+                    path.display(),
+                    format_python_exception(vm, &e)
+                );
+                load_failures += 1;
+                continue;
+            }
+            if let Err(e) = vm.run_code_string(
+                file_scope,
+                "xos._register_module_tests(globals())",
+                "<register-tests>".to_string(),
+            ) {
+                eprintln!(
+                    "failed to register tests from {}:\n{}",
+                    path.display(),
+                    format_python_exception(vm, &e)
+                );
+                load_failures += 1;
+            }
+        }
+
+        let run_all = match vm.get_attribute_opt(xos_obj, "_run_all") {
+            Ok(Some(f)) => f,
+            Ok(None) | Err(_) => {
+                eprintln!("xos._run_all missing");
+                return 1;
+            }
+        };
+        let result = match filter_name {
+            Some(name) => {
+                let filter_arg: PyObjectRef = vm.ctx.new_str(name).into();
+                run_all.call((filter_arg,), vm)
+            }
+            None => run_all.call((), vm),
+        };
+        let result = match result {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "test run failed:\n{}",
+                    format_python_exception(vm, &e)
+                );
+                return 1;
+            }
+        };
+        let ok = result.try_into_value::<bool>(vm).unwrap_or(false);
+        if load_failures > 0 || !ok {
+            1
+        } else {
+            0
+        }
+    })
+}
+
 /// Run an interactive Python console (`xpy` / `xos py` with no script).
 pub fn run_python_interactive() {
     let interpreter = Interpreter::with_init(Default::default(), |vm| {
@@ -375,6 +618,20 @@ pub fn run_python_interactive() {
     }
 }
 
+/// Whether the registered `xos.Application` instance requests headless mode.
+pub fn python_app_wants_headless(
+    interpreter: &Interpreter,
+    app_instance: &rustpython_vm::PyObjectRef,
+) -> bool {
+    interpreter.enter(|vm| {
+        vm.get_attribute_opt(app_instance.clone(), "headless")
+            .ok()
+            .flatten()
+            .and_then(|obj| obj.try_into_value::<bool>(vm).ok())
+            .unwrap_or(false)
+    })
+}
+
 /// Run a Python application with the xos engine
 pub fn run_python_app(file_path: &PathBuf, script_flags: &[String]) {
     #[cfg(not(target_arch = "wasm32"))]
@@ -386,7 +643,7 @@ pub fn run_python_app(file_path: &PathBuf, script_flags: &[String]) {
         .unwrap_or_else(|_| file_path.clone());
 
     // Read the Python file
-    let code = match fs::read_to_string(&resolved_file_path) {
+    let code = match read_python_source(&resolved_file_path) {
         Ok(content) => content,
         Err(e) => {
             eprintln!(
@@ -404,26 +661,8 @@ pub fn run_python_app(file_path: &PathBuf, script_flags: &[String]) {
     });
 
     #[cfg(not(target_arch = "wasm32"))]
-    if !source_declares_headless_window_app(&code) {
-        match xos_core::engine::start_native(Box::new(StagedNativePythonApp::new(
-            resolved_file_path.clone(),
-            code.clone(),
-            script_flags.to_vec(),
-            print_cb.clone(),
-        ))) {
-            Ok(()) => return,
-            Err(e) => {
-                eprintln!("❌ Engine error: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    // Headless heuristic match, or WASM: interpreter before engine (prior behavior).
-
-    #[cfg(not(target_arch = "wasm32"))]
     {
-        // Create interpreter with xos module
+        // Run the script first so `headless` / `device` on the Application instance are known.
         let interpreter = Interpreter::with_init(Default::default(), |vm| {
             vm.add_native_module(
                 "xos".to_owned(),
@@ -449,13 +688,7 @@ pub fn run_python_app(file_path: &PathBuf, script_flags: &[String]) {
         }
 
         if let Some(app_instance) = app_instance {
-            let headless = interpreter.enter(|vm| {
-                vm.get_attribute_opt(app_instance.clone(), "headless")
-                    .ok()
-                    .flatten()
-                    .and_then(|obj| obj.try_into_value::<bool>(vm).ok())
-                    .unwrap_or(false)
-            });
+            let headless = python_app_wants_headless(&interpreter, &app_instance);
 
             if headless {
                 interpreter.enter(|vm| {
@@ -474,6 +707,22 @@ pub fn run_python_app(file_path: &PathBuf, script_flags: &[String]) {
                 std::process::exit(1);
             }
             return;
+        }
+
+        // Scripts that defer app construction: window-first staged bootstrap (not headless).
+        if !source_declares_headless_window_app(&code) {
+            match xos_core::engine::start_native(Box::new(StagedNativePythonApp::new(
+                resolved_file_path.clone(),
+                code.clone(),
+                script_flags.to_vec(),
+                print_cb.clone(),
+            ))) {
+                Ok(()) => return,
+                Err(e) => {
+                    eprintln!("❌ Engine error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 

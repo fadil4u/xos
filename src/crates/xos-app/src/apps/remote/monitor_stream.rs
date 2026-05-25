@@ -7,6 +7,7 @@
     not(target_arch = "wasm32"),
     any(target_os = "macos", target_os = "windows")
 )))]
+#[allow(dead_code)]
 pub(crate) fn snapshot(_index: usize) -> Option<(Vec<u8>, u32, u32)> {
     None
 }
