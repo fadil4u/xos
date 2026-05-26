@@ -111,6 +111,9 @@ public final class XosNative {
      */
     public static native void onF3();
 
+    /** Requests Coder to stop current execution(s), same as the red stop action. */
+    public static native void onStopExecution();
+
     /**
      * Sets the coder scripts directory used by the native Coder app. Must be an absolute directory path.
      * Call before {@link #init} when embedding xos in another host (e.g. Minekov).

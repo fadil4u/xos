@@ -22,6 +22,7 @@ use xos::engine::{
     tick_frame_delta, tick_frame_view_zoom, Application, CursorStyleSetter, EngineState, F3Menu,
     FrameState, KeyboardState, MouseState, SafeRegionBoundingRectangle,
 };
+use xos::engine::keyboard::shortcuts::{PhysicalSpecialKey, SpecialKeyEvent};
 use xos::engine::keyboard::shortcuts::ShortcutAction;
 
 thread_local! {
@@ -823,5 +824,35 @@ pub extern "system" fn Java_ai_xlate_xos_XosNative_onF3(mut env: JNIEnv, _class:
         };
 
         host.engine.f3_menu.toggle_visible();
+    });
+}
+
+#[no_mangle]
+pub extern "system" fn Java_ai_xlate_xos_XosNative_onStopExecution(
+    mut env: JNIEnv,
+    _class: JClass,
+) {
+    HOST.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let Some(host) = guard.as_mut() else {
+            throw(
+                &mut env,
+                "java/lang/IllegalStateException",
+                "xos-java not initialized; call init first",
+            );
+            return;
+        };
+
+        host.app.on_special_key(
+            &mut host.engine,
+            SpecialKeyEvent {
+                named_key: None,
+                physical_key: Some(PhysicalSpecialKey::KeyW),
+                character: None,
+                command_held: false,
+                shift_held: true,
+                alt_held: true,
+            },
+        );
     });
 }

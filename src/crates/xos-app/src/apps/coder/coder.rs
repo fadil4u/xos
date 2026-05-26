@@ -10,9 +10,11 @@ use xos_core::rasterizer::text::text_rasterization::TextRasterizer;
 use xos_core::rasterizer::text::fonts;
 use rustpython_vm::{function::FuncArgs, AsObject, Interpreter, PyResult, VirtualMachine};
 use include_dir::{include_dir, Dir};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 // Embed the entire example-scripts/ directory at compile time
@@ -22,6 +24,10 @@ pub type HostBindingInvoker =
     Arc<dyn Fn(&str, &str, &str) -> Result<Option<String>, String> + Send + Sync>;
 static HOST_MODULES: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
 static HOST_BINDING_INVOKER: OnceLock<Mutex<Option<HostBindingInvoker>>> = OnceLock::new();
+thread_local! {
+    static BACKGROUND_EXECUTION_CONTEXT_GENERATION: Cell<u64> = const { Cell::new(0) };
+}
+static ACTIVE_BACKGROUND_EXECUTION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Task bar depth, chrome buttons, and related spacing/fonts vs prior baseline.
 const CODER_CHROME_SCALE: f32 = 1.3;
@@ -174,6 +180,22 @@ fn host_binding_invoker_registry() -> &'static Mutex<Option<HostBindingInvoker>>
     HOST_BINDING_INVOKER.get_or_init(|| Mutex::new(None))
 }
 
+fn set_background_execution_context_generation(generation: u64) {
+    BACKGROUND_EXECUTION_CONTEXT_GENERATION.with(|slot| slot.set(generation));
+}
+
+fn clear_background_execution_context_generation() {
+    BACKGROUND_EXECUTION_CONTEXT_GENERATION.with(|slot| slot.set(0));
+}
+
+fn is_background_execution_cancelled() -> bool {
+    let active = ACTIVE_BACKGROUND_EXECUTION_GENERATION.load(Ordering::Relaxed);
+    BACKGROUND_EXECUTION_CONTEXT_GENERATION.with(|slot| {
+        let mine = slot.get();
+        mine != 0 && mine != active
+    })
+}
+
 pub fn set_host_binding_invoker(invoker: Option<HostBindingInvoker>) {
     if let Ok(mut slot) = host_binding_invoker_registry().lock() {
         *slot = invoker;
@@ -251,6 +273,10 @@ fn register_optional_native_modules(vm: &mut VirtualMachine) {
                 let host_call_fn = vm.new_function(
                     "_host_call",
                     move |args: FuncArgs, vm: &VirtualMachine| -> PyResult {
+                        if is_background_execution_cancelled() {
+                            return Err(vm
+                                .new_exception_empty(vm.ctx.exceptions.keyboard_interrupt.to_owned()));
+                        }
                         let Some(fn_name_obj) = args.args.first() else {
                             return Err(vm.new_type_error(
                                 "_host_call(function_name, arg0='') expects at least one argument"
@@ -285,6 +311,10 @@ fn register_optional_native_modules(vm: &mut VirtualMachine) {
                     let native_fn = vm.new_function(
                         function_name_leaked,
                         move |args: FuncArgs, vm: &VirtualMachine| -> PyResult {
+                            if is_background_execution_cancelled() {
+                                return Err(vm
+                                    .new_exception_empty(vm.ctx.exceptions.keyboard_interrupt.to_owned()));
+                            }
                             let arg0 = if let Some(obj) = args.args.first() {
                                 obj.str(vm)?.to_string()
                             } else {
@@ -1121,12 +1151,14 @@ xos.print = __custom_print__
             *gen += 1;
             *gen
         };
+        ACTIVE_BACKGROUND_EXECUTION_GENERATION.store(current_generation, Ordering::Relaxed);
         
         // Mark thread as running
         *self.python_thread_running.lock().unwrap() = true;
         
         // Spawn background thread to execute Python
         let handle = thread::spawn(move || {
+            set_background_execution_context_generation(current_generation);
             // Create interpreter in this thread
             let interpreter = Interpreter::with_init(Default::default(), |vm| {
                 vm.add_native_module("xos".to_owned(), Box::new(xos_python::xos_module::make_module));
@@ -1147,13 +1179,26 @@ xos.print = __custom_print__
             });
             
             // Execute using unified runtime
-            let (result, _, _, _) = xos_python::runtime::execute_python_code(
+            let running_for_cancel = Arc::clone(&running_flag);
+            let gen_for_cancel = Arc::clone(&generation_counter);
+            let cancel_check: xos_python::runtime::CancelCheckCallback = Arc::new(move || {
+                let still_current = gen_for_cancel
+                    .lock()
+                    .map(|g| *g == current_generation)
+                    .unwrap_or(false);
+                let still_running = running_for_cancel.lock().map(|f| *f).unwrap_or(false);
+                !(still_current && still_running)
+            });
+
+            let (result, _, _, _) = xos_python::runtime::execute_python_code_with_mode_and_cancel(
                 &interpreter,
                 &code_str,
                 "<coder>",
                 None,
                 Some(print_callback),
                 &[],
+                xos_python::runtime::PythonRunMode::Exec,
+                Some(cancel_check),
             );
             
             // Handle errors (only if still current generation)
@@ -1175,8 +1220,10 @@ xos.print = __custom_print__
                     if let Ok(mut flag) = running_flag.lock() {
                         *flag = false;
                     }
+                    ACTIVE_BACKGROUND_EXECUTION_GENERATION.store(0, Ordering::Relaxed);
                 }
             }
+            clear_background_execution_context_generation();
         });
         
         // Store the thread handle
@@ -1479,6 +1526,7 @@ builtins.print = __custom_print__
         if is_background_running {
             if let Ok(mut gen) = self.python_thread_generation.lock() {
                 *gen += 1;
+                ACTIVE_BACKGROUND_EXECUTION_GENERATION.store(*gen, Ordering::Relaxed);
             }
             if let Ok(mut flag) = self.python_thread_running.lock() {
                 *flag = false;
@@ -1488,6 +1536,15 @@ builtins.print = __custom_print__
             if let Ok(mut buffer) = self.python_output_buffer.lock() {
                 buffer.push_str("\n[xos] Script stopped by user\n");
             }
+        }
+
+        // Notify host integrations (e.g. Minekov) to clear execution-owned effects.
+        let invoker = host_binding_invoker_registry()
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().cloned());
+        if let Some(invoker) = invoker {
+            let _ = invoker("mc", "execution_stopped", "");
         }
     }
     

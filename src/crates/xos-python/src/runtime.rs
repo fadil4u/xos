@@ -57,6 +57,8 @@ pub fn parse_script_cli_flags(rest: &[String]) -> Vec<String> {
 
 /// Callback type for capturing print output
 pub type PrintCallback = Arc<dyn Fn(&str) + Send + Sync>;
+/// Callback used to cooperatively request Python cancellation.
+pub type CancelCheckCallback = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[cfg(target_arch = "wasm32")]
 static WASM_PRINT_SINK: Mutex<Option<PrintCallback>> = Mutex::new(None);
@@ -175,7 +177,7 @@ pub fn execute_python_code(
     Option<rustpython_vm::PyObjectRef>,
     Option<rustpython_vm::scope::Scope>,
 ) {
-    execute_python_code_with_mode(
+    execute_python_code_with_mode_and_cancel(
         interpreter,
         code,
         filename,
@@ -183,6 +185,7 @@ pub fn execute_python_code(
         print_callback,
         script_flags,
         PythonRunMode::Exec,
+        None,
     )
 }
 
@@ -194,6 +197,33 @@ pub fn execute_python_code_with_mode(
     print_callback: Option<PrintCallback>,
     script_flags: &[String],
     run_mode: PythonRunMode,
+) -> (
+    Result<(), String>,
+    String,
+    Option<rustpython_vm::PyObjectRef>,
+    Option<rustpython_vm::scope::Scope>,
+) {
+    execute_python_code_with_mode_and_cancel(
+        interpreter,
+        code,
+        filename,
+        persistent_scope,
+        print_callback,
+        script_flags,
+        run_mode,
+        None,
+    )
+}
+
+pub fn execute_python_code_with_mode_and_cancel(
+    interpreter: &Interpreter,
+    code: &str,
+    filename: &str,
+    persistent_scope: Option<rustpython_vm::scope::Scope>,
+    print_callback: Option<PrintCallback>,
+    script_flags: &[String],
+    run_mode: PythonRunMode,
+    cancel_check: Option<CancelCheckCallback>,
 ) -> (
     Result<(), String>,
     String,
@@ -349,6 +379,34 @@ builtins.__import__ = __xos_import__
             eprintln!("Failed to set up print capture: {:?}", e);
         }
 
+        if let Some(cancel_check_cb) = cancel_check.clone() {
+            let cancel_fn = vm.new_function(
+                "__xos_should_cancel__",
+                move |_args: rustpython_vm::function::FuncArgs,
+                      vm: &rustpython_vm::VirtualMachine|
+                      -> rustpython_vm::PyResult {
+                    Ok(vm.ctx.new_bool(cancel_check_cb()).into())
+                },
+            );
+            scope
+                .globals
+                .set_item("__xos_should_cancel__", cancel_fn.into(), vm)
+                .ok();
+
+            // Cooperative cancellation for long-running scripts (e.g. while True loops).
+            let cancel_setup = r#"
+try:
+    def __xos_cancel_trace__(frame, event, arg):
+        if __xos_should_cancel__():
+            raise KeyboardInterrupt("Script stopped by user")
+        return __xos_cancel_trace__
+    sys.settrace(__xos_cancel_trace__)
+except Exception:
+    pass
+"#;
+            let _ = vm.run_code_string(scope.clone(), cancel_setup, "<cancel-setup>".to_string());
+        }
+
         // Run the code
         let compile_mode = match run_mode {
             PythonRunMode::Exec => rustpython_vm::compiler::Mode::Exec,
@@ -366,6 +424,10 @@ builtins.__import__ = __xos_import__
 builtins.print = __original_print__
 xos.print = __original_print__
 builtins.__import__ = __original_import__
+try:
+    sys.settrace(None)
+except Exception:
+    pass
 "#;
             vm.run_code_string(scope.clone(), restore_code, "<restore>".to_string())
                 .ok();
