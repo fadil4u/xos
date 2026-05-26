@@ -1,0 +1,26 @@
+{
+  "7b-chat-ct2": {
+    "repo": "michaelfeil/ct2fast-Llama-2-7b-chat-hf",
+    "files": [
+      "model.bin",
+      "config.json",
+      "vocabulary.json",
+      "tokenizer.json",
+      "tokenizer_config.json",
+      "special_tokens_map.json",
+      "generation_config.json"
+    ]
+  },
+  "13b-chat-ct2": {
+    "repo": "michaelfeil/ct2fast-Llama-2-13b-chat-hf",
+    "files": [
+      "model.bin",
+      "config.json",
+      "vocabulary.json",
+      "tokenizer.json",
+      "tokenizer_config.json",
+      "special_tokens_map.json",
+      "generation_config.json"
+    ]
+  }
+}
