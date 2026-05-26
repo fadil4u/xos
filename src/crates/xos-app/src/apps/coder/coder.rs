@@ -246,6 +246,36 @@ fn register_optional_native_modules(vm: &mut VirtualMachine) {
             Box::new(move |vm: &VirtualMachine| {
                 let module =
                     vm.new_module(module_name_for_factory.as_str(), vm.ctx.new_dict(), None);
+                let invoker_for_host_call = Arc::clone(&invoker_for_factory);
+                let module_name_for_host_call = module_name_for_factory.clone();
+                let host_call_fn = vm.new_function(
+                    "_host_call",
+                    move |args: FuncArgs, vm: &VirtualMachine| -> PyResult {
+                        let Some(fn_name_obj) = args.args.first() else {
+                            return Err(vm.new_type_error(
+                                "_host_call(function_name, arg0='') expects at least one argument"
+                                    .to_string(),
+                            ));
+                        };
+                        let function_name = fn_name_obj.str(vm)?.to_string();
+                        let arg0 = if let Some(arg_obj) = args.args.get(1) {
+                            arg_obj.str(vm)?.to_string()
+                        } else {
+                            String::new()
+                        };
+                        match invoker_for_host_call(
+                            &module_name_for_host_call,
+                            &function_name,
+                            &arg0,
+                        ) {
+                            Ok(Some(output)) => Ok(vm.ctx.new_str(output).into()),
+                            Ok(None) => Ok(vm.ctx.none()),
+                            Err(err) => Err(vm.new_runtime_error(err)),
+                        }
+                    },
+                );
+                let _ = module.set_attr("_host_call", host_call_fn, vm);
+
                 for function_name in function_names_for_factory.clone() {
                     let module_name_for_call = module_name_for_factory.clone();
                     let function_name_for_call = function_name.clone();
@@ -272,6 +302,42 @@ fn register_optional_native_modules(vm: &mut VirtualMachine) {
                         },
                     );
                     let _ = module.set_attr(function_name_leaked, native_fn, vm);
+                }
+
+                if function_names_for_factory
+                    .iter()
+                    .any(|name| name == "__bootstrap__")
+                {
+                    if let Ok(Some(bootstrap_source)) =
+                        invoker_for_factory(&module_name_for_factory, "__bootstrap__", "")
+                    {
+                        if !bootstrap_source.trim().is_empty() {
+                            let scope = vm.new_scope_with_builtins();
+                            let _ = scope
+                                .globals
+                                .set_item("__name__", vm.ctx.new_str("__xos_host_bootstrap__").into(), vm);
+                            let _ = scope
+                                .globals
+                                .set_item("__module__", module.as_object().to_owned(), vm);
+                            match vm.run_code_string(
+                                scope,
+                                &bootstrap_source,
+                                format!("<{}.__bootstrap__>", module_name_for_factory),
+                            ) {
+                                Ok(_) => {
+                                    let _ = module.set_attr("_bootstrap_ok", vm.ctx.new_bool(true), vm);
+                                }
+                                Err(e) => {
+                                    let _ = module.set_attr("_bootstrap_ok", vm.ctx.new_bool(false), vm);
+                                    let _ = module.set_attr(
+                                        "_bootstrap_error",
+                                        vm.ctx.new_str(format!("{e:?}")),
+                                        vm,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 module
             }),
