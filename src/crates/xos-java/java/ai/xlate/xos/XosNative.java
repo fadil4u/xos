@@ -99,6 +99,14 @@ public final class XosNative {
     public static native void onKeyChar(int codepoint);
 
     /**
+     * Text-edit shortcut action routed directly to the active xos app.
+     * <p>
+     * actionCode:
+     * 1=Copy, 2=Cut, 3=Paste, 4=SelectAll, 5=Undo, 6=Redo
+     */
+    public static native void onShortcut(int actionCode);
+
+    /**
      * F3 toggles the global FPS overlay (same as desktop/winit). Not sent as a Unicode character.
      */
     public static native void onF3();

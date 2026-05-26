@@ -22,6 +22,7 @@ use xos::engine::{
     tick_frame_delta, tick_frame_view_zoom, Application, CursorStyleSetter, EngineState, F3Menu,
     FrameState, KeyboardState, MouseState, SafeRegionBoundingRectangle,
 };
+use xos::engine::keyboard::shortcuts::ShortcutAction;
 
 thread_local! {
     static HOST: RefCell<Option<Host>> = RefCell::new(None);
@@ -767,6 +768,44 @@ pub extern "system" fn Java_ai_xlate_xos_XosNative_onKeyChar(
         };
 
         host.app.on_key_char(&mut host.engine, ch);
+    });
+}
+
+#[no_mangle]
+pub extern "system" fn Java_ai_xlate_xos_XosNative_onShortcut(
+    mut env: JNIEnv,
+    _class: JClass,
+    action_code: jint,
+) {
+    HOST.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let Some(host) = guard.as_mut() else {
+            throw(
+                &mut env,
+                "java/lang/IllegalStateException",
+                "xos-java not initialized; call init first",
+            );
+            return;
+        };
+
+        let action = match action_code {
+            1 => ShortcutAction::Copy,
+            2 => ShortcutAction::Cut,
+            3 => ShortcutAction::Paste,
+            4 => ShortcutAction::SelectAll,
+            5 => ShortcutAction::Undo,
+            6 => ShortcutAction::Redo,
+            _ => {
+                throw(
+                    &mut env,
+                    "java/lang/IllegalArgumentException",
+                    "invalid shortcut action code",
+                );
+                return;
+            }
+        };
+
+        host.app.on_key_shortcut(&mut host.engine, action);
     });
 }
 
