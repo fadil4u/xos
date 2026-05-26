@@ -6,13 +6,16 @@
 //! **client thread** only (same as other rendering/input). That allows non-[`Send`] apps such as
 //! [`CoderApp`] (RustPython is not `Send`).
 
-use jni::objects::{JClass, JString};
+use jni::objects::{GlobalRef, JClass, JObject, JObjectArray, JString, JValue};
 use jni::sys::{jfloat, jint, jlong, jobject, jstring};
 use jni::JNIEnv;
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use xos::apps::coder::CoderApp;
+use xos::apps::coder::coder::{
+    clear_host_python_modules, register_host_python_module, set_host_binding_invoker,
+};
 use xos::engine::{
     apply_frame_view_zoom,
     f3_menu_handle_mouse_down, f3_menu_handle_mouse_move, f3_menu_handle_mouse_up, tick_f3_menu,
@@ -25,6 +28,72 @@ thread_local! {
 }
 
 static INIT_HOOKS_ONCE: Once = Once::new();
+struct JavaHostBindingBridge {
+    jvm: Arc<jni::JavaVM>,
+    callback: GlobalRef,
+}
+static HOST_BINDING_BRIDGE: OnceLock<Mutex<Option<JavaHostBindingBridge>>> = OnceLock::new();
+
+fn host_binding_bridge_slot() -> &'static Mutex<Option<JavaHostBindingBridge>> {
+    HOST_BINDING_BRIDGE.get_or_init(|| Mutex::new(None))
+}
+
+fn invoke_registered_host_binding(
+    module_name: &str,
+    function_name: &str,
+    arg0: &str,
+) -> Result<Option<String>, String> {
+    let (jvm, callback) = {
+        let slot = host_binding_bridge_slot()
+            .lock()
+            .map_err(|_| "host binding bridge lock poisoned".to_string())?;
+        let Some(bridge) = slot.as_ref() else {
+            return Err("host binding callback not set".to_string());
+        };
+        (Arc::clone(&bridge.jvm), bridge.callback.clone())
+    };
+
+    let mut env = jvm
+        .attach_current_thread()
+        .map_err(|e| format!("failed to attach JVM thread: {e}"))?;
+
+    let module_j = env
+        .new_string(module_name)
+        .map_err(|e| format!("failed to create module string: {e}"))?;
+    let function_j = env
+        .new_string(function_name)
+        .map_err(|e| format!("failed to create function string: {e}"))?;
+    let arg0_j = env
+        .new_string(arg0)
+        .map_err(|e| format!("failed to create arg0 string: {e}"))?;
+
+    let result = env
+        .call_method(
+            callback.as_obj(),
+            "invokeXosBinding",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            &[
+                JValue::Object(&JObject::from(module_j)),
+                JValue::Object(&JObject::from(function_j)),
+                JValue::Object(&JObject::from(arg0_j)),
+            ],
+        )
+        .map_err(|e| format!("host binding callback failed: {e}"))?;
+
+    let obj = result
+        .l()
+        .map_err(|e| format!("invalid host binding callback return: {e}"))?;
+    if obj.is_null() {
+        return Ok(None);
+    }
+    let jstr = JString::from(obj);
+    let s = env
+        .get_string(&jstr)
+        .map_err(|e| format!("failed to decode callback string return: {e}"))?
+        .to_string_lossy()
+        .to_string();
+    Ok(Some(s))
+}
 
 struct Host {
     engine: EngineState,
@@ -134,6 +203,136 @@ pub extern "system" fn Java_ai_xlate_xos_XosNative_setCoderScriptsDirectory(
 
     let resolved = dir.canonicalize().unwrap_or(dir);
     std::env::set_var("XOS_CODER_DIR", resolved);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_ai_xlate_xos_XosNative_setHostBindingCallback(
+    mut env: JNIEnv,
+    _class: JClass,
+    callback: jobject,
+) {
+    if callback.is_null() {
+        if let Ok(mut slot) = host_binding_bridge_slot().lock() {
+            *slot = None;
+        }
+        set_host_binding_invoker(None);
+        return;
+    }
+
+    let callback_obj = unsafe { JObject::from_raw(callback) };
+    let global_callback = match env.new_global_ref(&callback_obj) {
+        Ok(r) => r,
+        Err(e) => {
+            throw(
+                &mut env,
+                "java/lang/RuntimeException",
+                &format!("failed to create global callback ref: {e}"),
+            );
+            return;
+        }
+    };
+    let jvm = match env.get_java_vm() {
+        Ok(v) => v,
+        Err(e) => {
+            throw(
+                &mut env,
+                "java/lang/RuntimeException",
+                &format!("failed to get JavaVM: {e}"),
+            );
+            return;
+        }
+    };
+    if let Ok(mut slot) = host_binding_bridge_slot().lock() {
+        *slot = Some(JavaHostBindingBridge {
+            jvm: Arc::new(jvm),
+            callback: global_callback,
+        });
+    }
+    set_host_binding_invoker(Some(Arc::new(
+        |module_name, function_name, arg0| {
+            invoke_registered_host_binding(module_name, function_name, arg0)
+        },
+    )));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_ai_xlate_xos_XosNative_clearHostPythonModules(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    clear_host_python_modules();
+}
+
+#[no_mangle]
+pub extern "system" fn Java_ai_xlate_xos_XosNative_registerHostPythonModule(
+    mut env: JNIEnv,
+    _class: JClass,
+    module_name: JString,
+    function_names: jobject,
+) {
+    let module_name = match env.get_string(&module_name) {
+        Ok(v) => v.to_string_lossy().to_string(),
+        Err(e) => {
+            throw(
+                &mut env,
+                "java/lang/IllegalArgumentException",
+                &format!("invalid module name: {e}"),
+            );
+            return;
+        }
+    };
+
+    if function_names.is_null() {
+        throw(
+            &mut env,
+            "java/lang/IllegalArgumentException",
+            "functionNames array must not be null",
+        );
+        return;
+    }
+    let function_names_array = unsafe { JObjectArray::from_raw(function_names) };
+    let len = match env.get_array_length(&function_names_array) {
+        Ok(v) => v,
+        Err(e) => {
+            throw(
+                &mut env,
+                "java/lang/IllegalArgumentException",
+                &format!("invalid functionNames array: {e}"),
+            );
+            return;
+        }
+    };
+    let mut functions = Vec::new();
+    for idx in 0..len {
+        let obj = match env.get_object_array_element(&function_names_array, idx) {
+            Ok(v) => v,
+            Err(e) => {
+                throw(
+                    &mut env,
+                    "java/lang/IllegalArgumentException",
+                    &format!("failed reading functionNames[{idx}]: {e}"),
+                );
+                return;
+            }
+        };
+        let jstr = JString::from(obj);
+        let fname = match env.get_string(&jstr) {
+            Ok(v) => v.to_string_lossy().to_string(),
+            Err(e) => {
+                throw(
+                    &mut env,
+                    "java/lang/IllegalArgumentException",
+                    &format!("invalid function name at index {idx}: {e}"),
+                );
+                return;
+            }
+        };
+        functions.push(fname);
+    }
+
+    if let Err(e) = register_host_python_module(&module_name, &functions) {
+        throw(&mut env, "java/lang/IllegalArgumentException", &e);
+    }
 }
 
 #[no_mangle]

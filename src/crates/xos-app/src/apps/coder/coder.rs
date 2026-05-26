@@ -8,16 +8,20 @@ use xos_core::rasterizer::{fill, fill_rect_buffer};
 use xos_core::ui::Button;
 use xos_core::rasterizer::text::text_rasterization::TextRasterizer;
 use xos_core::rasterizer::text::fonts;
-use rustpython_vm::{Interpreter, AsObject};
+use rustpython_vm::{function::FuncArgs, AsObject, Interpreter, PyResult, VirtualMachine};
 use include_dir::{include_dir, Dir};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 // Embed the entire example-scripts/ directory at compile time
 static PYTHON_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../../example-scripts");
 const CODER_SCRIPTS_DIR_ENV_VAR: &str = "XOS_CODER_DIR";
+pub type HostBindingInvoker =
+    Arc<dyn Fn(&str, &str, &str) -> Result<Option<String>, String> + Send + Sync>;
+static HOST_MODULES: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+static HOST_BINDING_INVOKER: OnceLock<Mutex<Option<HostBindingInvoker>>> = OnceLock::new();
 
 /// Task bar depth, chrome buttons, and related spacing/fonts vs prior baseline.
 const CODER_CHROME_SCALE: f32 = 1.3;
@@ -160,6 +164,119 @@ fn load_python_files_from_disk(root: &Path) -> Result<Vec<PythonFile>, String> {
     let mut python_files = Vec::new();
     collect_py_files_from_disk(root, root, &mut python_files)?;
     Ok(python_files)
+}
+
+fn host_modules_registry() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    HOST_MODULES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn host_binding_invoker_registry() -> &'static Mutex<Option<HostBindingInvoker>> {
+    HOST_BINDING_INVOKER.get_or_init(|| Mutex::new(None))
+}
+
+pub fn set_host_binding_invoker(invoker: Option<HostBindingInvoker>) {
+    if let Ok(mut slot) = host_binding_invoker_registry().lock() {
+        *slot = invoker;
+    }
+}
+
+pub fn clear_host_python_modules() {
+    if let Ok(mut modules) = host_modules_registry().lock() {
+        modules.clear();
+    }
+}
+
+pub fn register_host_python_module(module_name: &str, function_names: &[String]) -> Result<(), String> {
+    let name = module_name.trim();
+    if name.is_empty() {
+        return Err("module name must not be empty".to_string());
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(format!("module name '{name}' must be alphanumeric/underscore"));
+    }
+
+    let mut funcs: Vec<String> = function_names
+        .iter()
+        .map(|f| f.trim().to_string())
+        .filter(|f| !f.is_empty())
+        .collect();
+    if funcs.is_empty() {
+        return Err(format!("module '{name}' must expose at least one function"));
+    }
+    funcs.sort();
+    funcs.dedup();
+    for func in &funcs {
+        if !func.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!(
+                "function name '{func}' in module '{name}' must be alphanumeric/underscore"
+            ));
+        }
+    }
+    let mut modules = host_modules_registry()
+        .lock()
+        .map_err(|_| "host module registry lock poisoned".to_string())?;
+    modules.insert(name.to_string(), funcs);
+    Ok(())
+}
+
+fn register_optional_native_modules(vm: &mut VirtualMachine) {
+    let invoker = host_binding_invoker_registry()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().cloned());
+    let Some(invoker) = invoker else {
+        return;
+    };
+
+    let modules = host_modules_registry()
+        .lock()
+        .ok()
+        .map(|m| m.clone())
+        .unwrap_or_default();
+    if modules.is_empty() {
+        return;
+    }
+
+    for (module_name, function_names) in modules {
+        let module_name_for_factory = module_name.clone();
+        let function_names_for_factory = function_names.clone();
+        let invoker_for_factory = Arc::clone(&invoker);
+        vm.add_native_module(
+            module_name,
+            Box::new(move |vm: &VirtualMachine| {
+                let module =
+                    vm.new_module(module_name_for_factory.as_str(), vm.ctx.new_dict(), None);
+                for function_name in function_names_for_factory.clone() {
+                    let module_name_for_call = module_name_for_factory.clone();
+                    let function_name_for_call = function_name.clone();
+                    let invoker_for_call = Arc::clone(&invoker_for_factory);
+                    let function_name_leaked: &'static str =
+                        Box::leak(function_name.clone().into_boxed_str());
+                    let native_fn = vm.new_function(
+                        function_name_leaked,
+                        move |args: FuncArgs, vm: &VirtualMachine| -> PyResult {
+                            let arg0 = if let Some(obj) = args.args.first() {
+                                obj.str(vm)?.to_string()
+                            } else {
+                                String::new()
+                            };
+                            match invoker_for_call(
+                                &module_name_for_call,
+                                &function_name_for_call,
+                                &arg0,
+                            ) {
+                                Ok(Some(output)) => Ok(vm.ctx.new_str(output).into()),
+                                Ok(None) => Ok(vm.ctx.none()),
+                                Err(err) => Err(vm.new_runtime_error(err)),
+                            }
+                        },
+                    );
+                    let _ = module.set_attr(function_name_leaked, native_fn, vm);
+                }
+                module
+            }),
+        );
+    }
 }
 
 pub struct CoderApp {
@@ -634,6 +751,7 @@ impl CoderApp {
         let interpreter = Interpreter::with_init(Default::default(), |vm| {
             // Register the xos native module
             vm.add_native_module("xos".to_owned(), Box::new(xos_python::xos_module::make_module));
+            register_optional_native_modules(vm);
         });
 
         // Initialize persistent scope for console
@@ -946,6 +1064,7 @@ xos.print = __custom_print__
             // Create interpreter in this thread
             let interpreter = Interpreter::with_init(Default::default(), |vm| {
                 vm.add_native_module("xos".to_owned(), Box::new(xos_python::xos_module::make_module));
+                register_optional_native_modules(vm);
             });
             
             // Create print callback that checks generation

@@ -14,6 +14,9 @@ import java.nio.ByteBuffer;
  * a fresh direct buffer.
  */
 public final class XosNative {
+    public interface HostBindingCallback {
+        String invokeXosBinding(String moduleName, String functionName, String arg0);
+    }
 
     private static volatile boolean loaded;
 
@@ -105,4 +108,19 @@ public final class XosNative {
      * Call before {@link #init} when embedding xos in another host (e.g. Minekov).
      */
     public static native void setCoderScriptsDirectory(String absoluteDirectoryPath);
+
+    /**
+     * Register (or replace) a host callback used by externally-registered Python module bindings.
+     */
+    public static native void setHostBindingCallback(HostBindingCallback callback);
+
+    /**
+     * Clears all externally-registered Python host modules.
+     */
+    public static native void clearHostPythonModules();
+
+    /**
+     * Registers an external Python module and a set of function names (e.g. module `mc`, function `chat`).
+     */
+    public static native void registerHostPythonModule(String moduleName, String[] functionNames);
 }
