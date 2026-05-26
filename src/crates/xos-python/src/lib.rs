@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod audio;
+pub mod chat;
 pub mod auth;
 pub mod burn_train;
 pub mod clipboard;

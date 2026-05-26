@@ -126,3 +126,4 @@ whisper = ["dep:ureq", "dep:half", "dep:hound", "dep:strum", "dep:strum_macros",
 whisper_burn = ["whisper", "dep:tokenizers", "dep:burn-store", "dep:cubecl-common"]
 whisper_ct2 = ["dep:ct2rs", "dep:ureq", "dep:zip"]
 silero_vad = ["dep:ort", "dep:ureq", "whisper"]
+llama_ct2 = ["dep:ct2rs", "dep:ureq"]

@@ -31,6 +31,7 @@ whisper = ["xos-core/whisper", "xos-python/whisper"]
 whisper_burn = ["whisper", "xos-core/whisper_burn", "xos-python/whisper_burn"]
 whisper_ct2 = ["whisper", "xos-core/whisper_ct2", "xos-python/whisper_ct2", "xos-app/whisper_ct2"]
 silero_vad = ["whisper", "xos-core/silero_vad", "xos-app/silero_vad"]
+llama_ct2 = ["xos-core/llama_ct2", "xos-python/llama_ct2"]
 
 [lib]
 path = "src/lib.rs"

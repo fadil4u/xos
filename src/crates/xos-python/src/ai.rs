@@ -1,5 +1,6 @@
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
+use rustpython_vm::AsObject;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "whisper_burn"))]
 use burn::tensor::DType;
@@ -690,5 +691,7 @@ def load(model="tiny", full_values=False, max_values=128, weights_path=None, bac
     }
 
     ai.set_attr("whisper", whisper, vm).ok();
+    let chat_module = crate::chat::make_chat_module(vm);
+    ai.set_attr("chat", chat_module, vm).ok();
     ai
 }
