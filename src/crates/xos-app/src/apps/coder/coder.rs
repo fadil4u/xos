@@ -8,13 +8,26 @@ use xos_core::rasterizer::{fill, fill_rect_buffer};
 use xos_core::ui::Button;
 use xos_core::rasterizer::text::text_rasterization::TextRasterizer;
 use xos_core::rasterizer::text::fonts;
-use rustpython_vm::{Interpreter, AsObject};
+use rustpython_vm::{function::FuncArgs, AsObject, Interpreter, PyResult, VirtualMachine};
 use include_dir::{include_dir, Dir};
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 // Embed the entire example-scripts/ directory at compile time
 static PYTHON_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../../example-scripts");
+const CODER_SCRIPTS_DIR_ENV_VAR: &str = "XOS_CODER_DIR";
+pub type HostBindingInvoker =
+    Arc<dyn Fn(&str, &str, &str) -> Result<Option<String>, String> + Send + Sync>;
+static HOST_MODULES: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+static HOST_BINDING_INVOKER: OnceLock<Mutex<Option<HostBindingInvoker>>> = OnceLock::new();
+thread_local! {
+    static BACKGROUND_EXECUTION_CONTEXT_GENERATION: Cell<u64> = const { Cell::new(0) };
+}
+static ACTIVE_BACKGROUND_EXECUTION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Task bar depth, chrome buttons, and related spacing/fonts vs prior baseline.
 const CODER_CHROME_SCALE: f32 = 1.3;
@@ -57,6 +70,309 @@ struct PythonFile {
     content: String,
     #[allow(dead_code)]
     path: String,
+}
+
+fn collect_py_files_from_embedded(dir: &Dir, base_path: &str, files: &mut Vec<PythonFile>) {
+    for file in dir.files() {
+        if let Some(filename) = file.path().file_name() {
+            if filename.to_string_lossy().ends_with(".py") {
+                let relative_path = if base_path.is_empty() {
+                    filename.to_string_lossy().to_string()
+                } else {
+                    format!("{}/{}", base_path, filename.to_string_lossy())
+                };
+
+                if let Ok(content) = std::str::from_utf8(file.contents()) {
+                    files.push(PythonFile {
+                        name: relative_path.clone(),
+                        content: content.to_string(),
+                        path: relative_path,
+                    });
+                }
+            }
+        }
+    }
+
+    for subdir in dir.dirs() {
+        if let Some(dirname) = subdir.path().file_name() {
+            let new_base = if base_path.is_empty() {
+                dirname.to_string_lossy().to_string()
+            } else {
+                format!("{}/{}", base_path, dirname.to_string_lossy())
+            };
+            collect_py_files_from_embedded(subdir, &new_base, files);
+        }
+    }
+}
+
+fn load_embedded_python_files() -> Vec<PythonFile> {
+    let mut python_files = Vec::new();
+    collect_py_files_from_embedded(&PYTHON_DIR, "", &mut python_files);
+    python_files
+}
+
+fn collect_py_files_from_disk(
+    dir: &Path,
+    root: &Path,
+    files: &mut Vec<PythonFile>,
+) -> Result<(), String> {
+    let mut entries = fs::read_dir(dir)
+        .map_err(|e| format!("failed to read {}: {e}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase());
+
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_py_files_from_disk(&path, root, files)?;
+            continue;
+        }
+        let is_python = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("py"))
+            .unwrap_or(false);
+        if !is_python {
+            continue;
+        }
+
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|e| format!("failed to relativize {}: {e}", path.display()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        files.push(PythonFile {
+            name: relative.clone(),
+            content,
+            path: relative,
+        });
+    }
+    Ok(())
+}
+
+fn load_python_files_from_disk(root: &Path) -> Result<Vec<PythonFile>, String> {
+    if !root.exists() {
+        return Err(format!(
+            "coder scripts directory does not exist: {}",
+            root.display()
+        ));
+    }
+    if !root.is_dir() {
+        return Err(format!(
+            "coder scripts path is not a directory: {}",
+            root.display()
+        ));
+    }
+
+    let mut python_files = Vec::new();
+    collect_py_files_from_disk(root, root, &mut python_files)?;
+    Ok(python_files)
+}
+
+fn host_modules_registry() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    HOST_MODULES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn host_binding_invoker_registry() -> &'static Mutex<Option<HostBindingInvoker>> {
+    HOST_BINDING_INVOKER.get_or_init(|| Mutex::new(None))
+}
+
+fn set_background_execution_context_generation(generation: u64) {
+    BACKGROUND_EXECUTION_CONTEXT_GENERATION.with(|slot| slot.set(generation));
+}
+
+fn clear_background_execution_context_generation() {
+    BACKGROUND_EXECUTION_CONTEXT_GENERATION.with(|slot| slot.set(0));
+}
+
+fn is_background_execution_cancelled() -> bool {
+    let active = ACTIVE_BACKGROUND_EXECUTION_GENERATION.load(Ordering::Relaxed);
+    BACKGROUND_EXECUTION_CONTEXT_GENERATION.with(|slot| {
+        let mine = slot.get();
+        mine != 0 && mine != active
+    })
+}
+
+pub fn set_host_binding_invoker(invoker: Option<HostBindingInvoker>) {
+    if let Ok(mut slot) = host_binding_invoker_registry().lock() {
+        *slot = invoker;
+    }
+}
+
+pub fn clear_host_python_modules() {
+    if let Ok(mut modules) = host_modules_registry().lock() {
+        modules.clear();
+    }
+}
+
+pub fn register_host_python_module(module_name: &str, function_names: &[String]) -> Result<(), String> {
+    let name = module_name.trim();
+    if name.is_empty() {
+        return Err("module name must not be empty".to_string());
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(format!("module name '{name}' must be alphanumeric/underscore"));
+    }
+
+    let mut funcs: Vec<String> = function_names
+        .iter()
+        .map(|f| f.trim().to_string())
+        .filter(|f| !f.is_empty())
+        .collect();
+    if funcs.is_empty() {
+        return Err(format!("module '{name}' must expose at least one function"));
+    }
+    funcs.sort();
+    funcs.dedup();
+    for func in &funcs {
+        if !func.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!(
+                "function name '{func}' in module '{name}' must be alphanumeric/underscore"
+            ));
+        }
+    }
+    let mut modules = host_modules_registry()
+        .lock()
+        .map_err(|_| "host module registry lock poisoned".to_string())?;
+    modules.insert(name.to_string(), funcs);
+    Ok(())
+}
+
+fn register_optional_native_modules(vm: &mut VirtualMachine) {
+    let invoker = host_binding_invoker_registry()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().cloned());
+    let Some(invoker) = invoker else {
+        return;
+    };
+
+    let modules = host_modules_registry()
+        .lock()
+        .ok()
+        .map(|m| m.clone())
+        .unwrap_or_default();
+    if modules.is_empty() {
+        return;
+    }
+
+    for (module_name, function_names) in modules {
+        let module_name_for_factory = module_name.clone();
+        let function_names_for_factory = function_names.clone();
+        let invoker_for_factory = Arc::clone(&invoker);
+        vm.add_native_module(
+            module_name,
+            Box::new(move |vm: &VirtualMachine| {
+                let module =
+                    vm.new_module(module_name_for_factory.as_str(), vm.ctx.new_dict(), None);
+                let invoker_for_host_call = Arc::clone(&invoker_for_factory);
+                let module_name_for_host_call = module_name_for_factory.clone();
+                let host_call_fn = vm.new_function(
+                    "_host_call",
+                    move |args: FuncArgs, vm: &VirtualMachine| -> PyResult {
+                        if is_background_execution_cancelled() {
+                            return Err(vm
+                                .new_exception_empty(vm.ctx.exceptions.keyboard_interrupt.to_owned()));
+                        }
+                        let Some(fn_name_obj) = args.args.first() else {
+                            return Err(vm.new_type_error(
+                                "_host_call(function_name, arg0='') expects at least one argument"
+                                    .to_string(),
+                            ));
+                        };
+                        let function_name = fn_name_obj.str(vm)?.to_string();
+                        let arg0 = if let Some(arg_obj) = args.args.get(1) {
+                            arg_obj.str(vm)?.to_string()
+                        } else {
+                            String::new()
+                        };
+                        match invoker_for_host_call(
+                            &module_name_for_host_call,
+                            &function_name,
+                            &arg0,
+                        ) {
+                            Ok(Some(output)) => Ok(vm.ctx.new_str(output).into()),
+                            Ok(None) => Ok(vm.ctx.none()),
+                            Err(err) => Err(vm.new_runtime_error(err)),
+                        }
+                    },
+                );
+                let _ = module.set_attr("_host_call", host_call_fn, vm);
+
+                for function_name in function_names_for_factory.clone() {
+                    let module_name_for_call = module_name_for_factory.clone();
+                    let function_name_for_call = function_name.clone();
+                    let invoker_for_call = Arc::clone(&invoker_for_factory);
+                    let function_name_leaked: &'static str =
+                        Box::leak(function_name.clone().into_boxed_str());
+                    let native_fn = vm.new_function(
+                        function_name_leaked,
+                        move |args: FuncArgs, vm: &VirtualMachine| -> PyResult {
+                            if is_background_execution_cancelled() {
+                                return Err(vm
+                                    .new_exception_empty(vm.ctx.exceptions.keyboard_interrupt.to_owned()));
+                            }
+                            let arg0 = if let Some(obj) = args.args.first() {
+                                obj.str(vm)?.to_string()
+                            } else {
+                                String::new()
+                            };
+                            match invoker_for_call(
+                                &module_name_for_call,
+                                &function_name_for_call,
+                                &arg0,
+                            ) {
+                                Ok(Some(output)) => Ok(vm.ctx.new_str(output).into()),
+                                Ok(None) => Ok(vm.ctx.none()),
+                                Err(err) => Err(vm.new_runtime_error(err)),
+                            }
+                        },
+                    );
+                    let _ = module.set_attr(function_name_leaked, native_fn, vm);
+                }
+
+                if function_names_for_factory
+                    .iter()
+                    .any(|name| name == "__bootstrap__")
+                {
+                    if let Ok(Some(bootstrap_source)) =
+                        invoker_for_factory(&module_name_for_factory, "__bootstrap__", "")
+                    {
+                        if !bootstrap_source.trim().is_empty() {
+                            let scope = vm.new_scope_with_builtins();
+                            let _ = scope
+                                .globals
+                                .set_item("__name__", vm.ctx.new_str("__xos_host_bootstrap__").into(), vm);
+                            let _ = scope
+                                .globals
+                                .set_item("__module__", module.as_object().to_owned(), vm);
+                            match vm.run_code_string(
+                                scope,
+                                &bootstrap_source,
+                                format!("<{}.__bootstrap__>", module_name_for_factory),
+                            ) {
+                                Ok(_) => {
+                                    let _ = module.set_attr("_bootstrap_ok", vm.ctx.new_bool(true), vm);
+                                }
+                                Err(e) => {
+                                    let _ = module.set_attr("_bootstrap_ok", vm.ctx.new_bool(false), vm);
+                                    let _ = module.set_attr(
+                                        "_bootstrap_error",
+                                        vm.ctx.new_str(format!("{e:?}")),
+                                        vm,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                module
+            }),
+        );
+    }
 }
 
 pub struct CoderApp {
@@ -464,46 +780,25 @@ impl CoderApp {
     pub fn new() -> Self {
         // Enable coder logging to capture all Rust/Swift logs
         super::logging::enable_coder_logging();
-        
-        // Discover all Python files from the embedded directory
-        let mut python_files = Vec::new();
-        
-        fn collect_py_files(dir: &Dir, base_path: &str, files: &mut Vec<PythonFile>) {
-            // Collect all .py files in this directory
-            for file in dir.files() {
-                if let Some(filename) = file.path().file_name() {
-                    if filename.to_string_lossy().ends_with(".py") {
-                        let relative_path = if base_path.is_empty() {
-                            filename.to_string_lossy().to_string()
-                        } else {
-                            format!("{}/{}", base_path, filename.to_string_lossy())
-                        };
-                        
-                        if let Ok(content) = std::str::from_utf8(file.contents()) {
-                            files.push(PythonFile {
-                                name: relative_path.clone(),
-                                content: content.to_string(),
-                                path: relative_path,
-                            });
-                        }
+        let mut python_files = if cfg!(target_os = "ios") {
+            load_embedded_python_files()
+        } else if let Ok(raw_dir) = std::env::var(CODER_SCRIPTS_DIR_ENV_VAR) {
+            let trimmed = raw_dir.trim();
+            if trimmed.is_empty() {
+                load_embedded_python_files()
+            } else {
+                match load_python_files_from_disk(Path::new(trimmed)) {
+                    Ok(files) => files,
+                    Err(err) => {
+                        eprintln!("⚠️ {err}");
+                        eprintln!("⚠️ falling back to embedded example scripts");
+                        load_embedded_python_files()
                     }
                 }
             }
-            
-            // Recursively collect from subdirectories
-            for subdir in dir.dirs() {
-                if let Some(dirname) = subdir.path().file_name() {
-                    let new_base = if base_path.is_empty() {
-                        dirname.to_string_lossy().to_string()
-                    } else {
-                        format!("{}/{}", base_path, dirname.to_string_lossy())
-                    };
-                    collect_py_files(subdir, &new_base, files);
-                }
-            }
-        }
-        
-        collect_py_files(&PYTHON_DIR, "", &mut python_files);
+        } else {
+            load_embedded_python_files()
+        };
         
         // Keep stable deterministic ordering by normalized folder/name.
         python_files.sort_by(|a, b| {
@@ -552,6 +847,7 @@ impl CoderApp {
         let interpreter = Interpreter::with_init(Default::default(), |vm| {
             // Register the xos native module
             vm.add_native_module("xos".to_owned(), Box::new(xos_python::xos_module::make_module));
+            register_optional_native_modules(vm);
         });
 
         // Initialize persistent scope for console
@@ -855,15 +1151,18 @@ xos.print = __custom_print__
             *gen += 1;
             *gen
         };
+        ACTIVE_BACKGROUND_EXECUTION_GENERATION.store(current_generation, Ordering::Relaxed);
         
         // Mark thread as running
         *self.python_thread_running.lock().unwrap() = true;
         
         // Spawn background thread to execute Python
         let handle = thread::spawn(move || {
+            set_background_execution_context_generation(current_generation);
             // Create interpreter in this thread
             let interpreter = Interpreter::with_init(Default::default(), |vm| {
                 vm.add_native_module("xos".to_owned(), Box::new(xos_python::xos_module::make_module));
+                register_optional_native_modules(vm);
             });
             
             // Create print callback that checks generation
@@ -880,13 +1179,26 @@ xos.print = __custom_print__
             });
             
             // Execute using unified runtime
-            let (result, _, _, _) = xos_python::runtime::execute_python_code(
+            let running_for_cancel = Arc::clone(&running_flag);
+            let gen_for_cancel = Arc::clone(&generation_counter);
+            let cancel_check: xos_python::runtime::CancelCheckCallback = Arc::new(move || {
+                let still_current = gen_for_cancel
+                    .lock()
+                    .map(|g| *g == current_generation)
+                    .unwrap_or(false);
+                let still_running = running_for_cancel.lock().map(|f| *f).unwrap_or(false);
+                !(still_current && still_running)
+            });
+
+            let (result, _, _, _) = xos_python::runtime::execute_python_code_with_mode_and_cancel(
                 &interpreter,
                 &code_str,
                 "<coder>",
                 None,
                 Some(print_callback),
                 &[],
+                xos_python::runtime::PythonRunMode::Exec,
+                Some(cancel_check),
             );
             
             // Handle errors (only if still current generation)
@@ -908,8 +1220,10 @@ xos.print = __custom_print__
                     if let Ok(mut flag) = running_flag.lock() {
                         *flag = false;
                     }
+                    ACTIVE_BACKGROUND_EXECUTION_GENERATION.store(0, Ordering::Relaxed);
                 }
             }
+            clear_background_execution_context_generation();
         });
         
         // Store the thread handle
@@ -1212,6 +1526,7 @@ builtins.print = __custom_print__
         if is_background_running {
             if let Ok(mut gen) = self.python_thread_generation.lock() {
                 *gen += 1;
+                ACTIVE_BACKGROUND_EXECUTION_GENERATION.store(*gen, Ordering::Relaxed);
             }
             if let Ok(mut flag) = self.python_thread_running.lock() {
                 *flag = false;
@@ -1221,6 +1536,15 @@ builtins.print = __custom_print__
             if let Ok(mut buffer) = self.python_output_buffer.lock() {
                 buffer.push_str("\n[xos] Script stopped by user\n");
             }
+        }
+
+        // Notify host integrations (e.g. Minekov) to clear execution-owned effects.
+        let invoker = host_binding_invoker_registry()
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().cloned());
+        if let Some(invoker) = invoker {
+            let _ = invoker("mc", "execution_stopped", "");
         }
     }
     

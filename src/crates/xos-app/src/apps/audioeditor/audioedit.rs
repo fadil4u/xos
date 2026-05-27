@@ -616,7 +616,11 @@ impl AudioEditApp {
 #[cfg(not(target_os = "linux"))]
 impl Application for AudioEditApp {
     fn setup(&mut self, _state: &mut EngineState) -> Result<(), String> {
-        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            not(target_os = "ios"),
+            feature = "native_file_dialog"
+        ))]
         {
             // Open file picker for audio files
             let file = rfd::FileDialog::new()
@@ -654,6 +658,18 @@ impl Application for AudioEditApp {
                 // No audio file selected - close the app
                 return Err("No audio file selected. Application will close.".to_string());
             }
+        }
+
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            not(target_os = "ios"),
+            not(feature = "native_file_dialog")
+        ))]
+        {
+            return Err(
+                "File picker unavailable: xos-app was built without `native_file_dialog` feature."
+                    .to_string(),
+            );
         }
 
         #[cfg(target_os = "ios")]

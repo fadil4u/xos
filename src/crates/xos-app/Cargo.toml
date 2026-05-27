@@ -36,7 +36,7 @@ ctrlc = "3.4"
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))'.dependencies]
 cpal = "0.16.0"
-rfd = "0.16.0"
+rfd = { version = "0.16.0", optional = true }
 nokhwa = { version = "0.10.7", features = ["input-native"] }
 ct2rs = { version = "0.9.18", optional = true, default-features = false, features = ["whisper", "ruy"] }
 ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["std", "download-binaries", "tls-rustls", "api-24"] }
@@ -56,6 +56,7 @@ web-sys = { version = "0.3", features = ["Window", "Document"] }
 
 [features]
 default = []
+native_file_dialog = ["dep:rfd"]
 whisper = ["xos-core/whisper"]
 whisper_ct2 = ["whisper", "dep:ct2rs", "xos-core/whisper_ct2"]
 silero_vad = ["whisper", "dep:ort", "xos-core/silero_vad"]

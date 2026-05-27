@@ -1,6 +1,93 @@
 use rustpython_vm::{
-    builtins::PyModule, function::FuncArgs, PyObjectRef, PyRef, PyResult, VirtualMachine,
+    builtins::{PyDict, PyModule},
+    function::FuncArgs,
+    PyObjectRef, PyRef, PyResult, VirtualMachine,
 };
+use crate::dtypes::DType;
+use crate::tensor_buf::create_tensor_from_data;
+use crate::tensors::{tensor_flat_data_list, tensor_shape_tuple, wrap_tensor_dict};
+
+fn looks_like_tensor(obj: &PyObjectRef, vm: &VirtualMachine) -> bool {
+    if let Some(d) = obj.downcast_ref::<PyDict>() {
+        return d.contains_key("_data", vm) || d.contains_key("shape", vm);
+    }
+    vm.get_attribute_opt(obj.clone(), "_data")
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+fn unary_math_map(
+    obj: &PyObjectRef,
+    vm: &VirtualMachine,
+    op_name: &str,
+    op: impl Fn(f64) -> Result<f64, String>,
+) -> PyResult {
+    if looks_like_tensor(obj, vm) {
+        let shape = tensor_shape_tuple(obj, vm)?;
+        let flat = tensor_flat_data_list(obj, vm)?;
+        let mut out = Vec::with_capacity(flat.len());
+        for v in flat {
+            let mapped = op(v as f64)
+                .map_err(|e| vm.new_value_error(format!("{op_name}: {e}")))?;
+            out.push(mapped as f32);
+        }
+        let t = create_tensor_from_data(out, shape, DType::Float32);
+        return wrap_tensor_dict(t.to_py_dict(vm, DType::Float32)?, vm);
+    }
+    let x = obj.clone().try_into_value::<f64>(vm)?;
+    let out = op(x).map_err(|e| vm.new_value_error(format!("{op_name}: {e}")))?;
+    Ok(vm.ctx.new_float(out).into())
+}
+
+fn binary_math_map(
+    lhs: &PyObjectRef,
+    rhs: &PyObjectRef,
+    vm: &VirtualMachine,
+    op_name: &str,
+    op: impl Fn(f64, f64) -> Result<f64, String>,
+) -> PyResult {
+    let lhs_is_tensor = looks_like_tensor(lhs, vm);
+    let rhs_is_tensor = looks_like_tensor(rhs, vm);
+    if !lhs_is_tensor && !rhs_is_tensor {
+        let a = lhs.clone().try_into_value::<f64>(vm)?;
+        let b = rhs.clone().try_into_value::<f64>(vm)?;
+        let out = op(a, b).map_err(|e| vm.new_value_error(format!("{op_name}: {e}")))?;
+        return Ok(vm.ctx.new_float(out).into());
+    }
+
+    let (shape, left, right): (Vec<usize>, Vec<f32>, Vec<f32>) = if lhs_is_tensor && rhs_is_tensor {
+        let lshape = tensor_shape_tuple(lhs, vm)?;
+        let rshape = tensor_shape_tuple(rhs, vm)?;
+        let lflat = tensor_flat_data_list(lhs, vm)?;
+        let rflat = tensor_flat_data_list(rhs, vm)?;
+        if lshape != rshape || lflat.len() != rflat.len() {
+            return Err(vm.new_value_error(format!(
+                "{op_name}: tensor shapes must match (lhs={lshape:?}, rhs={rshape:?})"
+            )));
+        }
+        (lshape, lflat, rflat)
+    } else if lhs_is_tensor {
+        let lshape = tensor_shape_tuple(lhs, vm)?;
+        let lflat = tensor_flat_data_list(lhs, vm)?;
+        let scalar = rhs.clone().try_into_value::<f64>(vm)? as f32;
+        (lshape, lflat.clone(), vec![scalar; lflat.len()])
+    } else {
+        let rshape = tensor_shape_tuple(rhs, vm)?;
+        let rflat = tensor_flat_data_list(rhs, vm)?;
+        let scalar = lhs.clone().try_into_value::<f64>(vm)? as f32;
+        (rshape, vec![scalar; rflat.len()], rflat)
+    };
+
+    let mut out = Vec::with_capacity(left.len());
+    for (a, b) in left.into_iter().zip(right.into_iter()) {
+        let mapped = op(a as f64, b as f64)
+            .map_err(|e| vm.new_value_error(format!("{op_name}: {e}")))?;
+        out.push(mapped as f32);
+    }
+    let t = create_tensor_from_data(out, shape, DType::Float32);
+    wrap_tensor_dict(t.to_py_dict(vm, DType::Float32)?, vm)
+}
 
 /// xos.math.log(x) - Natural logarithm (base e)
 fn log(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
@@ -16,14 +103,17 @@ fn log(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
 
 /// xos.math.sqrt(x) - Square root
 fn sqrt(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-    let x: f64 = args.bind(vm)?;
-
-    if x < 0.0 {
-        return Err(vm.new_value_error("math domain error: sqrt(x) requires x >= 0".to_string()));
+    let args_vec = args.args;
+    if args_vec.is_empty() {
+        return Err(vm.new_type_error("sqrt() requires 1 argument".to_string()));
     }
-
-    let result = x.sqrt();
-    Ok(vm.ctx.new_float(result).into())
+    unary_math_map(&args_vec[0], vm, "sqrt", |x| {
+        if x < 0.0 {
+            Err("math domain error: sqrt(x) requires x >= 0".to_string())
+        } else {
+            Ok(x.sqrt())
+        }
+    })
 }
 
 /// xos.math.pow(x, y) - x raised to the power y
@@ -59,6 +149,22 @@ fn tan(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let x: f64 = args.bind(vm)?;
     let result = x.tan();
     Ok(vm.ctx.new_float(result).into())
+}
+
+/// xos.math.atan2(y, x) - Four-quadrant arctangent (radians)
+fn atan2(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    if args.args.len() < 2 {
+        return Err(vm.new_type_error("atan2() requires 2 arguments (y, x)".to_string()));
+    }
+    binary_math_map(&args.args[0], &args.args[1], vm, "atan2", |y, x| Ok(y.atan2(x)))
+}
+
+/// xos.math.degrees(x) - Radians to degrees
+fn degrees(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    if args.args.is_empty() {
+        return Err(vm.new_type_error("degrees() requires 1 argument".to_string()));
+    }
+    unary_math_map(&args.args[0], vm, "degrees", |x| Ok(x.to_degrees()))
 }
 
 /// xos.math.floor(x) - Floor function
@@ -197,6 +303,8 @@ pub fn make_math_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     let _ = module.set_attr("sin", vm.new_function("sin", sin), vm);
     let _ = module.set_attr("cos", vm.new_function("cos", cos), vm);
     let _ = module.set_attr("tan", vm.new_function("tan", tan), vm);
+    let _ = module.set_attr("atan2", vm.new_function("atan2", atan2), vm);
+    let _ = module.set_attr("degrees", vm.new_function("degrees", degrees), vm);
     let _ = module.set_attr("floor", vm.new_function("floor", floor), vm);
     let _ = module.set_attr("ceil", vm.new_function("ceil", ceil), vm);
     let _ = module.set_attr("fft", vm.new_function("fft", fft), vm);

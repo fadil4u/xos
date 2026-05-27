@@ -1,4 +1,4 @@
-//! CLI compile helpers: `xos compile` (release by default), `xos compile --no-release`, `--ios`, `--wasm`.
+//! CLI compile helpers: `xos compile` (release by default), `xos compile --no-release`, `--ios`, `--wasm`, `--java`.
 
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
@@ -10,6 +10,104 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const WASM_TARGET_DIR_NAME: &str = "wasm";
 const WASM_MAIN_OUTPUT_DIR_NAME: &str = "main";
 const WASM_ZIP_NAME: &str = "xos-wasm.zip";
+
+fn canonical_repo_target_root(project_root: &Path) -> PathBuf {
+    project_root.join("target")
+}
+
+fn canonical_repo_profile_dir(project_root: &Path, release: bool) -> PathBuf {
+    canonical_repo_target_root(project_root).join(profile_dir_name(release))
+}
+
+fn windows_is_lock_contention(err: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        if let Some(code) = err.raw_os_error() {
+            // 32: ERROR_SHARING_VIOLATION, 33: ERROR_LOCK_VIOLATION
+            return code == 32 || code == 33;
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn windows_local_appdata_dir() -> PathBuf {
+    if let Ok(v) = std::env::var("LOCALAPPDATA") {
+        return PathBuf::from(v);
+    }
+    if let Ok(v) = std::env::var("USERPROFILE") {
+        return PathBuf::from(v).join("AppData").join("Local");
+    }
+    PathBuf::from(r"C:\Users\Public\AppData\Local")
+}
+
+#[cfg(windows)]
+fn windows_cargo_target_cache_root(lane: &str) -> PathBuf {
+    windows_local_appdata_dir()
+        .join("xos")
+        .join("cargo-target")
+        .join(lane)
+}
+
+#[cfg(windows)]
+fn windows_fallback_target_root(lane: &str) -> PathBuf {
+    windows_local_appdata_dir().join("xos").join("cargo-target").join(format!(
+        "{}-fallback-{}",
+        lane,
+        std::process::id()
+    ))
+}
+
+#[cfg(windows)]
+fn choose_windows_target_root(base_root: PathBuf, lane: &str, release: bool) -> PathBuf {
+    let lock_path = base_root.join(profile_dir_name(release)).join(".cargo-lock");
+    if !lock_path.exists() {
+        return base_root;
+    }
+    match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(_) => base_root,
+        Err(e) if windows_is_lock_contention(&e) => {
+            let fallback = windows_fallback_target_root(lane);
+            eprintln!(
+                "⚠️  target lock busy at {} — using fallback build cache {}",
+                lock_path.display(),
+                fallback.display()
+            );
+            fallback
+        }
+        Err(_) => base_root,
+    }
+}
+
+fn standard_build_target_root(project_root: &Path, release: bool) -> PathBuf {
+    let base = standard_target_root(project_root);
+    #[cfg(windows)]
+    {
+        return choose_windows_target_root(base, "standard", release);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = release;
+        base
+    }
+}
+
+fn java_build_target_root(project_root: &Path, release: bool) -> PathBuf {
+    let base = java_target_root(project_root);
+    #[cfg(windows)]
+    {
+        return choose_windows_target_root(base, "java", release);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = release;
+        base
+    }
+}
 
 #[cfg(windows)]
 fn normalize_windows_path(path: PathBuf) -> PathBuf {
@@ -32,15 +130,29 @@ fn normalize_windows_path(path: PathBuf) -> PathBuf {
 pub fn standard_target_root(project_root: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        // Some Windows Application Control policies block executing Cargo-generated
-        // build-script binaries under custom target subdirectories (e.g. target/standard).
-        // Use Cargo's default target dir on Windows to keep builds policy-compatible.
-        return project_root.join("target");
+        // App Control may block build-script executables under repository directories.
+        // Build in LocalAppData and publish artifacts back into `<repo>/target/{debug|release}`.
+        let _ = project_root;
+        return windows_cargo_target_cache_root("standard");
     }
 
     #[cfg(not(windows))]
     {
     project_root.join("target").join("standard")
+    }
+}
+
+/// Cargo `target` directory for Java/JNI builds (`xos-java` crate).
+pub fn java_target_root(project_root: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let _ = project_root;
+        return windows_cargo_target_cache_root("java");
+    }
+
+    #[cfg(not(windows))]
+    {
+        project_root.join("target").join("java")
     }
 }
 
@@ -52,10 +164,24 @@ fn profile_dir_name(release: bool) -> &'static str {
     }
 }
 
-/// Built `xos` binary under `target/standard/{debug|release}/`.
+fn java_library_filename() -> &'static str {
+    if cfg!(windows) {
+        "xos_java.dll"
+    } else if cfg!(target_os = "macos") {
+        "libxos_java.dylib"
+    } else {
+        "libxos_java.so"
+    }
+}
+
+fn java_library_artifact_path(project_root: &Path, release: bool) -> PathBuf {
+    canonical_repo_profile_dir(project_root, release)
+        .join(java_library_filename())
+}
+
+/// Canonical `xos` binary path under `<repo>/target/{debug|release}/`.
 pub fn standard_xos_executable(project_root: &Path, release: bool) -> PathBuf {
-    standard_target_root(project_root)
-        .join(profile_dir_name(release))
+    canonical_repo_profile_dir(project_root, release)
         .join(if cfg!(windows) { "xos.exe" } else { "xos" })
 }
 
@@ -158,9 +284,7 @@ fn copy_file_replace_windows(src: &Path, dest: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Copy freshly compiled `target/standard/{debug|release}/{xos,xpy}` into the Cargo `bin` directory.
-fn copy_bins_to_cargo_bin(project_root: &Path, release: bool, dest_dir: &Path) -> io::Result<()> {
-    let profile_dir = standard_target_root(project_root).join(profile_dir_name(release));
+fn copy_bins_from_profile_dir(profile_dir: &Path, dest_dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dest_dir)?;
     for stem in ["xos", "xpy", "xrs"] {
         let name = if cfg!(windows) {
@@ -173,19 +297,28 @@ fn copy_bins_to_cargo_bin(project_root: &Path, release: bool, dest_dir: &Path) -
             continue;
         }
         let to = dest_dir.join(&name);
+        if from == to {
+            continue;
+        }
         copy_file_replace_windows(&from, &to)?;
     }
     Ok(())
 }
 
-fn warn_path_copy_failed(project_root: &Path, release: bool, err: &io::Error) {
+fn warn_copy_failed(label: &str, err: &io::Error) {
     eprintln!();
-    eprintln!("⚠️  Compile succeeded, but could not overwrite PATH binaries: {err}");
+    eprintln!("⚠️  Compile succeeded, but could not update {label}: {err}");
+}
+
+fn warn_path_copy_failed(project_root: &Path, release: bool, err: &io::Error) {
+    warn_copy_failed("PATH binaries", err);
     eprintln!(
-        "   Fresh binaries: {}",
-        standard_target_root(project_root)
-            .join(profile_dir_name(release))
-            .display()
+        "   Fresh binaries (build dir): {}",
+        standard_target_root(project_root).join(profile_dir_name(release)).display()
+    );
+    eprintln!(
+        "   Canonical repo binaries: {}",
+        canonical_repo_profile_dir(project_root, release).display()
     );
     eprintln!(
         "   Fix: close every running `xos` / `xpy` (and shells that started them), then run:"
@@ -194,13 +327,10 @@ fn warn_path_copy_failed(project_root: &Path, release: bool, err: &io::Error) {
     eprintln!("   Or: cargo install --path {}", project_root.display());
 }
 
-fn run_cargo_build_verbose(project_root: &Path, release: bool) -> bool {
+fn run_cargo_build_verbose(project_root: &Path, target_root: &Path, release: bool) -> bool {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(project_root);
-    cmd.env(
-        "CARGO_TARGET_DIR",
-        standard_target_root(project_root).as_os_str(),
-    );
+    cmd.env("CARGO_TARGET_DIR", target_root.as_os_str());
     cmd.arg("build");
     if release {
         cmd.arg("--release");
@@ -221,15 +351,12 @@ fn run_cargo_build_verbose(project_root: &Path, release: bool) -> bool {
 }
 
 /// `cargo build -p xos-cli --bins` with no compiler output — spinner line only.
-fn run_cargo_build_quiet_spinner(project_root: &Path, release: bool) -> bool {
+fn run_cargo_build_quiet_spinner(project_root: &Path, target_root: &Path, release: bool) -> bool {
     let path_str = project_root.display().to_string();
     let profile_label = profile_dir_name(release);
     let mut cargo_cmd = Command::new("cargo");
     cargo_cmd.current_dir(project_root);
-    cargo_cmd.env(
-        "CARGO_TARGET_DIR",
-        standard_target_root(project_root).as_os_str(),
-    );
+    cargo_cmd.env("CARGO_TARGET_DIR", target_root.as_os_str());
     cargo_cmd.arg("build");
     if release {
         cargo_cmd.arg("--release");
@@ -339,27 +466,47 @@ fn run_compile_and_update_cargo_bin(
         );
     }
 
+    let build_target_root = standard_build_target_root(project_root, release);
+    let build_profile_dir = build_target_root.join(profile_dir_name(release));
+    if !quiet {
+        println!("📦 Build cache: {}", build_profile_dir.display());
+    }
+
     let compile_ok = if quiet {
-        run_cargo_build_quiet_spinner(project_root, release)
+        run_cargo_build_quiet_spinner(project_root, &build_target_root, release)
     } else {
-        run_cargo_build_verbose(project_root, release)
+        run_cargo_build_verbose(project_root, &build_target_root, release)
     };
     if !compile_ok {
         return None;
     }
+
+    let source_profile_dir = build_profile_dir;
+    let canonical_profile_dir = canonical_repo_profile_dir(project_root, release);
+
+    let canonical_ok = match copy_bins_from_profile_dir(&source_profile_dir, &canonical_profile_dir) {
+        Ok(()) => true,
+        Err(e) => {
+            warn_copy_failed("canonical repo binaries", &e);
+            eprintln!("   Canonical path: {}", canonical_profile_dir.display());
+            false
+        }
+    };
 
     if !quiet {
         println!("📁 Copying xos/xpy → {} ...", cargo_bin_dir_hint());
     }
 
     let dest = PathBuf::from(cargo_bin_dir_hint());
-    match copy_bins_to_cargo_bin(project_root, release, &dest) {
-        Ok(()) => Some(true),
+    let path_ok = match copy_bins_from_profile_dir(&source_profile_dir, &dest) {
+        Ok(()) => true,
         Err(e) => {
             warn_path_copy_failed(project_root, release, &e);
-            Some(false)
+            false
         }
-    }
+    };
+
+    Some(canonical_ok && path_ok)
 }
 
 pub fn find_project_root() -> PathBuf {
@@ -380,30 +527,37 @@ pub fn run_cargo_clean(project_root: &Path) -> bool {
         project_root.display()
     );
 
-    let rel_dirs = ["target/standard", "target/ios", "target/wasm"];
-
-    fn clean_target_dir(project_root: &Path, rel_dir: &str) -> Result<(), String> {
-        let td = project_root.join(rel_dir);
+    fn clean_target_dir(project_root: &Path, target_dir: &Path) -> Result<(), String> {
+        let td = target_dir;
         if !td.exists() {
             return Ok(());
         }
         let status = Command::new("cargo")
             .args(["clean", "--target-dir"])
-            .arg(rel_dir)
+            .arg(td)
             .current_dir(project_root)
             .status()
             .map_err(|e| e.to_string())?;
         if !status.success() {
             return Err(format!(
-                "cargo clean --target-dir {rel_dir} failed ({status})."
+                "cargo clean --target-dir {} failed ({status}).",
+                td.display()
             ));
         }
         Ok(())
     }
 
     match (|| -> Result<(), String> {
-        for rel in rel_dirs {
-            clean_target_dir(project_root, rel)?;
+        let mut targets = vec![
+            standard_target_root(project_root),
+            java_target_root(project_root),
+            project_root.join("target").join("ios"),
+            project_root.join("target").join("wasm"),
+        ];
+        targets.sort();
+        targets.dedup();
+        for target_dir in &targets {
+            clean_target_dir(project_root, target_dir)?;
         }
         Ok(())
     })() {
@@ -831,6 +985,100 @@ pub fn compile_ios_rust(clean: bool, release: bool) -> bool {
     }
 
     println!("✅ Rust library compiled successfully.");
+    true
+}
+
+/// Build JNI dynamic library (`xos-java` crate) for Java host integrations.
+pub fn compile_java(clean: bool, release: bool) -> bool {
+    let profile_label = profile_dir_name(release);
+    println!("☕ Compiling Rust JNI library for Java ({profile_label})...");
+
+    let project_root = find_project_root();
+    let java_target_dir = java_build_target_root(&project_root, release);
+    if clean {
+        println!("🧹 cargo clean --target-dir {} ...", java_target_dir.display());
+        let clean_status = Command::new("cargo")
+            .current_dir(&project_root)
+            .args(["clean", "--target-dir"])
+            .arg(&java_target_dir)
+            .status();
+        match clean_status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                eprintln!("❌ Java clean failed ({s}).");
+                return false;
+            }
+            Err(e) => {
+                eprintln!("❌ failed to run cargo clean for Java target dir: {e}");
+                return false;
+            }
+        }
+    }
+
+    let mut compile_cmd = Command::new("cargo");
+    compile_cmd.current_dir(&project_root);
+    compile_cmd.env("CARGO_TARGET_DIR", &java_target_dir);
+    #[cfg(windows)]
+    {
+        // `xos-java` links through `ct2rs`; on Windows this lane often needs static CRT linkage.
+        // Keep this scoped to `xos compile --java` so standard CLI compilation behavior stays unchanged.
+        let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+        if !rustflags.contains("target-feature=+crt-static") {
+            if !rustflags.trim().is_empty() {
+                rustflags.push(' ');
+            }
+            rustflags.push_str("-C target-feature=+crt-static");
+        }
+        compile_cmd.env("RUSTFLAGS", rustflags);
+    }
+    compile_cmd.arg("build");
+    if release {
+        compile_cmd.arg("--release");
+    }
+    compile_cmd.args(["-p", "xos-java"]);
+    compile_cmd.stdout(Stdio::inherit());
+    compile_cmd.stderr(Stdio::inherit());
+
+    let status = match compile_cmd.status() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("❌ failed to run cargo build for xos-java: {e}");
+            return false;
+        }
+    };
+    if !status.success() {
+        eprintln!("❌ Java/JNI compile failed. Exiting.");
+        return false;
+    }
+
+    let built = java_target_dir
+        .join(profile_dir_name(release))
+        .join(java_library_filename());
+    let published = java_library_artifact_path(&project_root, release);
+    if built != published {
+        if let Some(parent) = published.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                eprintln!(
+                    "❌ failed to prepare Java artifact directory {}: {e}",
+                    parent.display()
+                );
+                return false;
+            }
+        }
+        if let Err(e) = copy_file_replace_windows(&built, &published) {
+            eprintln!(
+                "❌ Java/JNI build succeeded, but publishing {} failed: {e}",
+                published.display()
+            );
+            eprintln!("   Built artifact is at: {}", built.display());
+            return false;
+        }
+    }
+
+    println!(
+        "✅ Java/JNI library built: {}",
+        published.display()
+    );
     true
 }
 

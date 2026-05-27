@@ -14,6 +14,9 @@ import java.nio.ByteBuffer;
  * a fresh direct buffer.
  */
 public final class XosNative {
+    public interface HostBindingCallback {
+        String invokeXosBinding(String moduleName, String functionName, String arg0);
+    }
 
     private static volatile boolean loaded;
 
@@ -96,7 +99,39 @@ public final class XosNative {
     public static native void onKeyChar(int codepoint);
 
     /**
+     * Text-edit shortcut action routed directly to the active xos app.
+     * <p>
+     * actionCode:
+     * 1=Copy, 2=Cut, 3=Paste, 4=SelectAll, 5=Undo, 6=Redo
+     */
+    public static native void onShortcut(int actionCode);
+
+    /**
      * F3 toggles the global FPS overlay (same as desktop/winit). Not sent as a Unicode character.
      */
     public static native void onF3();
+
+    /** Requests Coder to stop current execution(s), same as the red stop action. */
+    public static native void onStopExecution();
+
+    /**
+     * Sets the coder scripts directory used by the native Coder app. Must be an absolute directory path.
+     * Call before {@link #init} when embedding xos in another host (e.g. Minekov).
+     */
+    public static native void setCoderScriptsDirectory(String absoluteDirectoryPath);
+
+    /**
+     * Register (or replace) a host callback used by externally-registered Python module bindings.
+     */
+    public static native void setHostBindingCallback(HostBindingCallback callback);
+
+    /**
+     * Clears all externally-registered Python host modules.
+     */
+    public static native void clearHostPythonModules();
+
+    /**
+     * Registers an external Python module and a set of function names (e.g. module `mc`, function `chat`).
+     */
+    public static native void registerHostPythonModule(String moduleName, String[] functionNames);
 }
